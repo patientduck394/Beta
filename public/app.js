@@ -4,7 +4,8 @@
   'use strict';
   const app = document.getElementById('app');
   const side = document.getElementById('side');
-  const show = (...kids) => app.replaceChildren(...kids.flat(9).filter(Boolean));
+  const put = (el, ...kids) => el.replaceChildren(...kids.flat(9).filter(Boolean));
+  const show = (...kids) => put(app, ...kids);
   let me = null;
   let tick = 0;
   let timers = [];
@@ -84,7 +85,9 @@
   };
   const safe = (fn) => (...a) => Promise.resolve(fn(...a)).catch((e) => toast(e.message));
   const nameOf = (u) => u.display_name || u.username;
-  const avatar = (u, big) => h('span', { class: 'av c-' + (u.color || 'lime') + (big ? ' big' : ''), 'aria-hidden': 'true' }, (nameOf(u)[0] || '?').toUpperCase());
+  const avatar = (u, big) => (u.avatar
+    ? h('img', { class: 'av img' + (big ? ' big' : ''), src: '/api/files/' + u.avatar, alt: '', loading: 'lazy' })
+    : h('span', { class: 'av c-' + (u.color || 'lime') + (big ? ' big' : ''), 'aria-hidden': 'true' }, (nameOf(u)[0] || '?').toUpperCase()));
   const store = {
     get: (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set: (k, v) => { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch (e) {} },
@@ -104,6 +107,11 @@
     bell: 'M8 1a4 4 0 0 0-4 4v3l-2 3v1h12v-1l-2-3V5a4 4 0 0 0-4-4zM6.500 13a1.500 1.500 0 0 0 3 0z',
     x: 'M4 2.600 8 6.600l4-4L13.400 4 9.400 8l4 4-1.400 1.400-4-4-4 4L2.600 12l4-4-4-4z',
     pin: 'M9 1l6 6-2 1-2-1-2 2v3l-1 1-3-3-3 3-1-1 3-3-3-3 1-1h3l2-2z',
+    mail: 'M1 3h14v10H1zm1.800 1.500L8 8.800l5.200-4.300z',
+    explore: 'M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm3.500 3.500L9.500 9.500l-5 2 2-5z',
+    list: 'M2 3h2v2H2zM6 3.500h8v1H6zM2 7h2v2H2zM6 7.500h8v1H6zM2 11h2v2H2zM6 11.500h8v1H6z',
+    smile: 'M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zM5.500 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2zm5 0a1 1 0 1 1 0 2 1 1 0 0 1 0-2zM4.500 9.500h7a3.500 3.500 0 0 1-7 0z',
+    warn: 'M8 1l7 13H1zM7.300 6h1.400v4H7.300zM7.300 11h1.400v1.400H7.300z',
     rss: 'M2 2v2.500A9.500 9.500 0 0 1 11.500 14H14A12 12 0 0 0 2 2zm0 4.500V9a5 5 0 0 1 5 5h2.500A7.500 7.500 0 0 0 2 6.500zM3.500 11a1.500 1.500 0 1 0 0 3 1.500 1.500 0 0 0 0-3z',
   };
   const NS = 'http://www.w3.org/2000/svg';
@@ -120,15 +128,22 @@
   };
 
   // ---------- text: #topics, @names, and Keydown formatting (only fetched when a post looks like it uses some) ----------
-  const RICH = /(?<![A-Za-z0-9_#&@])([#@])([A-Za-z][A-Za-z0-9_-]{1,29})(?![A-Za-z0-9_])/g;
+  const RICH = /(https?:\/\/[^\s<>"']+)|(?<![A-Za-z0-9_#&@\/.])([#@])([A-Za-z][A-Za-z0-9_-]{1,29})(?![A-Za-z0-9_])/g;
   function rich(text) {
     const out = [];
     let last = 0;
     for (const m of text.matchAll(RICH)) {
-      if (m[1] === '@' && m[2].length < 3) continue;
+      if (m[1]) {
+        const url = m[1].replace(/[.,;:!?)\]}]+$/, '');
+        out.push(text.slice(last, m.index));
+        out.push(h('a', { href: url, target: '_blank', rel: 'noopener noreferrer nofollow ugc' }, url.length > 48 ? url.slice(0, 45) + '...' : url));
+        last = m.index + url.length;
+        continue;
+      }
+      if (m[2] === '@' && m[3].length < 3) continue;
       out.push(text.slice(last, m.index));
-      out.push(link(m[1] === '#' ? '/topic/' + enc(m[2].toLowerCase()) : '/u/' + enc(m[2]), m[0]));
-      last = m.index + m[0].length;
+      out.push(link(m[2] === '#' ? '/topic/' + enc(m[3].toLowerCase()) : '/u/' + enc(m[3]), m[2] + m[3]));
+      last = m.index + 1 + m[3].length;
     }
     out.push(text.slice(last));
     return out;
@@ -160,22 +175,31 @@
   function drawNav() {
     const nav = document.getElementById('nav');
     nav.replaceChildren();
+    const badge = (n) => (n ? h('span', { class: 'badge' }, n > 99 ? '99+' : n) : null);
     if (me) {
-      const bell = h('a', { class: 'navbtn', href: '/notifications', 'data-link': true, title: 'Notifications (g then n)', 'aria-label': 'Notifications' }, icon('bell'), me.unread ? h('span', { class: 'badge' }, me.unread > 99 ? '99+' : me.unread) : null);
+      const menu = h('details', { class: 'menu navmenu' }, h('summary', { class: 'navbtn', 'aria-label': 'More' }, icon('more')),
+        h('div', { class: 'pop right' },
+          h('a', { href: '/bookmarks', 'data-link': true }, 'Saved posts'),
+          h('a', { href: '/lists', 'data-link': true }, 'Lists'),
+          h('a', { href: '/settings', 'data-link': true }, 'Settings'),
+          me.admin ? h('a', { href: '/admin', 'data-link': true }, 'Admin') : null,
+          h('button', { type: 'button', onclick: () => shortcuts() }, 'Keyboard shortcuts'),
+          h('button', { type: 'button', onclick: safe(async () => { await api('/logout', { method: 'POST' }); me = null; drawNav(); go('/'); }) }, 'Log out')));
       nav.append(
-        bell,
-        h('a', { class: 'navbtn', href: '/bookmarks', 'data-link': true, title: 'Saved posts (g then b)', 'aria-label': 'Saved posts' }, icon('bookmark')),
+        h('a', { class: 'navbtn', href: '/explore', 'data-link': true, title: 'Explore (g then e)', 'aria-label': 'Explore' }, icon('explore')),
+        h('a', { class: 'navbtn', href: '/messages', 'data-link': true, title: 'Messages (g then m)', 'aria-label': 'Messages' }, icon('mail'), badge(me.dmUnread)),
+        h('a', { class: 'navbtn', href: '/notifications', 'data-link': true, title: 'Notifications (g then n)', 'aria-label': 'Notifications' }, icon('bell'), badge(me.unread)),
         h('a', { class: 'navuser', href: '/u/' + enc(me.username), 'data-link': true, title: 'Your profile' }, avatar(me), h('span', { class: 'navname' }, nameOf(me))),
-        h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Settings')
-      );
-    } else nav.append(h('a', { class: 'btn ghost small', href: '/login', 'data-link': true }, 'Log in'), h('a', { class: 'btn small', href: '/register', 'data-link': true }, 'Sign up'));
+        menu);
+    } else nav.append(h('a', { class: 'navbtn', href: '/explore', 'data-link': true, title: 'Explore', 'aria-label': 'Explore' }, icon('explore')), h('a', { class: 'btn ghost small', href: '/login', 'data-link': true }, 'Log in'), h('a', { class: 'btn small', href: '/register', 'data-link': true }, 'Sign up'));
   }
   async function refreshUnread() {
     if (!me) return;
     try {
       const r = await api('/notifications/count');
-      if (r.unread !== me.unread) {
+      if (r.unread !== me.unread || r.dmUnread !== me.dmUnread) {
         me.unread = r.unread;
+        me.dmUnread = r.dmUnread;
         drawNav();
       }
     } catch (e) {}
@@ -203,7 +227,7 @@
   async function drawSide() {
     try {
       const [t, s] = await Promise.all([api('/topics'), api('/suggest')]);
-      side.replaceChildren(
+      put(side,
         h('div', { class: 'card side' }, h('h2', null, 'Trending Topics'),
           t.topics.length ? h('ol', null, t.topics.map((x) => h('li', null, link('/topic/' + enc(x.topic), h('span', { class: 'tn' }, '#' + x.topic)), h('span', { class: 'muted small' }, x.n + (x.n === 1 ? ' post' : ' posts')))))
             : h('p', { class: 'muted' }, 'No Topics yet. Add a #hashtag to a post to start one!')),
@@ -288,19 +312,23 @@
     const canEdit = mineP && !rp && Date.now() - x.created < 15 * 60 * 1000;
     const gone = () => { wrap.remove(); if (opts.onDelete) opts.onDelete(wrap); };
     const bodyHolder = h('div');
-    const showBody = () => bodyHolder.replaceChildren(x.body ? bodyEl(x.body) : null);
+    const showBody = () => put(bodyHolder, x.body ? bodyEl(x.body) : null);
     showBody();
+    // a content warning hides the post until you ask to see it
+    const hidden = !!x.cw && !(opts.revealed && opts.revealed.has(x.id));
 
     const startEdit = () => {
+      if (hidden) { (opts.revealed = opts.revealed || new Set()).add(x.id); redraw(); toast('Press Edit again!'); return; }
       const area = h('textarea', { 'aria-label': 'Edit your post', value: x.body });
+      const cwIn = h('input', { placeholder: 'Content warning (optional)', maxlength: 80, value: x.cw || '', 'aria-label': 'Content warning' });
       const err = errBox();
       const count = h('span', { class: 'count' });
       const upd = () => { const left = 300 - [...area.value].length; count.textContent = String(left); count.className = 'count' + (left < 0 ? ' over' : ''); };
       area.addEventListener('input', upd);
       upd();
-      bodyHolder.replaceChildren(h('div', { class: 'editbox' }, area, h('div', { class: 'row' }, count, h('span', null,
+      bodyHolder.replaceChildren(h('div', { class: 'editbox' }, area, cwIn, h('div', { class: 'row' }, count, h('span', null,
         h('button', { class: 'btn ghost small', type: 'button', onclick: showBody }, 'Cancel'), ' ',
-        h('button', { class: 'btn small', type: 'button', onclick: guard(err, async () => { const r = await api('/posts/' + x.id, { method: 'PATCH', body: { body: area.value } }); Object.assign(x, r.post); redraw(); toast('Saved!'); }) }, 'Save'))), err));
+        h('button', { class: 'btn small', type: 'button', onclick: guard(err, async () => { const r = await api('/posts/' + x.id, { method: 'PATCH', body: { body: area.value, cw: cwIn.value } }); Object.assign(x, r.post); redraw(); toast('Saved!'); }) }, 'Save'))), err));
       area.focus();
     };
 
@@ -321,7 +349,11 @@
       h('div', { class: 'pop' },
         h('button', { type: 'button', onclick: safe(async (e) => { closeMenu(e.currentTarget); if (!me) return go('/login'); const r = await api('/posts/' + x.id + '/repost', { method: 'POST' }); x.reposted = r.reposted; x.reposts = r.reposts; redraw(); toast(r.reposted ? 'Reposted!' : 'Repost removed!'); }) }, x.reposted ? 'Undo repost' : 'Repost'),
         h('button', { type: 'button', onclick: (e) => { closeMenu(e.currentTarget); if (!me) return go('/login'); quoteDialog(x); } }, 'Quote'))) : null;
-    const shareBtn = h('button', { class: 'act', type: 'button', 'aria-label': 'Copy link', title: 'Copy link', onclick: async () => { try { await navigator.clipboard.writeText(location.origin + '/post/' + x.id); toast('Link copied!'); } catch (e) { toast('Copy it from the address bar after opening the post!'); } } }, icon('share'));
+    const shareBtn = h('button', { class: 'act', type: 'button', 'aria-label': 'Share', title: 'Share', onclick: async () => {
+      const u = location.origin + '/post/' + x.id;
+      if (navigator.share) { try { await navigator.share({ title: nameOf(x) + ' on Beta', url: u }); return; } catch (e) { if (e && e.name === 'AbortError') return; } }
+      try { await navigator.clipboard.writeText(u); toast('Link copied!'); } catch (e) { toast('Copy it from the address bar after opening the post!'); }
+    } }, icon('share'));
     const act = (fn) => safe(async (e) => { closeMenu(e.currentTarget); await fn(); });
     const items = [];
     if (mineP) {
@@ -334,19 +366,23 @@
         h('button', { type: 'button', onclick: act(async () => { if (!me) return go('/login'); if (!confirm('Block @' + x.username + '? They will not be able to follow, reply to or like your posts.')) return; const r = await api('/users/' + enc(x.username) + '/block', { method: 'POST' }); toast(r.blocked ? 'Blocked!' : 'Unblocked!'); }) }, 'Block @' + x.username),
         h('button', { type: 'button', onclick: act(async () => { if (!me) return go('/login'); const reason = prompt('What is wrong with this post? (a few words)'); if (reason === null) return; await api('/posts/' + x.id + '/report', { method: 'POST', body: { reason } }); toast('Thanks, we will take a look!'); }) }, 'Report'));
     }
+    if (x.likes) items.unshift(h('button', { type: 'button', onclick: act(async () => { const r = await api('/posts/' + x.id + '/likes'); peopleDialog('Liked by', r.users); }) }, 'See who liked'));
+    if (me && !mineP) items.push(h('button', { type: 'button', onclick: act(async () => { listPicker(x.username); }) }, 'Add @' + x.username + ' to a list'));
     const moreMenu = h('details', { class: 'menu' }, h('summary', { class: 'act', 'aria-label': 'More' }, icon('more')), h('div', { class: 'pop right' }, items));
 
     const quoteEl = x.quote ? h('a', { class: 'quote', href: '/post/' + x.quote.id, 'data-link': true }, h('div', { class: 'ph' }, avatar(x.quote, false), h('span', { class: 'who' }, nameOf(x.quote)), h('span', { class: 'muted small' }, '@' + x.quote.username + ' · ' + ago(x.quote.created))), h('div', { class: 'qbody' }, x.quote.body.slice(0, 200)), x.quote.files && x.quote.files[0] && x.quote.files[0].image ? h('img', { class: 'qimg', src: '/api/files/' + x.quote.files[0].id, alt: x.quote.files[0].alt || '', loading: 'lazy' }) : null)
       : x.quoteGone ? h('div', { class: 'quote gone muted small' }, 'This post was deleted.') : null;
 
+    const warn = hidden ? h('div', { class: 'cwbox' }, icon('warn'), h('b', null, x.cw), h('button', { class: 'btn ghost small', type: 'button', onclick: () => { (opts.revealed = opts.revealed || new Set()).add(x.id); redraw(); } }, 'Show')) : (x.cw ? h('div', { class: 'cwnote muted small' }, icon('warn'), x.cw) : null);
     const article = h('article', { class: 'post' + (opts.focus ? ' focus' : '') },
       avatar(x),
       h('div', { class: 'pb' },
         h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), h('span', { class: 'muted small' }, '@' + x.username), h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, opts.pinned ? h('span', { class: 'pinned' }, icon('pin'), 'Pinned') : null),
-        bodyHolder,
-        x.files.length ? filesView(x) : null,
-        x.poll ? pollView(x, redraw) : null,
-        quoteEl,
+        warn,
+        hidden ? null : bodyHolder,
+        hidden ? null : (x.files.length ? filesView(x) : null),
+        hidden ? null : (x.poll ? pollView(x, redraw) : null),
+        hidden ? null : quoteEl,
         h('div', { class: 'acts' },
           opts.noReplyLink ? null : h('a', { class: 'act', href: '/post/' + x.id, 'data-link': true, 'aria-label': 'Replies' }, icon('comment'), x.replies || ''),
           repostMenu, likeBtn, bmBtn, shareBtn, moreMenu)));
@@ -379,6 +415,30 @@
     const preview = h('div', { class: 'preview', hidden: true });
     let busy = 0;
 
+    // content warning
+    let cwOn = false;
+    const cwIn = h('input', { class: 'cwin', placeholder: 'Content warning: what should the post hide behind?', maxlength: 80, 'aria-label': 'Content warning', hidden: true });
+    const cwBtn = h('button', { class: 'act', type: 'button', 'aria-pressed': 'false', 'aria-label': 'Add a content warning', title: 'Content warning', onclick: () => { cwOn = !cwOn; cwIn.hidden = !cwOn; cwBtn.setAttribute('aria-pressed', String(cwOn)); if (cwOn) cwIn.focus(); } }, icon('warn'));
+
+    // more posts after this one make a thread
+    const extras = [];
+    const extraBox = h('div', { class: 'extras' });
+    const threadBtn = h('button', { class: 'act', type: 'button', 'aria-label': 'Add another post to a thread', title: 'Add another post (a thread)', onclick: () => {
+      if (extras.length >= 4) return toast('A thread can have 5 posts!');
+      const ta = h('textarea', { 'aria-label': 'Next post in the thread', placeholder: 'Next post...' });
+      const row = h('div', { class: 'xrow' }, ta, h('button', { class: 'act', type: 'button', 'aria-label': 'Remove this post', onclick: () => { extras.splice(extras.indexOf(ta), 1); row.remove(); update(); } }, icon('x')));
+      extras.push(ta);
+      extraBox.append(row);
+      ta.addEventListener('input', update);
+      ta.focus();
+      update();
+    } }, '+');
+
+    // emoji
+    const EMOJI = ['😀', '😂', '😍', '🥳', '😎', '🤔', '😭', '😡', '👍', '👎', '👏', '🙏', '💪', '🎉', '🔥', '✨', '💯', '❤️', '💚', '💙', '🌟', '🌈', '☀️', '🌙', '🍕', '🍔', '🍰', '☕', '🎵', '🎮', '📚', '💻', '🚀', '🐶', '🐱', '🦊', '🐢', '🌱', '🌸', '🍀'];
+    const emojiMenu = h('details', { class: 'menu' }, h('summary', { class: 'act', 'aria-label': 'Add an emoji', title: 'Emoji' }, icon('smile')),
+      h('div', { class: 'pop emoji' }, EMOJI.map((e) => h('button', { type: 'button', onclick: (ev) => { area.setRangeText(e, area.selectionStart, area.selectionEnd, 'end'); area.focus(); area.dispatchEvent(new Event('input')); ev.currentTarget.closest('details').removeAttribute('open'); } }, e))));
+
     // poll builder
     let pollOn = false;
     const pollBox = h('div', { class: 'pollbuilder', hidden: true });
@@ -407,7 +467,8 @@
       count.textContent = String(left);
       count.className = 'count' + (left < 0 ? ' over' : '');
       const hasThing = area.value.trim() || files.length || (pollOn && pollInputs.filter((i) => i.value.trim()).length >= 2);
-      btn.disabled = left < 0 || !hasThing || busy > 0 || (opts.quote && !area.value.trim());
+      const over = extras.some((t) => [...t.value].length > 300);
+      btn.disabled = left < 0 || over || !hasThing || busy > 0 || (opts.quote && !area.value.trim());
     };
     const drawTray = () => {
       tray.replaceChildren(...files.map((f) => h('div', { class: 'tfile' + (f.id ? '' : ' wait') },
@@ -478,9 +539,14 @@
     const form = h('form', { class: 'card compose', onsubmit: guard(err, async () => {
       btn.disabled = true;
       try {
-        const body = { body: area.value, parent: opts.parent, quote: opts.quote ? opts.quote.id : undefined, files: files.filter((f) => f.id).map((f) => ({ id: f.id, alt: f.alt || '' })) };
+        const body = { body: area.value, parent: opts.parent, quote: opts.quote ? opts.quote.id : undefined, cw: cwOn ? cwIn.value : undefined, files: files.filter((f) => f.id).map((f) => ({ id: f.id, alt: f.alt || '' })) };
         if (pollOn) body.poll = { options: pollInputs.map((i) => i.value).filter((v) => v.trim()), hours: parseInt(dur.value, 10) };
         const r = await api('/posts', { method: 'POST', body });
+        // the rest of a thread: each one replies to the first
+        for (const t of extras.filter((x) => x.value.trim())) await api('/posts', { method: 'POST', body: { body: t.value, parent: r.post.id } });
+        extras.length = 0;
+        extraBox.replaceChildren();
+        if (cwOn) { cwIn.value = ''; cwBtn.click(); }
         area.value = opts.prefill || '';
         store.set(dkey, '');
         files.length = 0;
@@ -490,9 +556,9 @@
         if (opts.onPosted) opts.onPosted(r.post);
       } finally { update(); }
     }) },
-      area, tray, pollBox, preview,
+      area, cwIn, tray, pollBox, extraBox, preview,
       opts.quote ? h('div', { class: 'quote small' }, h('b', null, nameOf(opts.quote)), ' ', '@' + opts.quote.username, h('div', { class: 'qbody' }, opts.quote.body.slice(0, 200))) : null,
-      h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, opts.parent || opts.noPoll ? null : pollBtn, count), btn),
+      h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, opts.parent || opts.noPoll ? null : pollBtn, cwBtn, emojiMenu, opts.parent || opts.quote ? null : threadBtn, count), btn),
       h('div', { class: 'muted small' }, 'Keydown works here: **bold**, *italic*, `code`, #G#chips#'), err);
     return form;
   }
@@ -577,11 +643,12 @@
         r.users.length ? h('ul', { class: 'ulist big' }, r.users.map(userRow)) : h('div', { class: 'empty' }, sub === 'followers' ? 'No followers yet!' : 'Not following anyone yet!')));
       return;
     }
+    if (sub === 'lists') return listsPage(user.username);
     const tab = ['replies', 'media', 'likes'].includes(params().get('tab')) ? params().get('tab') : 'posts';
     const mineU = me && me.username.toLowerCase() === user.username.toLowerCase();
     const stats = h('div', { class: 'stats' });
     const fbtn = followBtn(user);
-    const paint = () => stats.replaceChildren(h('span', null, h('b', null, user.posts), ' posts'), link('/u/' + enc(user.username) + '/followers', h('b', null, user.followers), ' followers'), link('/u/' + enc(user.username) + '/following', h('b', null, user.following), ' following'));
+    const paint = () => stats.replaceChildren(h('span', null, h('b', null, user.posts), ' posts'), link('/u/' + enc(user.username) + '/followers', h('b', null, user.followers), ' followers'), link('/u/' + enc(user.username) + '/following', h('b', null, user.following), ' following'), link('/u/' + enc(user.username) + '/lists', 'Lists'));
     user.onChange = paint;
     paint();
     const relBtns = [];
@@ -593,7 +660,7 @@
     const f = feed('/feed', { user: user.username, tab }, { empty: { posts: 'No posts yet!', replies: 'No replies yet!', media: 'No pictures or files yet!', likes: 'No likes yet!' }[tab], pinnedId: user.pinned ? user.pinned.id : null });
     show(h('div', { class: 'card profile' },
       h('div', { class: 'top2' }, avatar(user, true), h('div', { class: 'who2' }, h('h1', null, nameOf(user)), h('div', { class: 'muted' }, '@' + user.username, user.followsYou ? h('span', { class: 'chip small' }, 'Follows you') : null, user.muted ? h('span', { class: 'chip small' }, 'Muted') : null, user.blocked ? h('span', { class: 'chip small' }, 'Blocked') : null)),
-        h('div', { class: 'pbtns' }, mineU ? h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Edit profile') : fbtn, h('a', { class: 'btn ghost small', href: '/rss/user/' + enc(user.username), title: 'RSS feed' }, icon('rss')))),
+        h('div', { class: 'pbtns' }, mineU ? h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Edit profile') : fbtn, me && !mineU ? h('a', { class: 'btn ghost small', href: '/messages/' + enc(user.username), 'data-link': true, title: 'Send a message' }, icon('mail')) : null, me && !mineU ? h('button', { class: 'btn ghost small', type: 'button', title: 'Add to a list', onclick: safe(() => listPicker(user.username)) }, icon('list')) : null, h('a', { class: 'btn ghost small', href: '/rss/user/' + enc(user.username), title: 'RSS feed' }, icon('rss')))),
       user.bio ? h('p', null, rich(user.bio)) : null,
       h('p', { class: 'muted small' }, user.website ? [h('a', { href: user.website, rel: 'noopener noreferrer nofollow ugc', target: '_blank' }, user.website.replace(/^https?:\/\//, '')), ' · '] : null, 'Joined ' + new Date(user.created).toLocaleDateString()),
       stats, relBtns.length ? h('div', { class: 'row2' }, relBtns) : null),
@@ -625,10 +692,11 @@
     setTitle('Search');
     drawSide();
     const tabs = h('div', { class: 'tabs' }, [['posts', 'Posts'], ['people', 'People'], ['topics', 'Topics']].map(([k, l]) => h('a', { href: '/search?q=' + enc(qv) + '&tab=' + k, 'data-link': true, class: tab === k ? 'on' : '' }, l)));
-    if (!qv) return show(h('h1', null, 'Search'), h('p', { class: 'muted' }, 'Type something in the box at the top!'));
+    const tips = h('p', { class: 'muted small' }, 'Tips: ', h('code', null, 'from:name'), ' ', h('code', null, '#topic'), ' ', h('code', null, 'has:image'), ' ', h('code', null, 'has:file'), ' ', h('code', null, 'has:poll'), ' work together with words!');
+    if (!qv) return show(h('h1', null, 'Search'), h('p', { class: 'muted' }, 'Type something in the box at the top!'), tips);
     if (tab === 'posts') {
       const f = feed('/feed', { q: qv }, { empty: 'No posts matched that!' });
-      show(h('h1', null, 'Results for "' + qv + '"'), tabs, f);
+      show(h('h1', null, 'Results for "' + qv + '"'), tabs, tips, f);
       return f.ready;
     }
     const r = await api('/search?q=' + enc(qv));
@@ -709,9 +777,12 @@
     const oldPw = h('input', { id: 'op', type: 'password', autocomplete: 'current-password' });
     const newPw = h('input', { id: 'np', type: 'password', autocomplete: 'new-password' });
     const delPw = h('input', { id: 'dp', type: 'password', autocomplete: 'current-password' });
+    const dmSel = h('select', { id: 'dmp', onchange: safe(async () => { await api('/me/settings', { method: 'PATCH', body: { dm: dmSel.value } }); me.dm = dmSel.value; toast('Saved!'); }) }, [['all', 'Everyone'], ['following', 'People I follow'], ['none', 'Nobody']].map(([v, l]) => h('option', { value: v, selected: (cur.dm || 'all') === v }, l)));
+    const themeSel = h('select', { id: 'thm', onchange: () => { store.set('beta_theme', themeSel.value === 'auto' ? '' : themeSel.value); applyPrefs(); } }, [['auto', 'Match my device'], ['light', 'Light'], ['dark', 'Dark']].map(([v, l]) => h('option', { value: v, selected: (store.get('beta_theme') || 'auto') === v }, l)));
+    const densSel = h('select', { id: 'dns', onchange: () => { store.set('beta_density', densSel.value === 'comfortable' ? '' : densSel.value); applyPrefs(); } }, [['comfortable', 'Comfortable'], ['compact', 'Compact']].map(([v, l]) => h('option', { value: v, selected: (store.get('beta_density') || 'comfortable') === v }, l)));
     const muted = h('div');
     api('/mutes').then((m) => {
-      muted.replaceChildren(
+      put(muted,
         m.users.length ? h('ul', { class: 'ulist' }, m.users.map((u) => h('li', { class: 'urow' }, h('span', { class: 'ut' }, link('/u/' + enc(u.username), '@' + u.username), ' ', h('span', { class: 'chip small' }, u.kind === 'block' ? 'Blocked' : 'Muted')), h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async (e) => { await api('/users/' + enc(u.username) + '/' + (u.kind === 'block' ? 'block' : 'mute'), { method: 'POST' }); e.target.closest('li').remove(); }) }, 'Undo')))) : h('p', { class: 'muted' }, 'No muted or blocked people.'),
         m.topics.length ? h('p', null, 'Muted Topics: ', m.topics.map((t) => h('a', { class: 'chip', href: '/topic/' + enc(t), 'data-link': true }, '#' + t))) : null);
     }).catch(() => {});
@@ -719,15 +790,26 @@
       h('h1', null, 'Settings'),
       h('p', null, 'Signed in as ', h('b', null, cur.username), '. ', h('button', { class: 'btn ghost small', onclick: async () => { await api('/logout', { method: 'POST' }); me = null; drawNav(); go('/'); } }, 'Log out')),
       h('h2', null, 'Your profile'),
+      h('div', { class: 'avrow' }, avatar(me, true), h('div', null,
+        h('button', { class: 'btn ghost small', type: 'button', onclick: () => { const inp = h('input', { type: 'file', accept: 'image/*', hidden: true, onchange: safe(async () => { const f = inp.files[0]; inp.remove(); if (!f) return; const blob = await avatarBlob(f); const r = await api('/me/avatar', { method: 'POST', raw: true, body: blob, headers: { 'content-type': 'application/octet-stream' } }); me.avatar = r.avatar; drawNav(); toast('Profile picture saved!'); render(); }) }); document.body.append(inp); inp.click(); } }, 'Change picture'), ' ',
+        me.avatar ? h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/me/avatar', { method: 'DELETE' }); me.avatar = null; drawNav(); toast('Picture removed!'); render(); }) }, 'Remove') : null,
+        h('div', { class: 'muted small' }, 'It is cropped to a square. Without one, you get a colored circle!'))),
       h('label', { for: 'dn' }, 'Display name'), dn,
       h('label', { for: 'bio' }, 'Bio (up to 160 characters)'), bio,
       h('label', { for: 'web' }, 'Website'), web,
       h('label', null, 'Avatar color'), sw,
       h('p', null, h('button', { class: 'btn', onclick: guard(err1, async () => { await api('/me', { method: 'PATCH', body: { display_name: dn.value, bio: bio.value, website: web.value, color } }); Object.assign(me, { display_name: dn.value.trim(), bio: bio.value.trim(), color }); drawNav(); toast('Saved!'); }) }, 'Save profile')), err1,
+      h('h2', null, 'Messages'),
+      h('label', { for: 'dmp' }, 'Who can send you messages?'), dmSel,
+      h('h2', null, 'How Beta looks'),
+      h('label', { for: 'thm' }, 'Theme'), themeSel,
+      h('label', { for: 'dns' }, 'Spacing'), densSel,
       h('h2', null, 'Muted and blocked'), muted,
       h('h2', null, 'Change your password'),
       h('label', { for: 'op' }, 'Current password'), oldPw, h('label', { for: 'np' }, 'New password (8 or more characters)'), newPw,
       h('p', null, h('button', { class: 'btn', onclick: guard(err2, async () => { await api('/me/password', { method: 'POST', body: { old: oldPw.value, new: newPw.value } }); oldPw.value = newPw.value = ''; toast('Password changed! You were signed out everywhere else.'); }) }, 'Change password')), err2,
+      h('h2', null, 'Your data'),
+      h('p', { class: 'muted' }, 'Download your posts, follows, lists and more as a file.'), h('p', null, h('a', { class: 'btn ghost', href: '/api/me/export', download: true }, 'Download my data')),
       h('h2', null, 'Delete your account'),
       h('p', { class: 'muted' }, 'This removes your posts, pictures, likes and follows for good. Type your password to confirm.'),
       delPw,
@@ -735,7 +817,7 @@
   }
 
   function shortcuts() {
-    const rows = [['n', 'Write a new post'], ['/', 'Search'], ['g then h', 'Go home'], ['g then n', 'Notifications'], ['g then b', 'Saved posts'], ['?', 'Show this list'], ['Esc', 'Close pictures and menus']];
+    const rows = [['n', 'Write a new post'], ['/', 'Search'], ['g then h', 'Go home'], ['g then n', 'Notifications'], ['g then b', 'Saved posts'], ['g then e', 'Explore'], ['g then m', 'Messages'], ['?', 'Show this list'], ['Esc', 'Close pictures and menus']];
     const box = h('div', { class: 'modal', role: 'dialog', 'aria-label': 'Keyboard shortcuts', onclick: (e) => { if (e.target === box) box.remove(); } },
       h('div', { class: 'card sheet' }, h('div', { class: 'row' }, h('h2', null, 'Keyboard shortcuts'), h('button', { class: 'btn ghost small', type: 'button', onclick: () => box.remove() }, 'Close')), h('table', null, rows.map(([k, d]) => h('tr', null, h('td', null, h('kbd', null, k)), h('td', null, d))))));
     document.body.append(box);
@@ -747,7 +829,7 @@
     if (e.key === 'Escape') { document.querySelectorAll('.modal').forEach((m) => m.remove()); document.querySelectorAll('details.menu[open]').forEach((d) => d.removeAttribute('open')); return; }
     if (gPending && Date.now() - gPending < 1500) {
       gPending = 0;
-      const to = { h: '/', n: '/notifications', b: '/bookmarks' }[e.key];
+      const to = { h: '/', n: '/notifications', b: '/bookmarks', e: '/explore', m: '/messages' }[e.key];
       if (to) { e.preventDefault(); go(to); }
       return;
     }
@@ -757,7 +839,166 @@
     else if (e.key === '?') shortcuts();
   });
   // a menu closes when you click anywhere else
-  document.addEventListener('click', (e) => document.querySelectorAll('details.menu[open]').forEach((d) => { if (!d.contains(e.target)) d.removeAttribute('open'); }));
+  document.addEventListener('click', (e) => document.querySelectorAll('details.menu[open]').forEach((d) => { if (!d.contains(e.target) || (e.target.closest && e.target.closest('.pop a'))) d.removeAttribute('open'); }));
+
+
+  // ---------- little windows ----------
+  function modal(title, ...kids) {
+    const box = h('div', { class: 'modal', role: 'dialog', 'aria-label': title, onclick: (e) => { if (e.target === box) box.remove(); } },
+      h('div', { class: 'card sheet' }, h('div', { class: 'row' }, h('h2', null, title), h('button', { class: 'btn ghost small', type: 'button', onclick: () => box.remove() }, 'Close')), ...kids));
+    document.body.append(box);
+    return box;
+  }
+  function peopleDialog(title, users) {
+    modal(title, users.length ? h('ul', { class: 'ulist' }, users.map((u) => userRow({ ...u, isFollowing: undefined }))) : h('p', { class: 'muted' }, 'Nobody yet!'));
+  }
+  async function listPicker(username) {
+    const r = await api('/lists?has=' + enc(username));
+    const body = h('div');
+    const draw = (lists) => body.replaceChildren(...[
+      lists.length ? lists.map((l) => h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: l.has, onchange: safe(async (e) => {
+        if (e.target.checked) await api('/lists/' + l.id + '/members', { method: 'POST', body: { username } });
+        else await api('/lists/' + l.id + '/members/' + enc(username), { method: 'DELETE' });
+        l.has = e.target.checked;
+      }) }), ' ' + l.name)) : h('p', { class: 'muted' }, 'You have no lists yet. Make one below!'),
+      h('form', { class: 'row2', onsubmit: safe(async (e) => { e.preventDefault(); const i = e.target.elements.n; if (!i.value.trim()) return; const c = await api('/lists', { method: 'POST', body: { name: i.value } }); await api('/lists/' + c.id + '/members', { method: 'POST', body: { username } }); const again = await api('/lists?has=' + enc(username)); draw(again.lists); toast('List made!'); }) },
+        h('input', { name: 'n', placeholder: 'New list name', maxlength: 40, 'aria-label': 'New list name' }), h('button', { class: 'btn small', type: 'submit' }, 'Make list'))].flat());
+    draw(r.lists);
+    modal('Add @' + username + ' to a list', body);
+  }
+
+  // ---------- Explore ----------
+  async function explorePage() {
+    setTitle('Explore');
+    drawSide();
+    const tab = ['media', 'topics', 'people'].includes(params().get('tab')) ? params().get('tab') : 'top';
+    const tabs = h('div', { class: 'tabs' }, [['top', 'Top posts'], ['media', 'Pictures'], ['topics', 'Topics'], ['people', 'People']].map(([k, l]) => h('a', { href: '/explore' + (k === 'top' ? '' : '?tab=' + k), 'data-link': true, class: tab === k ? 'on' : '' }, l)));
+    if (tab === 'topics') {
+      const t = await api('/topics');
+      return show(h('h1', null, 'Explore'), tabs, h('div', { class: 'card side' }, t.topics.length ? h('div', null, t.topics.map((x) => h('a', { class: 'chip', href: '/topic/' + enc(x.topic), 'data-link': true }, '#' + x.topic + ' · ' + x.n))) : h('p', { class: 'muted' }, 'No Topics yet!')));
+    }
+    if (tab === 'people') {
+      const s2 = await api('/suggest');
+      return show(h('h1', null, 'Explore'), tabs, h('div', { class: 'card' }, s2.users.length ? h('ul', { class: 'ulist big' }, s2.users.map((u) => userRow({ ...u, isFollowing: false }))) : h('div', { class: 'empty' }, 'No one new to follow right now!')));
+    }
+    const f = feed('/feed', tab === 'media' ? { scope: 'explore', media: '1' } : { scope: 'explore' }, { empty: 'Nothing is popular yet. Post something!' });
+    show(h('h1', null, 'Explore'), h('p', { class: 'muted' }, tab === 'media' ? 'The most popular posts with pictures or files this week.' : 'The most popular posts this week.'), tabs, f);
+    await f.ready;
+  }
+
+  // ---------- Messages ----------
+  async function messagesPage(peer) {
+    if (!me) return go('/login', true);
+    side.replaceChildren();
+    if (!peer) {
+      setTitle('Messages');
+      const r = await api('/dm');
+      const to = h('input', { placeholder: 'Start a conversation with... (username)', 'aria-label': 'Username to message', maxlength: 20 });
+      show(h('h1', null, 'Messages'),
+        h('form', { class: 'card compose', onsubmit: (e) => { e.preventDefault(); const v = to.value.trim().replace(/^@/, ''); if (v) go('/messages/' + enc(v)); } }, h('div', { class: 'row' }, to, h('button', { class: 'btn', type: 'submit' }, 'Message'))),
+        h('div', { class: 'card' }, r.conversations.length ? r.conversations.map((c) => h('a', { class: 'note' + (c.unread ? ' unread' : ''), href: '/messages/' + enc(c.username), 'data-link': true }, avatar(c), h('div', { class: 'nt' }, h('div', null, h('b', null, nameOf(c)), h('span', { class: 'muted small' }, ' @' + c.username + ' · ' + ago(c.last.created)), c.unread ? h('span', { class: 'chip small' }, c.unread + ' new') : null), h('div', { class: 'muted snip' }, (c.last.mine ? 'You: ' : '') + c.last.body)))) : h('div', { class: 'empty' }, 'No messages yet. Start one above, or tap Message on someone\'s profile!')));
+      timers.push(setInterval(refreshUnread, 15000));
+      return;
+    }
+    const r = await api('/dm/' + enc(peer));
+    setTitle('Messages with ' + nameOf(r.peer));
+    me.dmUnread = 0;
+    drawNav();
+    const list = h('div', { class: 'thread', role: 'log', 'aria-live': 'polite' });
+    let lastId = 0;
+    const paint = (msgs) => {
+      const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+      list.replaceChildren(...(msgs.length ? msgs.map((m) => h('div', { class: 'bub ' + (m.mine ? 'mine' : 'theirs') },
+        h('div', { class: 'btext' }, ...rich(m.body)),
+        h('div', { class: 'bmeta' }, ago(m.created), m.mine ? [' · ', h('button', { class: 'linkbtn', type: 'button', onclick: safe(async () => { await api('/dm/msg/' + m.id, { method: 'DELETE' }); refresh(); }) }, 'Delete')] : null))) : [h('div', { class: 'empty' }, 'Say hello!')]));
+      if (nearBottom || !lastId) list.scrollTop = list.scrollHeight;
+      lastId = msgs.length ? msgs[msgs.length - 1].id : 0;
+    };
+    const refresh = async () => { const x = await api('/dm/' + enc(peer)); if (!x.messages.length || x.messages[x.messages.length - 1].id !== lastId || x.messages.length !== list.querySelectorAll('.bub').length) paint(x.messages); };
+    const area = h('textarea', { 'aria-label': 'Write a message', placeholder: 'Write a message...', maxlength: 1000, disabled: !r.canSend });
+    const err = errBox();
+    const send = guard(err, async () => { if (!area.value.trim()) return; await api('/dm/' + enc(peer), { method: 'POST', body: { body: area.value } }); area.value = ''; await refresh(); });
+    area.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+    show(h('div', { class: 'row2' }, link('/messages', '← All messages')),
+      h('div', { class: 'card' }, h('div', { class: 'row pad16 dmhead' }, avatar(r.peer), h('div', null, h('b', null, link('/u/' + enc(r.peer.username), nameOf(r.peer))), h('div', { class: 'muted small' }, '@' + r.peer.username))), list,
+        r.canSend ? h('form', { class: 'dmform', onsubmit: send }, area, h('button', { class: 'btn', type: 'submit' }, 'Send')) : h('p', { class: 'muted pad16' }, r.why), err));
+    paint(r.messages);
+    timers.push(setInterval(() => refresh().catch(() => {}), 8000));
+  }
+
+  // ---------- Lists ----------
+  async function listsPage(owner) {
+    if (!owner && !me) return go('/login', true);
+    setTitle('Lists');
+    drawSide();
+    const r = await api('/lists' + (owner ? '?user=' + enc(owner) : ''));
+    const mineL = !owner || (me && me.username.toLowerCase() === owner.toLowerCase());
+    const err = errBox();
+    const name = h('input', { placeholder: 'New list name', maxlength: 40, 'aria-label': 'New list name' });
+    const desc = h('input', { placeholder: 'What is it for? (optional)', maxlength: 120, 'aria-label': 'List description' });
+    show(h('h1', null, owner ? '@' + owner + "'s lists" : 'Your lists'),
+      mineL ? h('form', { class: 'card compose', onsubmit: guard(err, async () => { const c = await api('/lists', { method: 'POST', body: { name: name.value, description: desc.value } }); go('/list/' + c.id); }) }, name, desc, h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'A list is a group of people with its own feed!'), h('button', { class: 'btn', type: 'submit' }, 'Make list')), err) : null,
+      h('div', { class: 'card' }, r.lists.length ? r.lists.map((l) => h('a', { class: 'note', href: '/list/' + l.id, 'data-link': true }, icon('list'), h('div', { class: 'nt' }, h('b', null, l.name), h('div', { class: 'muted small' }, l.members + (l.members === 1 ? ' person' : ' people') + (l.description ? ' · ' + l.description : ''))))) : h('div', { class: 'empty' }, 'No lists yet!')));
+  }
+  async function listPage(id) {
+    const r = await api('/lists/' + enc(id));
+    setTitle(r.list.name);
+    drawSide();
+    const tab = params().get('tab') === 'people' ? 'people' : 'posts';
+    const path = '/list/' + r.list.id;
+    const tabs = h('div', { class: 'tabs' }, h('a', { href: path, 'data-link': true, class: tab === 'posts' ? 'on' : '' }, 'Posts'), h('a', { href: path + '?tab=people', 'data-link': true, class: tab === 'people' ? 'on' : '' }, 'People (' + r.members.length + ')'));
+    const head = h('div', { class: 'card topichead' }, h('h1', null, r.list.name), h('p', { class: 'muted' }, 'A list by ', link('/u/' + enc(r.list.owner), '@' + r.list.owner), r.list.description ? ' · ' + r.list.description : ''),
+      r.list.isOwner ? h('div', { class: 'row2' }, h('button', { class: 'btn danger small', type: 'button', onclick: safe(async () => { if (!confirm('Delete this list?')) return; await api('/lists/' + r.list.id, { method: 'DELETE' }); toast('List deleted!'); go('/lists'); }) }, 'Delete list')) : null);
+    if (tab === 'people') {
+      const err = errBox();
+      const add = h('input', { placeholder: 'Add someone by username', maxlength: 20, 'aria-label': 'Username to add' });
+      return show(head, tabs, r.list.isOwner ? h('form', { class: 'card compose', onsubmit: guard(err, async () => { await api('/lists/' + r.list.id + '/members', { method: 'POST', body: { username: add.value.trim().replace(/^@/, '') } }); render(); }) }, h('div', { class: 'row' }, add, h('button', { class: 'btn', type: 'submit' }, 'Add')), err) : null,
+        h('div', { class: 'card' }, r.members.length ? h('ul', { class: 'ulist big' }, r.members.map((u) => h('li', { class: 'urow' }, avatar(u), h('div', { class: 'ut' }, link('/u/' + enc(u.username), h('b', null, nameOf(u))), h('div', { class: 'muted small' }, '@' + u.username)), r.list.isOwner ? h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/lists/' + r.list.id + '/members/' + enc(u.username), { method: 'DELETE' }); render(); }) }, 'Remove') : null))) : h('div', { class: 'empty' }, 'Nobody in this list yet!')));
+    }
+    const f = feed('/feed', { list: r.list.id }, { empty: r.members.length ? 'No posts from this list yet!' : 'Add some people on the People tab to see their posts here!' });
+    show(head, tabs, f);
+    await f.ready;
+  }
+
+  // ---------- for the people who run the site ----------
+  async function adminPage() {
+    if (!me || !me.admin) return show(h('div', { class: 'card empty' }, h('h2', null, 'Admins only'), link('/', 'Back to Beta')));
+    setTitle('Admin');
+    side.replaceChildren();
+    const [rep, bans] = await Promise.all([api('/admin/reports'), api('/admin/bans')]);
+    show(h('h1', null, 'Reports'), h('div', { class: 'card' }, rep.items.length ? rep.items.map((it) => {
+      const row = h('div', { class: 'report' },
+        h('div', { class: 'muted small' }, 'Reported by @' + it.reporter + ' ' + ago(it.created) + ': ', h('b', null, it.reason)),
+        it.post ? postCard(it.post, { noReplyLink: true }) : h('p', { class: 'muted' }, 'This post is gone.'),
+        h('div', { class: 'row2' },
+          it.post ? h('button', { class: 'btn danger small', type: 'button', onclick: safe(async () => { if (!confirm('Remove this post for everyone?')) return; await api('/admin/posts/' + it.post_id + '/remove', { method: 'POST' }); row.remove(); toast('Removed!'); }) }, 'Remove post') : null,
+          it.post ? h('button', { class: 'btn danger small', type: 'button', onclick: safe(async () => { const who = (it.post.kind === 'repost' ? it.post.target : it.post).username; const why = prompt('Suspend @' + who + '? Why? (shown when they try to log in)'); if (why === null) return; await api('/admin/users/' + enc(who) + '/ban', { method: 'POST', body: { reason: why } }); toast('Suspended!'); render(); }) }, 'Suspend author') : null,
+          h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/admin/reports/' + it.id + '/dismiss', { method: 'POST' }); row.remove(); }) }, 'Dismiss')));
+      return row;
+    }) : h('div', { class: 'empty' }, 'No reports. All calm!')),
+      h('h2', { class: 'gap' }, 'Suspended people'), h('div', { class: 'card' }, bans.bans.length ? bans.bans.map((b) => h('div', { class: 'urow pad16' }, h('div', { class: 'ut' }, link('/u/' + enc(b.username), '@' + b.username), h('span', { class: 'muted small' }, ' ' + (b.reason || ''))), h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/admin/users/' + enc(b.username) + '/unban', { method: 'POST' }); render(); }) }, 'Unsuspend'))) : h('div', { class: 'empty' }, 'Nobody is suspended.')));
+  }
+
+  // ---------- looks: light or dark, and how roomy ----------
+  function applyPrefs() {
+    const t = store.get('beta_theme') || 'auto';
+    const d = store.get('beta_density') || 'comfortable';
+    if (t === 'auto') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t);
+    if (d === 'compact') document.documentElement.setAttribute('data-density', 'compact'); else document.documentElement.removeAttribute('data-density');
+  }
+  // a square, small copy of the picked picture for the profile picture
+  async function avatarBlob(file) {
+    const url = await readDataUrl(file);
+    const img = await new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = no; i.src = url; });
+    const side2 = Math.min(img.width, img.height);
+    const c = document.createElement('canvas');
+    c.width = c.height = 256;
+    c.getContext('2d').drawImage(img, (img.width - side2) / 2, (img.height - side2) / 2, side2, side2, 0, 0, 256, 256);
+    const toBlob = (type, q) => new Promise((ok) => c.toBlob(ok, type, q));
+    let b = await toBlob('image/webp', 0.85);
+    if (!b || b.type !== 'image/webp') b = await toBlob('image/jpeg', 0.85);
+    return b;
+  }
 
   // ---------- the router ----------
   async function render() {
@@ -776,6 +1017,11 @@
       else if (a === 'search' && !b) await searchPage();
       else if (a === 'notifications' && !b) await notificationsPage();
       else if (a === 'bookmarks' && !b) await bookmarksPage();
+      else if (a === 'explore' && !b) await explorePage();
+      else if (a === 'messages') await messagesPage(b);
+      else if (a === 'lists' && !b) await listsPage();
+      else if (a === 'list' && b) await listPage(b);
+      else if (a === 'admin' && !b) await adminPage();
       else if (a === 'topic' && b) await topicPage(b);
       else if (a === 'u' && b) await userPage(b, c);
       else if (a === 'post' && b) await postPage(b);
@@ -801,6 +1047,7 @@
     go('/search' + (v ? '?q=' + enc(v) : ''));
   });
 
+  applyPrefs();
   api('/me').then((r) => { me = r.user; }).catch(() => {}).then(() => {
     drawNav();
     render();

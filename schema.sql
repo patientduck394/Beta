@@ -76,3 +76,16 @@ CREATE TABLE IF NOT EXISTS attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, us
 CREATE INDEX IF NOT EXISTS attachments_post ON attachments(post_id);
 CREATE INDEX IF NOT EXISTS attachments_user ON attachments(user_id);
 CREATE TABLE IF NOT EXISTS attachment_chunks (attachment_id INTEGER NOT NULL, idx INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (attachment_id, idx));
+
+-- ---- added in version 3 ----
+CREATE TABLE IF NOT EXISTS settings (user_id INTEGER NOT NULL, k TEXT NOT NULL, v TEXT NOT NULL, PRIMARY KEY (user_id, k));
+CREATE TABLE IF NOT EXISTS dms (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS dms_recipient ON dms(recipient_id, read);
+CREATE INDEX IF NOT EXISTS dms_pair ON dms(sender_id, recipient_id, id);
+CREATE TABLE IF NOT EXISTS lists (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS lists_user ON lists(user_id);
+CREATE TABLE IF NOT EXISTS list_members (list_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY (list_id, user_id));
+CREATE INDEX IF NOT EXISTS list_members_user ON list_members(user_id);
+CREATE TABLE IF NOT EXISTS post_cw (post_id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bans (user_id INTEGER PRIMARY KEY, reason TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS avatars (user_id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL);

@@ -5,6 +5,10 @@ compatibility_date = "2026-11-01"
 # The address the app lives at (the radii-office.com site must be in the same Cloudflare account)
 routes = [{ pattern = "beta.radii-office.com", custom_domain = true }]
 
+# People who can use the /admin page (reports and suspensions). Put usernames here, separated by commas.
+[vars]
+ADMINS = ""
+
 [assets]
 directory = "./public"
 not_found_handling = "single-page-application"

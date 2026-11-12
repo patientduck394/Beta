@@ -48,3 +48,14 @@ Then open the address it prints (usually http://localhost:8787).
 - Report a post, change password, delete account, keyboard shortcuts (press ?)
 
 The new database tables are made by the Worker itself the first time it runs after a deploy, so no database command is needed. Files are kept in the D1 database (cut into pieces); for a lot of traffic, move them to R2 later.
+
+## Version 3 additions
+
+- Direct messages (with a count on the envelope), and a setting for who may message you (everyone, people you follow, nobody)
+- Lists of people, each with its own feed, public to everyone; add someone from their profile or any post menu
+- Content warnings that hide a post until you press Show; threads (up to 5 posts written at once); emoji picker; links in posts turn into links
+- Profile pictures (cropped square in the browser); light or dark theme and compact spacing in Settings
+- Explore: top posts and pictures from this week, Topics and people
+- Search filters: `from:name`, `#topic`, `has:image`, `has:file`, `has:poll`, together with words
+- See who liked a post; Share button (uses the phone's share sheet when there is one); download all your data
+- Admin page for reports, removing posts and suspending people. To make yourself an admin, put your username in `wrangler.toml` where it says `ADMINS = ""` (several names can be separated by commas), then deploy
