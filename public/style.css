@@ -258,3 +258,5 @@ kbd { font: 600 .8em ui-monospace, Menlo, monospace; border: 1.5px solid var(--l
 .formcard textarea { width: 100%; min-height: 70px; }
 .side .foot { margin: 10px 4px 0; }
 .card.feed { overflow: visible; }
+
+.brand img { object-fit: contain; }
