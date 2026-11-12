@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beta</title>
+<meta name="description" content="Beta is a microblogging site where every post lives in Topics. Short posts, big conversations!">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css?v=2">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/" data-link><img src="/favicon.svg" alt="" width="30" height="30"><span>Beta</span></a>
+  <form class="search" id="search" role="search"><input id="q" type="search" placeholder="Search topics and people" aria-label="Search topics and people"></form>
+  <nav id="nav"></nav>
+</header>
+<div class="layout">
+  <main id="app"><p class="muted pad">Loading...</p></main>
+  <aside id="side" aria-label="Trending topics"></aside>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="/kd.js?v=3" defer></script>
+<script src="/app.js?v=2" defer></script>
+</body>
+</html>

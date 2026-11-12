@@ -1,0 +1,16 @@
+name = "beta"
+main = "src/worker.js"
+compatibility_date = "2026-11-01"
+
+# The address the app lives at (the radii-office.com site must be in the same Cloudflare account)
+routes = [{ pattern = "beta.radii-office.com", custom_domain = true }]
+
+[assets]
+directory = "./public"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "beta-db"
+database_id = "fb23137a-a135-4688-b1ba-3b6770ed670e"

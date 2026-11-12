@@ -1,0 +1,11 @@
+{
+  "name": "beta",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "db:local": "wrangler d1 execute beta-db --local --file=schema.sql",
+    "db:remote": "wrangler d1 execute beta-db --remote --file=schema.sql",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": { "wrangler": "^4" }
+}
