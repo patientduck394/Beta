@@ -35,3 +35,16 @@ Then open the address it prints (usually http://localhost:8787).
 - Passwords are hashed with PBKDF2 (100,000 rounds). If logins ever fail with "exceeded CPU time limit" on the free Workers plan, the paid Workers plan ( a month) fixes it.
 - Posting, logging in and signing up are rate limited.
 - Keydown: posts can use Keydown formatting (bold, chips, quotes...). `public/Keydown.js` is loaded only when a post needs it, and `public/kd.js` cleans the result before it reaches the page. #topics and @names still turn into links.
+
+## What Beta can do
+
+- Posts up to 300 characters with #Topics, @mentions and Keydown formatting; edit a post for 15 minutes; delete; pin one to your profile
+- Pictures and files (up to 4 per post, pictures shrink in the browser first, 2 MB per picture, 4 MB per file, 40 MB per person), with picture descriptions and a full-size viewer
+- Polls (2 to 4 choices, 1 hour to 7 days), replies, likes, reposts, quote posts and saved posts (bookmarks)
+- Notifications (likes, replies, reposts, quotes, mentions, follows) with a count on the bell
+- Follow people and Topics; mute or block people; mute Topics; Latest and Top in each Topic; who to follow
+- Profiles with display name, bio, website, avatar color, and tabs for Posts, Replies, Media and Likes; follower lists
+- Search posts, people and Topics; RSS for every Topic (/rss/topic/NAME) and person (/rss/user/NAME)
+- Report a post, change password, delete account, keyboard shortcuts (press ?)
+
+The new database tables are made by the Worker itself the first time it runs after a deploy, so no database command is needed. Files are kept in the D1 database (cut into pieces); for a lot of traffic, move them to R2 later.
