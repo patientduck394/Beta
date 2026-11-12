@@ -969,6 +969,7 @@
     const t = store.get('beta_theme') || 'auto';
     const d = store.get('beta_density') || 'comfortable';
     if (t === 'auto') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t);
+    window.dispatchEvent(new Event('kd-recolor'));
     if (d === 'compact') document.documentElement.setAttribute('data-density', 'compact'); else document.documentElement.removeAttribute('data-density');
   }
   // a square, small copy of the picked picture for the profile picture
