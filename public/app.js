@@ -36,7 +36,7 @@
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const err = new Error(data.error || 'Something went wrong!');
+      const err = new Error(data.error || 'Something went wrong! (the server said ' + res.status + ' for ' + path.split('?')[0] + ')');
       err.status = res.status;
       throw err;
     }
