@@ -94,36 +94,21 @@
   };
 
   // ---------- little drawings ----------
-  const PATHS = {
-    comment: 'M2 3h12v8H8l-3 3v-3H2z',
-    repost: 'M3 8V6a2 2 0 0 1 2-2h6V2l3 3-3 3V6H5v2zM13 8v2a2 2 0 0 1-2 2H5v2l-3-3 3-3v2h6V8z',
-    heart: 'M8 14S1.500 10 1.500 5.800A3 3 0 0 1 8 4.300 3 3 0 0 1 14.500 5.800C14.500 10 8 14 8 14z',
-    bookmark: 'M4 2h8v12l-4-3-4 3z',
-    share: 'M8 1l4 4H9v6H7V5H4zM3 10h2v3h6v-3h2v5H3z',
-    more: 'M2 7h2.500v2H2zM6.750 7h2.500v2h-2.500zM11.500 7H14v2h-2.500z',
-    image: 'M2 3h12v10H2zm1.500 1.500v7h9v-7zM5 10l2-2.500L8.500 9l1.500-2 2 3z',
-    poll: 'M2 9h3v5H2zM6.500 2h3v12h-3zM11 6h3v8h-3z',
-    file: 'M3 2.500A1.500 1.500 0 0 1 4.500 1H9l4 4v8.500A1.500 1.500 0 0 1 11.500 15h-7A1.500 1.500 0 0 1 3 13.500z',
-    bell: 'M8 1a4 4 0 0 0-4 4v3l-2 3v1h12v-1l-2-3V5a4 4 0 0 0-4-4zM6.500 13a1.500 1.500 0 0 0 3 0z',
-    x: 'M4 2.600 8 6.600l4-4L13.400 4 9.400 8l4 4-1.400 1.400-4-4-4 4L2.600 12l4-4-4-4z',
-    pin: 'M9 1l6 6-2 1-2-1-2 2v3l-1 1-3-3-3 3-1-1 3-3-3-3 1-1h3l2-2z',
-    mail: 'M1 3h14v10H1zm1.800 1.500L8 8.800l5.200-4.300z',
-    explore: 'M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm3.500 3.500L9.500 9.500l-5 2 2-5z',
-    list: 'M2 3h2v2H2zM6 3.500h8v1H6zM2 7h2v2H2zM6 7.500h8v1H6zM2 11h2v2H2zM6 11.500h8v1H6z',
-    smile: 'M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zM5.500 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2zm5 0a1 1 0 1 1 0 2 1 1 0 0 1 0-2zM4.500 9.500h7a3.500 3.500 0 0 1-7 0z',
-    warn: 'M8 1l7 13H1zM7.300 6h1.400v4H7.300zM7.300 11h1.400v1.400H7.300z',
-    rss: 'M2 2v2.500A9.500 9.500 0 0 1 11.500 14H14A12 12 0 0 0 2 2zm0 4.500V9a5 5 0 0 1 5 5h2.500A7.500 7.500 0 0 0 2 6.500zM3.500 11a1.500 1.500 0 1 0 0 3 1.500 1.500 0 0 0 0-3z',
-  };
+  // icons come from Vadivam (MIT, https://github.com/praveenjuge/vadivam) in vadivam-icons.js; add the class "solid" for the filled version
   const NS = 'http://www.w3.org/2000/svg';
   const icon = (name, cls) => {
+    const spec = (window.__VADIVAM || {})[name];
+    const filled = !!(spec && spec.s && cls && /(^| )solid( |$)/.test(cls));
     const s = document.createElementNS(NS, 'svg');
-    s.setAttribute('viewBox', '0 0 16 16');
-    s.setAttribute('class', 'ic' + (cls ? ' ' + cls : ''));
+    s.setAttribute('viewBox', '0 0 24 24');
+    s.setAttribute('class', ('ic' + (cls ? ' ' + cls : '')).split(' ').filter((c) => c !== 'solid' || filled).join(' '));
     s.setAttribute('aria-hidden', 'true');
-    const p = document.createElementNS(NS, 'path');
-    p.setAttribute('d', PATHS[name]);
-    p.setAttribute('fill-rule', 'evenodd');
-    s.append(p);
+    if (!spec) return s;
+    for (const [tag, attrs] of filled ? spec.s : spec.o) {
+      const el = document.createElementNS(NS, tag);
+      for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+      s.append(el);
+    }
     return s;
   };
 
@@ -336,13 +321,13 @@
       if (!me) return go('/login');
       const r = await api('/posts/' + x.id + '/like', { method: 'POST' });
       x.liked = r.liked; x.likes = r.likes; redraw();
-    }) }, icon('heart'), x.likes || '');
+    }) }, icon('heart', x.liked ? 'solid' : ''), x.likes || '');
     const bmBtn = h('button', { class: 'act' + (x.bookmarked ? ' on' : ''), type: 'button', 'aria-pressed': String(x.bookmarked), 'aria-label': 'Save for later', title: 'Save for later', onclick: safe(async () => {
       if (!me) return go('/login');
       const r = await api('/posts/' + x.id + '/bookmark', { method: 'POST' });
       x.bookmarked = r.bookmarked; redraw();
       if (opts.onUnsave && !r.bookmarked) { wrap.remove(); opts.onUnsave(); }
-    }) }, icon('bookmark'));
+    }) }, icon('bookmark', x.bookmarked ? 'solid' : ''));
     const canRepost = !x.parent_id;
     const closeMenu = (btn) => { const d = btn.closest('details'); if (d) d.removeAttribute('open'); };
     const repostMenu = canRepost ? h('details', { class: 'menu' }, h('summary', { class: 'act' + (x.reposted ? ' on' : ''), 'aria-label': 'Repost or quote' }, icon('repost'), (x.reposts + x.quotes) || ''),
@@ -377,7 +362,7 @@
     const article = h('article', { class: 'post' + (opts.focus ? ' focus' : '') },
       avatar(x),
       h('div', { class: 'pb' },
-        h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), h('span', { class: 'muted small' }, '@' + x.username), h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, opts.pinned ? h('span', { class: 'pinned' }, icon('pin'), 'Pinned') : null),
+        h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), h('span', { class: 'muted small' }, '@' + x.username), h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, opts.pinned ? h('span', { class: 'pinned' }, icon('pin', 'solid'), 'Pinned') : null),
         warn,
         hidden ? null : bodyHolder,
         hidden ? null : (x.files.length ? filesView(x) : null),

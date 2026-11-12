@@ -140,7 +140,8 @@ main > a:first-child { display: inline-block; margin-bottom: 8px; }
 .preview { border: 1.5px dashed var(--line); border-radius: 12px; padding: 8px 12px; }
 
 /* ---- v2: avatars, menus, pictures, polls, notifications and more ---- */
-.ic { width: 16px; height: 16px; fill: currentColor; vertical-align: text-bottom; flex: none; }
+.ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vertical-align: text-bottom; flex: none; }
+.ic.solid { fill: currentColor; stroke: none; fill-rule: evenodd; }
 .av { background: linear-gradient(180deg, var(--a1, #d4ff7a), var(--a2, var(--lime))); }
 .c-lime { --a1: #d4ff7a; --a2: #a3e635; }
 .c-mint { --a1: #a8f7d6; --a2: #34d399; }
@@ -170,7 +171,6 @@ main > a:first-child { display: inline-block; margin-bottom: 8px; }
 .act { display: inline-flex; align-items: center; gap: 5px; }
 .act.on { color: var(--lime-d); }
 .act.liked { color: #d6336c; }
-.act.liked .ic { fill: #d6336c; }
 .act .ic { width: 15px; height: 15px; }
 .acts { justify-content: space-between; max-width: 420px; }
 details.menu { position: relative; display: inline-block; }
