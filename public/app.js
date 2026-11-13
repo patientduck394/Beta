@@ -136,7 +136,7 @@
     out.push(text.slice(last));
     return out;
   }
-  const KD_HINT = /\*\S|__|~\S|=[A-Za-z]=|`|#[A-Za-z0-9]{1,12}#|@@|::|^\s*#{1,6}\s|^\s*>|^\s*[-+]\s|\[[A-Z]\]/m;
+  const KD_HINT = /\*\S|__|~\S|=[A-Za-z]=|`|#[A-Za-z0-9]{1,12}#|@@|::|\{(?:chip|caps|wide|glow|shadow|outline|rainbow|redact|blink|flip|sc|dots|dim|tip)\b|^\s*#{1,6}\s|^\s*>|^\s*[-+]\s|\[[A-Z]\]/m;
   const looksKd = (t) => KD_HINT.test(t);
   function linkify(root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, { acceptNode: (n) => (n.parentElement && n.parentElement.closest('a, code, pre') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT) });
@@ -533,6 +533,7 @@
       ['Spoiler', () => wrap('@spoiler-1@', '@', 'hidden words')], null,
       ['ALL CAPS', () => wrap('{caps}', '{/caps}', 'loud')], ['Wide spacing', () => wrap('{wide}', '{/wide}', 'spread out')], ['Glow', () => wrap('{glow}', '{/glow}', 'shine')], ['Drop shadow', () => wrap('{shadow}', '{/shadow}', 'lifted')],
       ['Outline', () => wrap('{outline}', '{/outline}', 'outlined')], ['Rainbow', () => wrap('{rainbow}', '{/rainbow}', 'colorful')], ['Redacted', () => wrap('{redact}', '{/redact}', 'secret')], ['Mirror', () => wrap('{flip}', '{/flip}', 'mirror')], null,
+      ['Chip: Pill', () => wrap('{chip blue}', '{/chip}', 'label')], ['Chip: Soft', () => wrap('{chip green soft}', '{/chip}', 'label')], ['Chip: Outline', () => wrap('{chip red outline}', '{/chip}', 'label')], ['Chip: Status dot', () => wrap('{chip orange dot}', '{/chip}', 'label')], ['Chip: Price tag', () => wrap('{chip purple tag}', '{/chip}', 'label')], ['Chip: Ticket', () => wrap('{chip teal ticket}', '{/chip}', 'label')], ['Chip: Arrow', () => wrap('{chip pink arrow}', '{/chip}', 'label')], ['Chip: Ribbon', () => wrap('{chip gold ribbon}', '{/chip}', 'label')], ['Chip: Stamp', () => wrap('{chip red stamp}', '{/chip}', 'label')], ['Chip: Sticker', () => wrap('{chip lime sticker}', '{/chip}', 'label')], ['Chip: Highlighter', () => wrap('{chip yellow marker}', '{/chip}', 'label')], ['Chip: Neon sign', () => wrap('{chip cyan neon}', '{/chip}', 'label')], ['Chip: LED display', () => wrap('{chip green led}', '{/chip}', 'label')], ['Chip: Cut corners', () => wrap('{chip slate chamfer}', '{/chip}', 'label')], null,
       ['Progress bar', () => line('::progress 70% Label')], ['Star rating', () => line('::rating 4/5 Review')], ['Countdown', () => line('::countdown ' + new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10) + ' Big day')],
       ['Steps', () => line('::steps Plan\n* [x] First\n* Next\n* Last\n::end')], ['Stat tiles', () => line('::stats Numbers\n| Visitors | 1,204 | +12% |\n| Sales | 85 | -3% |\n::end')], ['Foldout', () => line('::fold Click to open\nHidden words here.\n::end')], ['Timeline', () => line('::timeline Story\n* 2019 - Began\n* 2022 - Grew\n::end')],
     ];
