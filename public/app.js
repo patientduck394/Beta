@@ -193,7 +193,7 @@
           h('a', { href: '/stats', 'data-link': true }, 'Your stats'),
           h('a', { href: '/lists', 'data-link': true }, 'Lists'),
           h('a', { href: '/settings', 'data-link': true }, 'Settings'),
-          me.admin ? h('a', { href: '/admin', 'data-link': true }, 'Admin') : null,
+          me.admin || me.mod ? h('a', { href: '/admin', 'data-link': true }, me.admin ? 'Admin' : 'Moderation') : null,
           h('button', { type: 'button', onclick: () => shortcuts() }, 'Keyboard shortcuts'),
           h('button', { type: 'button', onclick: safe(async () => { await api('/logout', { method: 'POST' }); me = null; drawNav(); go('/'); }) }, 'Log out')));
       nav.append(
@@ -1001,8 +1001,11 @@
     const err = errBox();
     const user = h('input', { id: 'u', autocomplete: 'username', maxlength: 20, required: true });
     const pw = h('input', { id: 'p', type: 'password', autocomplete: mode === 'login' ? 'current-password' : 'new-password', required: true });
+    const inv = h('input', { id: 'inv', maxlength: 20, value: params().get('invite') || '', autocomplete: 'off' });
+    const invRow = h('div', { hidden: true }, h('label', { for: 'inv' }, 'Invite code'), inv);
+    if (mode === 'register') api('/announcements').then((r) => { if (r.inviteOnly) invRow.hidden = false; }).catch(() => {});
     show(h('form', { class: 'card formcard', onsubmit: guard(err, async () => {
-      const r = await api('/' + mode, { method: 'POST', body: { username: user.value, password: pw.value } });
+      const r = await api('/' + mode, { method: 'POST', body: { username: user.value, password: pw.value, invite: inv.value } });
       me = r.user;
       drawNav();
       go('/', true);
@@ -1011,6 +1014,7 @@
       h('h1', null, mode === 'login' ? 'Log in' : 'Join Beta'),
       h('label', { for: 'u' }, 'Username'), user,
       h('label', { for: 'p' }, mode === 'login' ? 'Password' : 'Password (8 or more characters)'), pw,
+      mode === 'register' ? invRow : null,
       err, h('p', null, h('button', { class: 'btn', type: 'submit' }, mode === 'login' ? 'Log in' : 'Sign up')),
       h('p', { class: 'muted small' }, mode === 'login' ? 'New here? ' : 'Already a member? ', link(mode === 'login' ? '/register' : '/login', mode === 'login' ? 'Join Beta' : 'Log in'))));
     user.focus();
@@ -1260,14 +1264,17 @@
   }
 
   async function adminPage() {
-    if (!me || !me.admin) return show(h('div', { class: 'card empty' }, h('h2', null, 'Admins only'), link('/', 'Back to Beta')));
-    setTitle('Admin');
+    if (!me || !(me.admin || me.mod)) return show(h('div', { class: 'card empty' }, h('h2', null, 'Admins only'), link('/', 'Back to Beta')));
+    setTitle(me.admin ? 'Admin' : 'Moderation');
     side.replaceChildren();
-    const TABS = [['overview', 'Overview'], ['reports', 'Reports'], ['people', 'People'], ['outlets', 'Outlets'], ['site', 'Site'], ['audit', 'Activity log']];
+    const ALL = [['overview', 'Overview'], ['reports', 'Reports'], ['people', 'People'], ['content', 'Content'], ['outlets', 'Outlets'], ['files', 'Files'], ['invites', 'Invites'], ['site', 'Site'], ['audit', 'Activity log']];
+    const TABS = me.admin ? ALL : ALL.filter((t) => ['overview', 'reports', 'people', 'content', 'audit'].includes(t[0]));
     const tab = TABS.some((t) => t[0] === params().get('tab')) ? params().get('tab') : 'overview';
     const tabs = h('div', { class: 'tabs' }, TABS.map(([k, l]) => h('a', { href: '/admin' + (k === 'overview' ? '' : '?tab=' + k), 'data-link': true, class: tab === k ? 'on' : '' }, l)));
-    const body = tab === 'reports' ? await adminReports() : tab === 'people' ? [adminPeople()] : tab === 'outlets' ? [await adminOutlets()] : tab === 'site' ? [await adminSite()] : tab === 'audit' ? [await adminAudit()] : [await adminOverview()];
-    show(h('h1', null, 'Admin'), tabs, ...body);
+    const dismissAll = h('div', { class: 'row2' }, h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { if (!confirm('Dismiss every report?')) return; await api('/admin/reports/dismiss-all', { method: 'POST' }); render(); }) }, 'Dismiss all reports'));
+    const body = tab === 'reports' ? [dismissAll, ...(await adminReports())] : tab === 'people' ? [adminPeople()] : tab === 'content' ? [adminContent()] : tab === 'outlets' ? [await adminOutlets()] : tab === 'files' ? [await adminFiles()]
+      : tab === 'invites' ? [await adminInvites()] : tab === 'site' ? [await adminSite()] : tab === 'audit' ? [await adminAudit()] : [await adminOverview()];
+    show(h('h1', null, me.admin ? 'Admin' : 'Moderation'), tabs, ...body);
   }
   async function adminOverview() {
     const s = await api('/admin/stats');
@@ -1290,14 +1297,30 @@
     const row = (u) => {
       const act = (label, fn, cls) => h('button', { type: 'button', class: cls || '', onclick: safe(async (e) => { const d = e.currentTarget.closest('details'); if (d) d.removeAttribute('open'); await fn(); }) }, label);
       const post = (suffix, body) => api('/admin/users/' + enc(u.username) + '/' + suffix, { method: 'POST', body });
-      const menu = u.admin ? null : h('details', { class: 'menu' }, h('summary', { class: 'btn ghost small' }, 'Actions'), h('div', { class: 'pop right' },
-        act(u.banned ? 'Lift suspension' : 'Suspend', async () => { if (u.banned) await post('unban'); else { const why = prompt('Why? (shown to them)'); if (why === null) return; await post('ban', { reason: why }); } toast('Done!'); load(true); }),
+      const items = [
+        act(u.banned ? 'Lift suspension' : 'Suspend', async () => {
+          if (u.banned) await post('unban');
+          else {
+            const why = prompt('Why? (shown to them)'); if (why === null) return;
+            const hrs = prompt('For how many hours? Leave empty to keep it until you lift it.', '');
+            if (hrs === null) return;
+            await post('ban', { reason: why, hours: Number(hrs) || 0 });
+          }
+          toast('Done!'); load(true);
+        }),
+        act('Send a warning', async () => { const text = prompt('What should the warning say? They will see it next time they open Beta:'); if (!text) return; await post('warn', { text }); toast('Warning sent!'); }),
+        act(u.note ? 'Edit the admin note' : 'Add an admin note', async () => { const note = prompt('A private note about @' + u.username + ' (only admins and moderators see it). Empty removes it:', u.note || ''); if (note === null) return; await post('note', { note }); toast('Saved!'); load(true); }),
         act('Sign out everywhere', async () => { await post('signout'); toast('Signed out everywhere!'); }),
+      ];
+      if (me.admin) items.push(
         act('Set a new password', async () => { const pw = prompt('New password for @' + u.username + ' (8 or more characters):'); if (!pw) return; await post('password', { password: pw }); toast('Password changed, and they were signed out!'); }),
         act('Remove all their posts', async () => { if (!confirm('Remove every post by @' + u.username + '?')) return; const r = await post('purge-posts'); toast(r.removed + ' removed!'); load(true); }, 'danger'),
-        act('Delete the account', async () => { if (prompt('Type ' + u.username + ' to delete the account for good:') !== u.username) return toast('Cancelled!'); await post('delete'); toast('Deleted!'); load(true); }, 'danger')));
-      return h('div', { class: 'urow pad16' }, h('div', { class: 'ut' }, link('/u/' + enc(u.username), '@' + u.username), badgeEl(u), u.admin ? h('span', { class: 'chip small' }, 'Admin') : null, u.banned ? h('span', { class: 'chip small bad' }, 'Suspended' + (u.banned_reason ? ': ' + u.banned_reason : '')) : null,
-        h('div', { class: 'muted small' }, 'Joined ' + ago(u.created) + ' · ' + u.posts + ' posts · ' + u.followers + ' followers · ' + (u.last_login ? 'signed in ' + ago(u.last_login) : 'never signed in'))), menu);
+        act('Delete the account', async () => { if (prompt('Type ' + u.username + ' to delete the account for good:') !== u.username) return toast('Cancelled!'); await post('delete'); toast('Deleted!'); load(true); }, 'danger'));
+      const menu = u.admin ? null : h('details', { class: 'menu' }, h('summary', { class: 'btn ghost small' }, 'Actions'), h('div', { class: 'pop right' }, items));
+      return h('div', { class: 'urow pad16' }, h('div', { class: 'ut' }, link('/u/' + enc(u.username), '@' + u.username), badgeEl(u), u.admin ? h('span', { class: 'chip small' }, 'Admin') : null, u.mod ? h('span', { class: 'chip small' }, 'Moderator') : null,
+        u.banned ? h('span', { class: 'chip small bad' }, 'Suspended' + (u.banned_until ? ' until ' + new Date(u.banned_until).toLocaleString() : '') + (u.banned_reason ? ': ' + u.banned_reason : '')) : null,
+        h('div', { class: 'muted small' }, 'Joined ' + ago(u.created) + ' · ' + u.posts + ' posts · ' + u.followers + ' followers · ' + (u.last_login ? 'signed in ' + ago(u.last_login) : 'never signed in')),
+        u.note ? h('div', { class: 'anote small' }, 'Note: ' + u.note) : null), menu);
     };
     const load = safe(async (fresh) => {
       if (fresh === true) { cursor = null; list.replaceChildren(); }
@@ -1313,6 +1336,58 @@
     load(true);
     return box;
   }
+  function adminContent() {
+    const box = h('div');
+    const list = h('div');
+    const more = h('div', { class: 'more' });
+    const q = h('input', { type: 'search', placeholder: 'Search every post for a word', 'aria-label': 'Search posts', maxlength: 60 });
+    let cursor = null, term = '', tm = 0;
+    const load = safe(async (fresh) => {
+      if (fresh === true) { cursor = null; list.replaceChildren(); }
+      more.replaceChildren();
+      const r = await api('/admin/content?q=' + enc(term) + (cursor ? '&before=' + cursor : ''));
+      if (!r.posts.length && !list.children.length) list.append(h('div', { class: 'card empty' }, 'No posts found!'));
+      r.posts.forEach((p) => {
+        const w = h('div', { class: 'card report' }, postCard(p, { noReplyLink: true }), h('div', { class: 'row2' },
+          h('button', { class: 'btn danger small', type: 'button', onclick: safe(async () => { if (!confirm('Remove this post for everyone?')) return; await api('/admin/posts/' + p.id + '/remove', { method: 'POST' }); w.remove(); toast('Removed!'); }) }, 'Remove'),
+          link('/u/' + enc(p.username), 'Author: @' + p.username)));
+        list.append(w);
+      });
+      cursor = r.cursor;
+      if (r.more) more.append(h('button', { class: 'btn ghost', type: 'button', onclick: load }, 'Load more'));
+    });
+    q.addEventListener('input', () => { clearTimeout(tm); tm = setTimeout(() => { term = q.value.trim(); load(true); }, 300); });
+    put(box, h('div', { class: 'row2' }, q), list, more);
+    load(true);
+    return box;
+  }
+  async function adminFiles() {
+    const r = await api('/admin/files');
+    const list = h('div', { class: 'card' });
+    const draw = (files) => put(list, files.length ? files.map((f) => h('div', { class: 'urow pad16' },
+      f.mime.startsWith('image/') ? h('img', { class: 'fthumb', src: '/api/files/' + f.id, alt: '', loading: 'lazy' }) : h('span', { class: 'fthumb ficon' }, 'FILE'),
+      h('div', { class: 'ut' }, h('b', null, f.name), ' ', h('span', { class: 'muted small' }, bytes(f.size) + ' · ' + f.mime), h('div', { class: 'muted small' }, 'by @' + f.username + ' ' + ago(f.created) + (f.post_id ? ' · ' : ''), f.post_id ? link('/post/' + f.post_id, 'the post') : ' (not on a post)')),
+      h('button', { class: 'btn danger small', type: 'button', onclick: safe(async () => { if (!confirm('Delete this file?')) return; await api('/admin/files/' + f.id + '/remove', { method: 'POST' }); files = files.filter((x) => x !== f); draw(files); toast('Deleted!'); }) }, 'Delete'))) : h('div', { class: 'empty' }, 'No files yet!'));
+    let files = r.files;
+    draw(files);
+    return h('div', null, h('p', { class: 'muted' }, 'The 50 biggest files, largest first.'), list);
+  }
+  async function adminInvites() {
+    const note = h('input', { placeholder: 'Who is it for? (a note)', maxlength: 60, 'aria-label': 'Note' });
+    const max = h('input', { type: 'number', min: 0, max: 1000, placeholder: 'Uses (0 = unlimited)', 'aria-label': 'How many people can use it' });
+    const list = h('div', { class: 'card' });
+    const err = errBox();
+    const draw = async () => {
+      const r = await api('/admin/invites');
+      put(list, r.invites.length ? r.invites.map((i) => { const url = location.origin + '/register?invite=' + i.code; return h('div', { class: 'urow pad16' }, h('div', { class: 'ut' }, h('code', null, i.code), i.disabled ? h('span', { class: 'chip small bad' }, 'Off') : null, ' ', h('span', { class: 'muted small' }, i.uses + ' used' + (i.max ? ' of ' + i.max : '') + (i.note ? ' · ' + i.note : ''))),
+        h('button', { class: 'btn ghost small', type: 'button', onclick: async () => { try { await navigator.clipboard.writeText(url); toast('Link copied!'); } catch (e) { prompt('Copy this link:', url); } } }, 'Copy link'),
+        h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/admin/invites/' + i.code + '/toggle', { method: 'POST' }); draw(); }) }, i.disabled ? 'Turn on' : 'Turn off'),
+        h('button', { class: 'btn danger small', type: 'button', onclick: safe(async () => { await api('/admin/invites/' + i.code, { method: 'DELETE' }); draw(); }) }, 'Delete')); }) : h('div', { class: 'empty' }, 'No invites yet!'));
+    };
+    await draw();
+    return h('div', null, h('div', { class: 'card pad16' }, h('h2', null, 'Make an invite'), h('p', { class: 'muted small' }, 'Invites only matter when invite-only sign-up is on (Site tab).'),
+      h('div', { class: 'row2' }, note, max, h('button', { class: 'btn small', type: 'button', onclick: guard(err, async () => { await api('/admin/invites', { method: 'POST', body: { note: note.value, max: parseInt(max.value, 10) || 0 } }); note.value = max.value = ''; draw(); toast('Invite made!'); }) }, 'Make it')), err), list);
+  }
   async function adminOutlets() {
     const r = await api('/admin/outlets');
     const list = h('div', { class: 'card' });
@@ -1323,17 +1398,33 @@
     return list;
   }
   async function adminSite() {
-    const set = await api('/admin/settings');
+    const [set, tp, mods] = await Promise.all([api('/admin/settings'), api('/admin/topics'), api('/admin/mods')]);
     const err = errBox();
     const save = (patch) => api('/admin/settings', { method: 'POST', body: patch });
-    const toggle = (label, hint, on, key, invert) => { const cb = h('input', { type: 'checkbox', checked: invert ? !on : on, onchange: safe(async () => { await save({ [key]: invert ? !cb.checked : cb.checked }); toast('Saved!'); }) }); return h('label', { class: 'checkrow' }, cb, h('span', null, h('b', null, label), h('div', { class: 'muted small' }, hint))); };
+    const toggle = (label, hint, on, key) => { const cb = h('input', { type: 'checkbox', checked: on, onchange: safe(async () => { await save({ [key]: cb.checked }); toast('Saved!'); }) }); return h('label', { class: 'checkrow' }, cb, h('span', null, h('b', null, label), h('div', { class: 'muted small' }, hint))); };
     const words = h('textarea', { rows: 4, 'aria-label': 'Blocked words', placeholder: 'One word or phrase per line', value: set.blocked_words.join('\n') });
+    const reserved = h('textarea', { rows: 3, 'aria-label': 'Reserved usernames', placeholder: 'One name per line', value: set.reserved_names.join('\n') });
+    const hiddenBox = h('div'), modBox = h('div');
+    const drawHidden = (hidden) => put(hiddenBox, hidden.length ? h('div', { class: 'chips' }, hidden.map((t) => h('button', { type: 'button', class: 'chip', title: 'Show this Topic again', onclick: safe(async () => { await api('/admin/topics', { method: 'POST', body: { topic: t, hidden: false } }); drawHidden(hidden.filter((x) => x !== t)); }) }, '#' + t + ' ×'))) : h('p', { class: 'muted small' }, 'No hidden Topics.'));
+    drawHidden(tp.hidden);
+    const hideIn = h('input', { placeholder: 'Topic to hide', maxlength: 30, 'aria-label': 'Topic to hide' });
+    const drawMods = (list) => put(modBox, list.length ? h('div', { class: 'chips' }, list.map((m) => h('button', { type: 'button', class: 'chip', title: 'Remove as moderator', onclick: safe(async () => { await api('/admin/mods/' + enc(m.username), { method: 'DELETE' }); drawMods(list.filter((x) => x !== m)); }) }, '@' + m.username + ' ×'))) : h('p', { class: 'muted small' }, 'No moderators yet.'));
+    drawMods(mods.mods);
+    const modIn = h('input', { placeholder: 'username', maxlength: 20, 'aria-label': 'Moderator username' });
     return h('div', null,
       h('div', { class: 'card pad16' }, h('h2', null, 'Site controls'),
         toggle('New sign-ups are open', 'Turn off to pause registrations.', set.reg_open, 'reg_open'),
+        toggle('Invite-only sign-up', 'New people need an invite code (make them on the Invites tab).', set.invite_only, 'invite_only'),
         toggle('Read-only mode', 'Nobody but admins can post, like or change anything. Handy while you fix something!', set.readonly, 'readonly'),
-        h('h2', { class: 'gap' }, 'Words that are not allowed in posts'), h('p', { class: 'muted small' }, 'Posts and edits with these words are refused (admins are exempt).'), words, err,
-        h('p', null, h('button', { class: 'btn', type: 'button', onclick: guard(err, async () => { await save({ blocked_words: words.value.split('\n') }); toast('Saved!'); }) }, 'Save words'))),
+        h('h2', { class: 'gap' }, 'Words that are not allowed in posts'), h('p', { class: 'muted small' }, 'Posts and edits with these words are refused (admins are exempt).'), words,
+        h('h2', { class: 'gap' }, 'Reserved usernames'), h('p', { class: 'muted small' }, 'Nobody can sign up with these names.'), reserved, err,
+        h('p', null, h('button', { class: 'btn', type: 'button', onclick: guard(err, async () => { await save({ blocked_words: words.value.split('\n'), reserved_names: reserved.value.split('\n') }); toast('Saved!'); }) }, 'Save lists'))),
+      h('div', { class: 'card pad16' }, h('h2', null, 'Hidden Topics'), h('p', { class: 'muted small' }, 'Hidden Topics stay out of Trending, the Topics list and Explore. The posts still exist.'), hiddenBox,
+        h('div', { class: 'row2' }, hideIn, h('button', { class: 'btn small', type: 'button', onclick: safe(async () => { if (!hideIn.value.trim()) return; await api('/admin/topics', { method: 'POST', body: { topic: hideIn.value } }); const t = hideIn.value.trim().replace(/^#/, '').toLowerCase(); hideIn.value = ''; tp.hidden.push(t); drawHidden(tp.hidden); }) }, 'Hide it')),
+        tp.top.length ? h('p', { class: 'muted small' }, 'Biggest Topics: ', tp.top.slice(0, 12).map((x) => h('span', { class: 'muted' }, '#' + x.topic + ' (' + x.n + ') '))) : null),
+      h('div', { class: 'card pad16' }, h('h2', null, 'Moderators'), h('p', { class: 'muted small' }, 'Moderators can read reports, remove posts, warn and suspend people, but cannot change the site or delete accounts.'), modBox,
+        h('div', { class: 'row2' }, modIn, h('button', { class: 'btn small', type: 'button', onclick: safe(async () => { await api('/admin/mods', { method: 'POST', body: { username: modIn.value.trim() } }); const r = await api('/admin/mods'); drawMods(r.mods); modIn.value = ''; toast('Added!'); }) }, 'Make moderator'))),
+      h('div', { class: 'card pad16' }, h('h2', null, 'Downloads'), h('div', { class: 'row2' }, h('a', { class: 'btn ghost', href: '/api/admin/export/users.csv', download: true }, 'People (CSV)'), h('a', { class: 'btn ghost', href: '/api/admin/export/audit.csv', download: true }, 'Activity log (CSV)'))),
       await adminTools());
   }
   async function adminAudit() {
@@ -1437,6 +1528,12 @@
     return h('div', { class: 'card pad16 admintools' }, h('h2', null, 'Badges'), h('div', { class: 'row2' }, un, kind, h('button', { class: 'btn small', type: 'button', onclick: guard(err1, async () => { await api('/admin/badges', { method: 'POST', body: { username: un.value.trim(), kind: kind.value || null } }); toast('Done!'); un.value = ''; }) }, 'Apply')), err1,
       h('h2', null, 'Announcements'), h('div', { class: 'row2' }, text, days, h('button', { class: 'btn small', type: 'button', onclick: guard(err2, async () => { await api('/admin/announcements', { method: 'POST', body: { text: text.value, days: parseInt(days.value, 10) } }); text.value = ''; draw(); toast('Posted!'); }) }, 'Post')), err2, list);
   }
+  function showWarnings() {
+    if (!me || !me.warnings || !me.warnings.length) return;
+    const list = me.warnings;
+    const box = modal('A message from the Beta team', list.map((w) => h('div', { class: 'ver' }, h('div', { class: 'muted small' }, ago(w.created)), h('div', { class: 'vbody' }, w.text))),
+      h('p', null, h('button', { class: 'btn', type: 'button', onclick: safe(async () => { await api('/me/warnings/seen', { method: 'POST' }); me.warnings = []; box.remove(); }) }, 'I understand')));
+  }
   async function showAnnouncements() {
     try {
       const { items, readonly, signupsPaused } = await api('/announcements');
@@ -1528,6 +1625,7 @@
     drawNav();
     render();
     showAnnouncements();
+    showWarnings();
     setInterval(refreshUnread, 60000);
   });
 })();

@@ -461,3 +461,10 @@ a.tile:hover { border-color: var(--lime-d); }
 :root[data-theme="dark"] .chip.bad { background: #3b1613; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .chip.bad { background: #3b1613; } }
 .tabs a.on { background: var(--lime-l); color: var(--lime-dd); }
+.anote { margin-top: 4px; padding: 3px 8px; border-left: 3px solid var(--lime-d); background: var(--lime-ll); color: var(--ink); border-radius: 0 8px 8px 0; }
+.fthumb { width: 48px; height: 48px; object-fit: cover; border-radius: 8px; flex: none; background: var(--lime-ll); }
+.ficon { display: inline-flex; align-items: center; justify-content: center; font-size: .65rem; font-weight: 800; color: var(--muted); border: 1.5px solid var(--line); }
+.card.report { margin-bottom: 12px; padding-bottom: 10px; }
+.tabs { flex-wrap: wrap; }
+.tabs a { white-space: nowrap; }
+.card.pad16 textarea { width: 100%; box-sizing: border-box; }

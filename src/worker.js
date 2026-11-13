@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -158,6 +158,14 @@ const DDL = [
   "CREATE TABLE IF NOT EXISTS reply_policy (post_id INTEGER PRIMARY KEY, policy TEXT NOT NULL)",
   // version 6: the admin audit log (site settings live in the meta table)
   "CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, admin TEXT NOT NULL, action TEXT NOT NULL, created INTEGER NOT NULL)",
+  // version 7: moderators, warnings, timed suspensions, admin notes, invites, hidden topics
+  "CREATE TABLE IF NOT EXISTS site_mods (user_id INTEGER PRIMARY KEY)",
+  "CREATE TABLE IF NOT EXISTS warnings (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, text TEXT NOT NULL, created INTEGER NOT NULL, seen INTEGER NOT NULL DEFAULT 0)",
+  "CREATE INDEX IF NOT EXISTS warnings_user ON warnings(user_id, seen)",
+  "CREATE TABLE IF NOT EXISTS ban_until (user_id INTEGER PRIMARY KEY, until INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS admin_notes (user_id INTEGER PRIMARY KEY, note TEXT NOT NULL, updated INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT '', max INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0)",
+  "CREATE TABLE IF NOT EXISTS hidden_topics (topic TEXT PRIMARY KEY)",
 ];
 let schemaReady = null;
 function ensureSchema(env) {
@@ -486,6 +494,7 @@ async function purgeUser(D, u) {
     D.stmt('DELETE FROM bookmark_folder_items WHERE user_id=?', u), D.stmt('DELETE FROM bookmark_folders WHERE user_id=?', u), D.stmt('DELETE FROM badges WHERE user_id=?', u),
     D.stmt('DELETE FROM profile_fields WHERE user_id=?', u), D.stmt('DELETE FROM user_notes WHERE user_id=? OR target_id=?', u, u),
     D.stmt('DELETE FROM outlet_members WHERE user_id=?', u), D.stmt('DELETE FROM outlet_bans WHERE user_id=?', u),
+    D.stmt('DELETE FROM warnings WHERE user_id=?', u), D.stmt('DELETE FROM ban_until WHERE user_id=?', u), D.stmt('DELETE FROM admin_notes WHERE user_id=?', u), D.stmt('DELETE FROM site_mods WHERE user_id=?', u),
   ]);
 }
 
@@ -524,6 +533,19 @@ async function tokenHash(req) {
   return m ? sha256(m[1]) : '';
 }
 const BADGES = ['verified', 'staff', 'supporter'];
+// moderators can read reports and act on posts and people, but not change the site
+const modAllowed = (seg, method) => {
+  const a = seg[1];
+  if (a === 'stats' || a === 'audit' || a === 'bans') return method === 'GET';
+  if (a === 'users') return !seg[2] ? method === 'GET' : ['ban', 'unban', 'signout', 'warn', 'note'].includes(seg[3]);
+  return ['reports', 'posts', 'content'].includes(a);
+};
+const csvCell = (v) => {
+  let t = String(v == null ? '' : v);
+  if (/^[=+\-@\t\r]/.test(t)) t = "'" + t;
+  return '"' + t.replace(/"/g, '""') + '"';
+};
+const csv = (rows) => rows.map((r) => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
 
 async function route(req, env, url) {
   const D = db(env);
@@ -591,7 +613,14 @@ async function route(req, env, url) {
     const pw = String(b.password || '');
     if (pw.length < 8 || pw.length > 200) bad('Passwords need at least 8 characters!');
     if (await D.first('SELECT 1 AS x FROM users WHERE username=?', name)) bad('That username is taken!', 409);
+    if ((await siteGet(D, 'reserved_names', '')).split('\n').map((w) => w.trim().toLowerCase()).filter(Boolean).includes(name.toLowerCase())) bad('That name is saved for the site. Pick another!');
+    let invite = null;
+    if ((await siteGet(D, 'invite_only', '0')) === '1') {
+      invite = await D.first('SELECT code, max, uses, disabled FROM invites WHERE code=?', String(b.invite || '').trim().toUpperCase());
+      if (!invite || invite.disabled || (invite.max && invite.uses >= invite.max)) bad('Beta is invite-only right now. Ask for an invite link!', 403);
+    }
     const r = await D.run('INSERT INTO users(username,pw,created) VALUES(?,?,?)', name, await hashPw(pw), Date.now());
+    if (invite) await D.run('UPDATE invites SET uses=uses+1 WHERE code=?', invite.code);
     const token = await newSession(D, r.meta.last_row_id, 'web');
     return json({ user: { username: name, bio: '', display_name: '', color: 'lime', unread: 0 } }, 200, { 'set-cookie': cookie(req, token, 2592000) });
   }
@@ -603,8 +632,12 @@ async function route(req, env, url) {
     const row = await D.first('SELECT id, username, bio, pw FROM users WHERE username=?', name);
     const ok = row ? await checkPw(String(b.password || ''), row.pw) : (await hashPw('x'), false);
     if (!ok) bad('That username or password is not right!', 401);
-    const ban = await D.first('SELECT reason FROM bans WHERE user_id=?', row.id);
-    if (ban) bad('This account is suspended' + (ban.reason ? ': ' + ban.reason : '') + '.', 403);
+    let ban = await D.first('SELECT reason FROM bans WHERE user_id=?', row.id);
+    if (ban) {
+      const bu = await D.first('SELECT until FROM ban_until WHERE user_id=?', row.id);
+      if (bu && bu.until < Date.now()) { await D.batch([D.stmt('DELETE FROM bans WHERE user_id=?', row.id), D.stmt('DELETE FROM ban_until WHERE user_id=?', row.id)]); ban = null; }
+      else bad('This account is suspended' + (ban.reason ? ': ' + ban.reason : '') + (bu ? ' (until ' + new Date(bu.until).toUTCString() + ')' : '') + '.', 403);
+    }
     const token = await newSession(D, row.id, 'web');
     const t = await theme(row.id);
     return json({ user: { username: row.username, bio: row.bio, display_name: t.display_name, color: t.color, unread: 0 } }, 200, { 'set-cookie': cookie(req, token, 2592000) });
@@ -623,7 +656,9 @@ async function route(req, env, url) {
     const st = await settingsOf(D, user.id);
     await runDue(env);
     const filters = (await D.all('SELECT word FROM word_filters WHERE user_id=?', user.id)).map((r) => r.word);
-    return json({ user: { ...row, filters, display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, admin: isAdmin(env, user), avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
+    const isModer = !!(await D.first('SELECT 1 AS x FROM site_mods WHERE user_id=?', user.id));
+    const warnings = await D.all('SELECT id, text, created FROM warnings WHERE user_id=? AND seen=0 ORDER BY id LIMIT 3', user.id);
+    return json({ user: { ...row, filters, mod: isModer, warnings, display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, admin: isAdmin(env, user), avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
   }
   if (seg[0] === 'me' && !seg[1] && method === 'PATCH') {
     need();
@@ -897,7 +932,7 @@ async function route(req, env, url) {
       where += ' AND p.user_id IN (SELECT user_id FROM list_members WHERE list_id=?)';
       params = [lid];
     } else if (sp.get('scope') === 'explore') {
-      where += " AND p.created > ? AND p.id NOT IN (SELECT post_id FROM refs WHERE kind='repost')";
+      where += " AND p.created > ? AND p.id NOT IN (SELECT post_id FROM refs WHERE kind='repost') AND p.id NOT IN (SELECT post_id FROM post_topics WHERE topic IN (SELECT topic FROM hidden_topics))";
       params = [Date.now() - 7 * 864e5];
       if (sp.get('media') === '1') where += ' AND p.id IN (SELECT post_id FROM attachments WHERE post_id IS NOT NULL)';
       opts = { limit: 30, order: '((SELECT COUNT(*) FROM likes l WHERE l.post_id=p.id) * 2 + (SELECT COUNT(*) FROM posts r WHERE r.parent_id=p.id) * 3 + (SELECT COUNT(*) FROM refs x WHERE x.target_id=p.id) * 3) DESC, p.id DESC' };
@@ -979,8 +1014,8 @@ async function route(req, env, url) {
   // --- topics
   if (seg[0] === 'topics' && !seg[1] && method === 'GET') {
     const since = Date.now() - 3 * 864e5;
-    let rows = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? GROUP BY pt.topic ORDER BY n DESC, MAX(p.id) DESC LIMIT 10', since);
-    if (!rows.length) rows = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt GROUP BY pt.topic ORDER BY n DESC, MAX(pt.post_id) DESC LIMIT 10');
+    let rows = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY n DESC, MAX(p.id) DESC LIMIT 10', since);
+    if (!rows.length) rows = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt WHERE pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY n DESC, MAX(pt.post_id) DESC LIMIT 10');
     return json({ topics: rows });
   }
   if (seg[0] === 'topics' && seg[1] && !seg[2] && method === 'GET') {
@@ -1163,6 +1198,11 @@ async function route(req, env, url) {
     }
     if (method === 'DELETE' && seg[2]) { await D.run('DELETE FROM word_filters WHERE user_id=? AND word=?', user.id, seg[2].toLowerCase()); return json({ ok: true }); }
   }
+  if (seg[0] === 'me' && seg[1] === 'warnings' && seg[2] === 'seen' && method === 'POST') {
+    need();
+    await D.run('UPDATE warnings SET seen=1 WHERE user_id=?', user.id);
+    return json({ ok: true });
+  }
   if (seg[0] === 'me' && seg[1] === 'fields' && method === 'POST') {
     need();
     const b = await readJson(req, 3000);
@@ -1262,8 +1302,8 @@ async function route(req, env, url) {
   }
   if (seg[0] === 'trending' && method === 'GET') {
     const since = Date.now() - 864e5;
-    const topics = await D.all('SELECT pt.topic AS topic, COUNT(DISTINCT p.user_id) AS people, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? AND p.id NOT IN (SELECT post_id FROM outlet_posts) GROUP BY pt.topic ORDER BY people DESC, n DESC, pt.topic LIMIT 10', since);
-    const rows = await D.all('SELECT p.id, (SELECT COUNT(*) FROM likes WHERE post_id=p.id) + (SELECT COUNT(*) FROM reactions WHERE post_id=p.id) + 2*(SELECT COUNT(*) FROM refs WHERE target_id=p.id) + (SELECT COUNT(*) FROM posts c WHERE c.parent_id=p.id) AS score FROM posts p WHERE p.parent_id IS NULL AND p.created>? AND p.id NOT IN (SELECT post_id FROM refs) AND p.id NOT IN (SELECT post_id FROM outlet_posts) ORDER BY score DESC, p.id DESC LIMIT 5', since);
+    const topics = await D.all('SELECT pt.topic AS topic, COUNT(DISTINCT p.user_id) AS people, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? AND p.id NOT IN (SELECT post_id FROM outlet_posts) AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY people DESC, n DESC, pt.topic LIMIT 10', since);
+    const rows = await D.all('SELECT p.id, (SELECT COUNT(*) FROM likes WHERE post_id=p.id) + (SELECT COUNT(*) FROM reactions WHERE post_id=p.id) + 2*(SELECT COUNT(*) FROM refs WHERE target_id=p.id) + (SELECT COUNT(*) FROM posts c WHERE c.parent_id=p.id) AS score FROM posts p WHERE p.parent_id IS NULL AND p.created>? AND p.id NOT IN (SELECT post_id FROM refs) AND p.id NOT IN (SELECT post_id FROM outlet_posts) AND p.id NOT IN (SELECT post_id FROM post_topics WHERE topic IN (SELECT topic FROM hidden_topics)) ORDER BY score DESC, p.id DESC LIMIT 5', since);
     const hot = rows.filter((r) => r.score > 0);
     const posts = hot.length ? (await listPosts(env, D, user, `p.id IN (${ph(hot.length)})`, hot.map((r) => r.id), { limit: 5 })).posts : [];
     const rank = new Map(hot.map((r, i) => [r.id, i]));
@@ -1278,7 +1318,7 @@ async function route(req, env, url) {
     return json({ users: rows });
   }
   if (seg[0] === 'announcements' && method === 'GET') {
-    return json({ items: await D.all('SELECT id, text, created FROM announcements WHERE ends IS NULL OR ends>? ORDER BY id DESC LIMIT 3', Date.now()), readonly: (await siteGet(D, 'readonly', '0')) === '1', signupsPaused: (await siteGet(D, 'reg_open', '1')) === '0' });
+    return json({ items: await D.all('SELECT id, text, created FROM announcements WHERE ends IS NULL OR ends>? ORDER BY id DESC LIMIT 3', Date.now()), readonly: (await siteGet(D, 'readonly', '0')) === '1', signupsPaused: (await siteGet(D, 'reg_open', '1')) === '0', inviteOnly: (await siteGet(D, 'invite_only', '0')) === '1' });
   }
   if (seg[0] === 'dm') {
     need();
@@ -1561,7 +1601,9 @@ async function route(req, env, url) {
   // --- for the people who run the site: set ADMINS in wrangler.toml
   if (seg[0] === 'admin') {
     need();
-    if (!isAdmin(env, user)) bad('Admins only!', 403);
+    const role = isAdmin(env, user) ? 'admin' : (await D.first('SELECT 1 AS x FROM site_mods WHERE user_id=?', user.id)) ? 'mod' : null;
+    if (!role) bad('Admins only!', 403);
+    if (role === 'mod' && !modAllowed(seg, method)) bad('That one is for admins only!', 403);
     // every change an admin makes is written down
     if (method !== 'GET') await D.run('INSERT INTO audit(admin,action,created) VALUES(?,?,?)', user.username, method + ' ' + seg.slice(1).join('/'), Date.now());
     if (seg[1] === 'reports' && !seg[2] && method === 'GET') {
@@ -1579,10 +1621,14 @@ async function route(req, env, url) {
       const u = await D.first('SELECT id, username FROM users WHERE username=?', seg[2]);
       if (!u) bad('We could not find that person!', 404);
       if (isAdmin(env, u)) bad('You cannot suspend an admin!');
+      if (role === 'mod' && (await D.first('SELECT 1 AS x FROM site_mods WHERE user_id=?', u.id))) bad('Moderators cannot suspend each other!', 403);
+      const hrs = Math.min(24 * 365, Math.max(0, Number(b.hours) || 0));
+      if (hrs) await D.run('INSERT INTO ban_until(user_id,until) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET until=excluded.until', u.id, Date.now() + hrs * 3600000);
+      else await D.run('DELETE FROM ban_until WHERE user_id=?', u.id);
       await D.batch([D.stmt('INSERT INTO bans(user_id,reason,created) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason', u.id, cleanLine(b.reason, 100), Date.now()), D.stmt('DELETE FROM sessions WHERE user_id=?', u.id)]);
       return json({ ok: true });
     }
-    if (seg[1] === 'users' && seg[2] && seg[3] === 'unban' && method === 'POST') { await D.run('DELETE FROM bans WHERE user_id=(SELECT id FROM users WHERE username=?)', seg[2]); return json({ ok: true }); }
+    if (seg[1] === 'users' && seg[2] && seg[3] === 'unban' && method === 'POST') { await D.batch([D.stmt('DELETE FROM ban_until WHERE user_id=(SELECT id FROM users WHERE username=?)', seg[2]), D.stmt('DELETE FROM bans WHERE user_id=(SELECT id FROM users WHERE username=?)', seg[2])]); return json({ ok: true }); }
     if (seg[1] === 'stats' && method === 'GET') {
       const n = async (sql, ...a) => (await D.first(sql, ...a)).n;
       const since = Date.now() - 14 * 864e5;
@@ -1606,9 +1652,9 @@ async function route(req, env, url) {
       const q = String(url.searchParams.get('q') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 30);
       const before = intParam(url.searchParams.get('before'));
       const rows = await D.all(`SELECT u.id, u.username, u.created, (SELECT COUNT(*) FROM posts WHERE user_id=u.id) AS posts, (SELECT COUNT(*) FROM follows WHERE followee=u.id) AS followers,
-        (SELECT kind FROM badges WHERE user_id=u.id) AS badge, (SELECT reason FROM bans WHERE user_id=u.id) AS banned_reason, (SELECT COUNT(*) FROM bans WHERE user_id=u.id) AS banned,
+        (SELECT kind FROM badges WHERE user_id=u.id) AS badge, (SELECT note FROM admin_notes WHERE user_id=u.id) AS note, (SELECT COUNT(*) FROM site_mods WHERE user_id=u.id) AS is_mod, (SELECT until FROM ban_until WHERE user_id=u.id) AS banned_until, (SELECT reason FROM bans WHERE user_id=u.id) AS banned_reason, (SELECT COUNT(*) FROM bans WHERE user_id=u.id) AS banned,
         (SELECT MAX(created) FROM sessions WHERE user_id=u.id) AS last_login FROM users u WHERE u.username LIKE ? ESCAPE '\\' ${before ? 'AND u.id < ?' : ''} ORDER BY u.id DESC LIMIT 30`, '%' + q.replace(/[%_\\]/g, '\\$&') + '%', ...(before ? [before] : []));
-      return json({ users: rows.map((r) => ({ ...r, banned: !!r.banned, admin: isAdmin(env, r) })), cursor: rows.length === 30 ? rows[rows.length - 1].id : null });
+      return json({ users: rows.map((r) => ({ ...r, banned: !!r.banned, mod: !!r.is_mod, admin: isAdmin(env, r) })), cursor: rows.length === 30 ? rows[rows.length - 1].id : null });
     }
     if (seg[1] === 'users' && seg[2] && ['signout', 'password', 'delete', 'purge-posts'].includes(seg[3]) && method === 'POST') {
       const u = await D.first('SELECT id, username FROM users WHERE username=?', seg[2]);
@@ -1627,7 +1673,7 @@ async function route(req, env, url) {
       return json({ ok: true });
     }
     if (seg[1] === 'settings' && method === 'GET') {
-      return json({ reg_open: (await siteGet(D, 'reg_open', '1')) !== '0', readonly: (await siteGet(D, 'readonly', '0')) === '1', blocked_words: (await siteGet(D, 'blocked_words', '')).split('\n').filter(Boolean) });
+      return json({ reg_open: (await siteGet(D, 'reg_open', '1')) !== '0', readonly: (await siteGet(D, 'readonly', '0')) === '1', blocked_words: (await siteGet(D, 'blocked_words', '')).split('\n').filter(Boolean), invite_only: (await siteGet(D, 'invite_only', '0')) === '1', reserved_names: (await siteGet(D, 'reserved_names', '')).split('\n').filter(Boolean) });
     }
     if (seg[1] === 'settings' && method === 'POST') {
       const b = await readJson(req, 6000);
@@ -1639,6 +1685,8 @@ async function route(req, env, url) {
         const words = [...new Set((Array.isArray(b.blocked_words) ? b.blocked_words : []).map((w) => cleanLine(w, 40).toLowerCase()).filter(Boolean))].slice(0, 200);
         list.push(put('blocked_words', words.join('\n')));
       }
+      if (b.invite_only !== undefined) list.push(put('invite_only', b.invite_only ? '1' : '0'));
+      if (b.reserved_names !== undefined) list.push(put('reserved_names', [...new Set((Array.isArray(b.reserved_names) ? b.reserved_names : []).map((w) => cleanLine(w, 20).toLowerCase()).filter(Boolean))].slice(0, 300).join('\n')));
       if (list.length) await D.batch(list);
       return json({ ok: true });
     }
@@ -1658,6 +1706,83 @@ async function route(req, env, url) {
       const post = id && (await onePost(env, D, user, id));
       if (!post) bad('We could not find that post!', 404);
       return json({ post });
+    }
+    if (seg[1] === 'users' && seg[2] && seg[3] === 'warn' && method === 'POST') {
+      const u = await D.first('SELECT id FROM users WHERE username=?', seg[2]);
+      if (!u) bad('We could not find that person!', 404);
+      const b = await readJson(req, 1500);
+      const text = cleanLine(b.text, 400);
+      if (!text) bad('Write the warning first!');
+      await D.run('INSERT INTO warnings(user_id,text,created) VALUES(?,?,?)', u.id, text, Date.now());
+      return json({ ok: true });
+    }
+    if (seg[1] === 'users' && seg[2] && seg[3] === 'note' && method === 'POST') {
+      const u = await D.first('SELECT id FROM users WHERE username=?', seg[2]);
+      if (!u) bad('We could not find that person!', 404);
+      const b = await readJson(req, 2000);
+      const note = cleanLine(b.note, 500);
+      if (note) await D.run('INSERT INTO admin_notes(user_id,note,updated) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET note=excluded.note, updated=excluded.updated', u.id, note, Date.now());
+      else await D.run('DELETE FROM admin_notes WHERE user_id=?', u.id);
+      return json({ ok: true });
+    }
+    if (seg[1] === 'reports' && seg[2] === 'dismiss-all' && method === 'POST') { await D.run('DELETE FROM reports'); return json({ ok: true }); }
+    if (seg[1] === 'content' && method === 'GET') {
+      const q = String(url.searchParams.get('q') || '').trim().slice(0, 60).replace(/[\\%_]/g, '\\$&');
+      const before = intParam(url.searchParams.get('before'));
+      const got = await listPosts(env, D, user, "p.id NOT IN (SELECT post_id FROM refs WHERE kind='repost')" + (q ? " AND p.body LIKE ? ESCAPE '\\'" : ''), q ? ['%' + q + '%'] : [], { before, limit: 20 });
+      return json({ posts: got.posts, cursor: got.cursor, more: got.count === 20 });
+    }
+    if (seg[1] === 'files' && !seg[2] && method === 'GET') {
+      return json({ files: await D.all('SELECT a.id, a.name, a.mime, a.size, a.post_id, a.created, u.username FROM attachments a JOIN users u ON u.id=a.user_id ORDER BY a.size DESC LIMIT 50') });
+    }
+    if (seg[1] === 'files' && seg[2] && seg[3] === 'remove' && method === 'POST') {
+      const id = intParam(seg[2]);
+      await D.batch([D.stmt('DELETE FROM attachment_chunks WHERE attachment_id=?', id), D.stmt('DELETE FROM attachments WHERE id=?', id)]);
+      return json({ ok: true });
+    }
+    if (seg[1] === 'invites' && !seg[2] && method === 'GET') return json({ invites: await D.all('SELECT code, note, max, uses, created, disabled FROM invites ORDER BY created DESC LIMIT 100') });
+    if (seg[1] === 'invites' && !seg[2] && method === 'POST') {
+      const b = await readJson(req, 1000);
+      const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      const code = [...crypto.getRandomValues(new Uint8Array(8))].map((x) => alphabet[x % alphabet.length]).join('');
+      const max = Math.min(1000, Math.max(0, parseInt(b.max, 10) || 0));
+      await D.run('INSERT INTO invites(code,note,max,created) VALUES(?,?,?,?)', code, cleanLine(b.note, 60), max, Date.now());
+      return json({ ok: true, code: code });
+    }
+    if (seg[1] === 'invites' && seg[2] && seg[3] === 'toggle' && method === 'POST') { await D.run('UPDATE invites SET disabled = 1 - disabled WHERE code=?', seg[2]); return json({ ok: true }); }
+    if (seg[1] === 'invites' && seg[2] && method === 'DELETE') { await D.run('DELETE FROM invites WHERE code=?', seg[2]); return json({ ok: true }); }
+    if (seg[1] === 'mods' && method === 'GET') return json({ mods: await D.all('SELECT u.username FROM site_mods m JOIN users u ON u.id=m.user_id ORDER BY u.username') });
+    if (seg[1] === 'mods' && !seg[2] && method === 'POST') {
+      const b = await readJson(req, 500);
+      const u = await D.first('SELECT id FROM users WHERE username=?', String(b.username || ''));
+      if (!u) bad('We could not find that person!', 404);
+      await D.run('INSERT OR IGNORE INTO site_mods(user_id) VALUES(?)', u.id);
+      return json({ ok: true });
+    }
+    if (seg[1] === 'mods' && seg[2] && method === 'DELETE') { await D.run('DELETE FROM site_mods WHERE user_id=(SELECT id FROM users WHERE username=?)', seg[2]); return json({ ok: true }); }
+    if (seg[1] === 'topics' && method === 'GET') {
+      return json({
+        hidden: (await D.all('SELECT topic FROM hidden_topics ORDER BY topic')).map((r) => r.topic),
+        top: await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt GROUP BY pt.topic ORDER BY n DESC, pt.topic LIMIT 30'),
+      });
+    }
+    if (seg[1] === 'topics' && !seg[2] && method === 'POST') {
+      const b = await readJson(req, 500);
+      const t = cleanTopic(String(b.topic || '').trim().replace(/^#/, ''));
+      if (!t) bad('Type a Topic name!');
+      if (b.hidden === false) await D.run('DELETE FROM hidden_topics WHERE topic=?', t);
+      else await D.run('INSERT OR IGNORE INTO hidden_topics(topic) VALUES(?)', t);
+      return json({ ok: true });
+    }
+    if (seg[1] === 'export' && method === 'GET') {
+      if (seg[2] === 'users.csv') {
+        const rows = await D.all('SELECT u.username, u.created, (SELECT COUNT(*) FROM posts WHERE user_id=u.id) AS posts, (SELECT COUNT(*) FROM follows WHERE followee=u.id) AS followers, (SELECT COUNT(*) FROM bans WHERE user_id=u.id) AS banned, (SELECT kind FROM badges WHERE user_id=u.id) AS badge FROM users u ORDER BY u.id');
+        return new Response(csv([['username', 'joined', 'posts', 'followers', 'suspended', 'badge'], ...rows.map((r) => [r.username, new Date(r.created).toISOString(), r.posts, r.followers, r.banned ? 'yes' : '', r.badge || ''])]), { headers: { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': 'attachment; filename="beta-people.csv"', 'cache-control': 'no-store' } });
+      }
+      if (seg[2] === 'audit.csv') {
+        const rows = await D.all('SELECT admin, action, created FROM audit ORDER BY id');
+        return new Response(csv([['when', 'admin', 'action'], ...rows.map((r) => [new Date(r.created).toISOString(), r.admin, r.action])]), { headers: { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': 'attachment; filename="beta-activity-log.csv"', 'cache-control': 'no-store' } });
+      }
     }
     if (seg[1] === 'badges' && method === 'POST') {
       const b = await readJson(req, 500);
