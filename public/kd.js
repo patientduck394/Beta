@@ -9,7 +9,7 @@
     loading = new Promise((ok, no) => {
       window.__KeydownNoAuto = true; // we draw things ourselves; do not let it scan the whole page
       const s = document.createElement('script');
-      s.src = '/Keydown.js?v=3';
+      s.src = '/Keydown.js?v=4';
       s.onload = () => (window.Keydown ? ok(window.Keydown) : no(new Error('Keydown did not start!')));
       s.onerror = () => {
         loading = null;
@@ -110,6 +110,7 @@
       return c;
     };
     for (const el of root.querySelectorAll('*')) {
+      if (el.closest('.kdx-block, .kdx-t-rainbow, .kdx-t-outline, .kdx-t-redact')) continue; // Keydown Next blocks and effects pick their own colors
       let hasText = false;
       for (const n of el.childNodes) if (n.nodeType === 3 && n.data.trim()) { hasText = true; break; }
       if (!hasText) continue;
@@ -143,6 +144,8 @@
     const out = document.createElement('div');
     out.className = 'kd-out';
     out.append(...doc.body.childNodes);
+    // Keydown Next: text effects like {rainbow}, and blocks like ::progress. It runs before the safety pass, which then strips anything risky it made (frames, sliders)
+    try { if (window.KeydownNext) { window.KeydownNext.apply(out, { editing: false }); clean(out); } } catch (e) {}
     // colors need a real page to be worked out, so it is set up out of sight for a moment
     const stage = document.createElement('div');
     stage.style.cssText = 'position:absolute;left:-99999px;top:0;width:720px;visibility:hidden';

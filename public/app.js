@@ -397,6 +397,7 @@
         h('button', { type: 'button', onclick: act(async () => { if (!me) return go('/login'); const reason = prompt('What is wrong with this post? (a few words)'); if (reason === null) return; await api('/posts/' + x.id + '/report', { method: 'POST', body: { reason } }); toast('Thanks, we will take a look!'); }) }, 'Report'));
     }
     if (x.edited) items.push(h('button', { type: 'button', onclick: act(async () => { const r = await api('/posts/' + x.id + '/history'); historyDialog(r.versions); }) }, 'Edit history'));
+    if (me) items.push(h('button', { type: 'button', onclick: act(async () => { const r = await api('/posts/' + (x.parent_id || x.id) + '/mutethread', { method: 'POST' }); x.threadMuted = r.muted; toast(r.muted ? 'Muted! No more notifications from this thread.' : 'Unmuted!'); redraw(); }) }, x.threadMuted ? 'Unmute this thread' : 'Mute this thread'));
     if (me && x.bookmarked) items.push(h('button', { type: 'button', onclick: act(async () => { await folderPicker(x, redraw); }) }, 'Move to a folder'));
     if (x.likes) items.unshift(h('button', { type: 'button', onclick: act(async () => { const r = await api('/posts/' + x.id + '/likes'); peopleDialog('Liked by', r.users); }) }, 'See who liked'));
     if (me && !mineP) items.push(h('button', { type: 'button', onclick: act(async () => { listPicker(x.username); }) }, 'Add @' + x.username + ' to a list'));
@@ -515,6 +516,29 @@
       }, 160);
     });
     area.addEventListener('blur', () => setTimeout(acHide, 200));
+    // formatting helpers: wrap the selected words, or put a ready-made block on its own line
+    const wrap = (open, close, hint) => {
+      const s0 = area.selectionStart, e0 = area.selectionEnd, sel = area.value.slice(s0, e0) || hint;
+      area.setRangeText(open + sel + close, s0, e0, 'end');
+      if (!area.value.slice(s0, e0)) area.setSelectionRange(s0 + open.length, s0 + open.length + sel.length);
+      area.focus(); area.dispatchEvent(new Event('input'));
+    };
+    const line = (text) => {
+      const at = area.selectionEnd, before = area.value.slice(0, at), lead = before && !/\n$/.test(before) ? '\n' : '';
+      area.setRangeText(lead + text + '\n', at, at, 'end');
+      area.focus(); area.dispatchEvent(new Event('input'));
+    };
+    const FORMATS = [
+      ['Bold', () => wrap('**', '**', 'bold')], ['Italic', () => wrap('*', '*', 'italic')], ['Code', () => wrap('`', '`', 'code')], ['Underline', () => wrap('__', '__', 'underline')], ['Strikethrough', () => wrap('-_', '_-', 'strike')],
+      ['Spoiler', () => wrap('@spoiler-1@', '@', 'hidden words')], null,
+      ['ALL CAPS', () => wrap('{caps}', '{/caps}', 'loud')], ['Wide spacing', () => wrap('{wide}', '{/wide}', 'spread out')], ['Glow', () => wrap('{glow}', '{/glow}', 'shine')], ['Drop shadow', () => wrap('{shadow}', '{/shadow}', 'lifted')],
+      ['Outline', () => wrap('{outline}', '{/outline}', 'outlined')], ['Rainbow', () => wrap('{rainbow}', '{/rainbow}', 'colorful')], ['Redacted', () => wrap('{redact}', '{/redact}', 'secret')], ['Mirror', () => wrap('{flip}', '{/flip}', 'mirror')], null,
+      ['Progress bar', () => line('::progress 70% Label')], ['Star rating', () => line('::rating 4/5 Review')], ['Countdown', () => line('::countdown ' + new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10) + ' Big day')],
+      ['Steps', () => line('::steps Plan\n* [x] First\n* Next\n* Last\n::end')], ['Stat tiles', () => line('::stats Numbers\n| Visitors | 1,204 | +12% |\n| Sales | 85 | -3% |\n::end')], ['Foldout', () => line('::fold Click to open\nHidden words here.\n::end')], ['Timeline', () => line('::timeline Story\n* 2019 - Began\n* 2022 - Grew\n::end')],
+    ];
+    const fmtMenu = h('details', { class: 'menu' }, h('summary', { class: 'act txt', 'aria-label': 'Format text', title: 'Format text' }, 'Aa'),
+      h('div', { class: 'pop fmtpop' }, FORMATS.map((f) => (f ? h('button', { type: 'button', onclick: (ev) => { closeMenuOf(ev.currentTarget); f[1](); } }, f[0]) : h('hr')))));
+    function closeMenuOf(btn) { const d = btn.closest('details'); if (d) d.removeAttribute('open'); }
     // emoji
     const EMOJI = ['😀', '😂', '😍', '🥳', '😎', '🤔', '😭', '😡', '👍', '👎', '👏', '🙏', '💪', '🎉', '🔥', '✨', '💯', '❤️', '💚', '💙', '🌟', '🌈', '☀️', '🌙', '🍕', '🍔', '🍰', '☕', '🎵', '🎮', '📚', '💻', '🚀', '🐶', '🐱', '🦊', '🐢', '🌱', '🌸', '🍀'];
     const emojiMenu = h('details', { class: 'menu' }, h('summary', { class: 'act', 'aria-label': 'Add an emoji', title: 'Emoji' }, icon('smile')),
@@ -646,7 +670,7 @@
       schedBtn ? h('div', { class: 'schedrow' }, when) : null,
       repSel ? h('label', { class: 'small muted subrow' }, icon('lock'), ' ', repSel) : null,
       opts.quote ? h('div', { class: 'quote small' }, h('b', null, nameOf(opts.quote)), ' ', '@' + opts.quote.username, h('div', { class: 'qbody' }, opts.quote.body.slice(0, 200))) : null,
-      h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, opts.parent || opts.noPoll ? null : pollBtn, cwBtn, emojiMenu, opts.parent || opts.quote ? null : threadBtn, schedBtn, count), btn),
+      h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, fmtMenu, opts.parent || opts.noPoll ? null : pollBtn, cwBtn, emojiMenu, opts.parent || opts.quote ? null : threadBtn, schedBtn, count), btn),
       h('div', { class: 'muted small' }, 'Keydown works here: **bold**, *italic*, `code`, #G#chips#'), err);
     return form;
   }
@@ -937,14 +961,18 @@
     drawSide();
     const tabs = h('div', { class: 'tabs' }, [['posts', 'Posts'], ['people', 'People'], ['topics', 'Topics']].map(([k, l]) => h('a', { href: '/search?q=' + enc(qv) + '&tab=' + k, 'data-link': true, class: tab === k ? 'on' : '' }, l)));
     const tips = h('p', { class: 'muted small' }, 'Tips: ', h('code', null, 'from:name'), ' ', h('code', null, '#topic'), ' ', h('code', null, 'has:image'), ' ', h('code', null, 'has:file'), ' ', h('code', null, 'has:poll'), ' work together with words!');
-    if (!qv) return show(h('h1', null, 'Search'), h('p', { class: 'muted' }, 'Type something in the box at the top!'), tips);
+    const savedBox = h('div', { class: 'savedsearch' });
+    const drawSaved = (list) => put(savedBox, list.length ? h('div', { class: 'chips' }, h('span', { class: 'muted small' }, 'Saved: '), list.map((s2) => h('span', { class: 'fchip' }, link('/search?q=' + enc(s2.q), s2.q), h('button', { type: 'button', class: 'fdel', 'aria-label': 'Forget ' + s2.q, onclick: safe(async () => { await api('/me/searches/' + s2.id, { method: 'DELETE' }); drawSaved(list.filter((z) => z !== s2)); }) }, '×')))) : null);
+    if (me) api('/me/searches').then((r) => drawSaved(r.searches)).catch(() => {});
+    const saveBtn = me && qv ? h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { const r = await api('/me/searches', { method: 'POST', body: { q: qv } }); drawSaved(r.searches); toast('Search saved!'); }) }, 'Save this search') : null;
+    if (!qv) return show(h('h1', null, 'Search'), h('p', { class: 'muted' }, 'Type something in the box at the top!'), savedBox, tips);
     if (tab === 'posts') {
       const f = feed('/feed', { q: qv }, { empty: 'No posts matched that!' });
-      show(h('h1', null, 'Results for "' + qv + '"'), tabs, tips, f);
+      show(h('h1', null, 'Results for "' + qv + '"'), saveBtn, savedBox, tabs, tips, f);
       return f.ready;
     }
     const r = await api('/search?q=' + enc(qv));
-    show(h('h1', null, 'Results for "' + qv + '"'), tabs,
+    show(h('h1', null, 'Results for "' + qv + '"'), saveBtn, savedBox, tabs,
       tab === 'topics' ? h('div', { class: 'card side' }, r.topics.length ? h('div', null, r.topics.map((t) => h('a', { class: 'chip', href: '/topic/' + enc(t.topic), 'data-link': true }, '#' + t.topic))) : h('p', { class: 'muted' }, 'No matching Topics!'))
         : h('div', { class: 'card' }, r.users.length ? h('ul', { class: 'ulist big' }, r.users.map((u) => userRow({ ...u }))) : h('div', { class: 'empty' }, 'No matching people!')));
   }

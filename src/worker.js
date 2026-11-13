@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -166,6 +166,10 @@ const DDL = [
   "CREATE TABLE IF NOT EXISTS admin_notes (user_id INTEGER PRIMARY KEY, note TEXT NOT NULL, updated INTEGER NOT NULL)",
   "CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT '', max INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0)",
   "CREATE TABLE IF NOT EXISTS hidden_topics (topic TEXT PRIMARY KEY)",
+  // version 8: muted threads and saved searches
+  "CREATE TABLE IF NOT EXISTS muted_threads (user_id INTEGER NOT NULL, post_id INTEGER NOT NULL, PRIMARY KEY (user_id, post_id))",
+  "CREATE TABLE IF NOT EXISTS saved_searches (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, q TEXT NOT NULL, created INTEGER NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS saved_searches_user ON saved_searches(user_id)",
 ];
 let schemaReady = null;
 function ensureSchema(env) {
@@ -250,6 +254,10 @@ async function blockedBetween(D, a, b) {
 async function notify(D, userId, actorId, kind, postId) {
   if (!userId || userId === actorId) return;
   if (await D.first("SELECT 1 AS x FROM mutes WHERE user_id=? AND target_id=? AND kind IN ('block','mute')", userId, actorId)) return;
+  if (postId) {
+    const root = await D.first('SELECT COALESCE(parent_id, id) AS r FROM posts WHERE id=?', postId);
+    if (root && (await D.first('SELECT 1 AS x FROM muted_threads WHERE user_id=? AND post_id=?', userId, root.r))) return;
+  }
   await D.run(
     'INSERT INTO notifications(user_id,actor_id,kind,post_id,created) SELECT ?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM notifications WHERE user_id=? AND actor_id=? AND kind=? AND COALESCE(post_id,0)=COALESCE(?,0))',
     userId, actorId, kind, postId ?? null, Date.now(), userId, actorId, kind, postId ?? null
@@ -266,7 +274,7 @@ const BASE = `SELECT p.id, p.body, p.created, p.parent_id, p.user_id, u.username
 
 async function metrics(env, viewerId, ids) {
   const M = {};
-  ids.forEach((id) => (M[id] = { likes: 0, liked: false, replies: 0, reposts: 0, quotes: 0, reposted: false, bookmarked: false, edited: null, poll: null, files: [], outlet: null, reactions: {}, myReaction: null, replyPolicy: null }));
+  ids.forEach((id) => (M[id] = { likes: 0, liked: false, replies: 0, reposts: 0, quotes: 0, reposted: false, bookmarked: false, edited: null, poll: null, files: [], outlet: null, reactions: {}, myReaction: null, replyPolicy: null, threadMuted: false }));
   if (!ids.length) return M;
   const P = ph(ids.length);
   const v = viewerId || 0;
@@ -290,6 +298,7 @@ async function metrics(env, viewerId, ids) {
       q(`SELECT post_id k, emoji, COUNT(*) n FROM reactions WHERE post_id IN (${P}) GROUP BY post_id, emoji`),
       q(`SELECT post_id k, emoji FROM reactions WHERE user_id=? AND post_id IN (${P})`, v),
       q(`SELECT post_id k, policy FROM reply_policy WHERE post_id IN (${P})`),
+      q(`SELECT post_id k FROM muted_threads WHERE user_id=? AND post_id IN (${P})`, v),
     ])
   ).map((x) => x.results);
   res[0].forEach((r) => (M[r.k].likes = r.n));
@@ -316,6 +325,7 @@ async function metrics(env, viewerId, ids) {
   res[14].forEach((r) => (M[r.k].reactions[r.emoji] = r.n));
   res[15].forEach((r) => (M[r.k].myReaction = r.emoji));
   res[16].forEach((r) => (M[r.k].replyPolicy = r.policy));
+  res[17].forEach((r) => (M[r.k].threadMuted = true));
   res[11].forEach((r) => M[r.k].files.push({ id: r.id, name: r.name, mime: r.mime, size: r.size, alt: r.alt, image: r.mime.startsWith('image/') }));
   return M;
 }
@@ -366,7 +376,7 @@ async function purgePosts(D, startIds) {
     const del = (t, col = 'post_id') => D.stmt(`DELETE FROM ${t} WHERE ${col} IN (${P})`, ...part);
     await D.batch([
       D.stmt(`DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE post_id IN (${P}))`, ...part),
-      del('attachments'), del('post_cw'), del('outlet_posts'), del('likes'), del('post_topics'), del('edits'), del('polls'), del('poll_options'), del('poll_votes'), del('bookmarks'), del('reactions'), del('reply_policy'), del('post_versions'), del('bookmark_folder_items'), del('notifications'), del('reports'), del('refs'),
+      del('attachments'), del('post_cw'), del('outlet_posts'), del('likes'), del('post_topics'), del('edits'), del('polls'), del('poll_options'), del('poll_votes'), del('bookmarks'), del('muted_threads'), del('reactions'), del('reply_policy'), del('post_versions'), del('bookmark_folder_items'), del('notifications'), del('reports'), del('refs'),
       D.stmt(`UPDATE profiles SET pinned=NULL WHERE pinned IN (${P})`, ...part),
       del('posts', 'id'),
     ]);
@@ -494,7 +504,7 @@ async function purgeUser(D, u) {
     D.stmt('DELETE FROM bookmark_folder_items WHERE user_id=?', u), D.stmt('DELETE FROM bookmark_folders WHERE user_id=?', u), D.stmt('DELETE FROM badges WHERE user_id=?', u),
     D.stmt('DELETE FROM profile_fields WHERE user_id=?', u), D.stmt('DELETE FROM user_notes WHERE user_id=? OR target_id=?', u, u),
     D.stmt('DELETE FROM outlet_members WHERE user_id=?', u), D.stmt('DELETE FROM outlet_bans WHERE user_id=?', u),
-    D.stmt('DELETE FROM warnings WHERE user_id=?', u), D.stmt('DELETE FROM ban_until WHERE user_id=?', u), D.stmt('DELETE FROM admin_notes WHERE user_id=?', u), D.stmt('DELETE FROM site_mods WHERE user_id=?', u),
+    D.stmt('DELETE FROM muted_threads WHERE user_id=?', u), D.stmt('DELETE FROM saved_searches WHERE user_id=?', u), D.stmt('DELETE FROM warnings WHERE user_id=?', u), D.stmt('DELETE FROM ban_until WHERE user_id=?', u), D.stmt('DELETE FROM admin_notes WHERE user_id=?', u), D.stmt('DELETE FROM site_mods WHERE user_id=?', u),
   ]);
 }
 
@@ -803,7 +813,7 @@ async function route(req, env, url) {
     const target = id && (await D.first('SELECT p.id, p.user_id, p.parent_id, r.kind FROM posts p LEFT JOIN refs r ON r.post_id=p.id WHERE p.id=?', id));
     if (!target) bad('We could not find that post!', 404);
     const act = seg[2];
-    if (['like', 'repost', 'bookmark', 'vote', 'pin', 'report', 'react', 'folder'].includes(act)) await rate(D, 'act:' + user.id, 120, 60);
+    if (['like', 'repost', 'bookmark', 'vote', 'pin', 'report', 'react', 'folder', 'mutethread'].includes(act)) await rate(D, 'act:' + user.id, 120, 60);
     if (act === 'react') {
       const b = await readJson(req, 300);
       if (!REACTIONS.includes(b.emoji)) bad('Pick one of the reaction emoji!');
@@ -814,6 +824,13 @@ async function route(req, env, url) {
       const counts = {};
       (await D.all('SELECT emoji, COUNT(*) n FROM reactions WHERE post_id=? GROUP BY emoji', id)).forEach((r) => (counts[r.emoji] = r.n));
       return json({ reactions: counts, myReaction: had && had.emoji === b.emoji ? null : b.emoji });
+    }
+    if (act === 'mutethread') {
+      const root = target.parent_id || target.id;
+      const had = await D.first('SELECT 1 AS x FROM muted_threads WHERE user_id=? AND post_id=?', user.id, root);
+      if (had) await D.run('DELETE FROM muted_threads WHERE user_id=? AND post_id=?', user.id, root);
+      else await D.run('INSERT INTO muted_threads(user_id,post_id) VALUES(?,?)', user.id, root);
+      return json({ muted: !had });
     }
     if (act === 'folder') {
       const b = await readJson(req, 300);
@@ -1202,6 +1219,19 @@ async function route(req, env, url) {
     need();
     await D.run('UPDATE warnings SET seen=1 WHERE user_id=?', user.id);
     return json({ ok: true });
+  }
+  if (seg[0] === 'me' && seg[1] === 'searches') {
+    need();
+    if (method === 'GET' && !seg[2]) return json({ searches: await D.all('SELECT id, q FROM saved_searches WHERE user_id=? ORDER BY id DESC', user.id) });
+    if (method === 'POST' && !seg[2]) {
+      const b = await readJson(req, 600);
+      const q = cleanLine(b.q, 100);
+      if (!q) bad('Search for something first!');
+      if ((await D.first('SELECT COUNT(*) AS n FROM saved_searches WHERE user_id=?', user.id)).n >= 20) bad('You can save up to 20 searches!');
+      if (!(await D.first('SELECT 1 AS x FROM saved_searches WHERE user_id=? AND q=? COLLATE NOCASE', user.id, q))) await D.run('INSERT INTO saved_searches(user_id,q,created) VALUES(?,?,?)', user.id, q, Date.now());
+      return json({ searches: await D.all('SELECT id, q FROM saved_searches WHERE user_id=? ORDER BY id DESC', user.id) });
+    }
+    if (method === 'DELETE' && seg[2]) { await D.run('DELETE FROM saved_searches WHERE id=? AND user_id=?', intParam(seg[2]), user.id); return json({ ok: true }); }
   }
   if (seg[0] === 'me' && seg[1] === 'fields' && method === 'POST') {
     need();

@@ -468,3 +468,6 @@ a.tile:hover { border-color: var(--lime-d); }
 .tabs { flex-wrap: wrap; }
 .tabs a { white-space: nowrap; }
 .card.pad16 textarea { width: 100%; box-sizing: border-box; }
+.pop.fmtpop { max-height: 60vh; overflow: auto; min-width: 190px; }
+.pop.fmtpop hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }
+.savedsearch { margin: 8px 0; }
