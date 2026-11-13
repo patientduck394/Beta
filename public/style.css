@@ -1,3 +1,6 @@
+:root { color-scheme: light dark; }
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
 :root {
   --lime: #a3e635;
   --lime-d: #4d7c0f;
@@ -356,3 +359,7 @@ h2.gap { margin-top: 24px; }
 .osb ul.olist .muted { margin-left: auto; }
 .orow { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
 .orow h1 { margin: 0; }
+
+.themebtn { font: inherit; background: none; border: 0; cursor: pointer; width: 34px; height: 34px; border-radius: 50%; display: inline-grid; place-items: center; color: var(--lime-dd); padding: 0; }
+.themebtn:hover { background: var(--lime-l); }
+.themebtn .ic { width: 20px; height: 20px; }

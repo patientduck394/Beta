@@ -157,9 +157,30 @@
   }
 
   // ---------- the top bar and the side column ----------
+
+  // ---------- light and dark: a button in the top bar (Settings also has "match my device") ----------
+  const THEME_KEY = 'beta_theme';
+  const themeStore = {
+    get: () => { try { return localStorage.getItem(THEME_KEY) || ''; } catch (e) { return ''; } },
+    set: (v) => { try { v ? localStorage.setItem(THEME_KEY, v) : localStorage.removeItem(THEME_KEY); } catch (e) {} },
+  };
+  const isDark = () => { const t = document.documentElement.getAttribute('data-theme'); return t ? t === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches; };
+  function setTheme(t) {
+    themeStore.set(t === 'auto' ? '' : t);
+    if (t === 'auto') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t);
+    window.dispatchEvent(new Event('kd-recolor'));
+    document.querySelectorAll('.themebtn').forEach((b) => b.replaceWith(themeBtn()));
+  }
+  function themeBtn() {
+    const dark = isDark();
+    return h('button', { class: 'themebtn', type: 'button', title: dark ? 'Switch to light mode' : 'Switch to dark mode', 'aria-label': dark ? 'Switch to light mode' : 'Switch to dark mode', onclick: () => setTheme(isDark() ? 'light' : 'dark') }, icon(dark ? 'sun' : 'moon'));
+  }
+  try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (!themeStore.get()) document.querySelectorAll('.themebtn').forEach((b) => b.replaceWith(themeBtn())); }); } catch (e) {}
+
   function drawNav() {
     const nav = document.getElementById('nav');
     nav.replaceChildren();
+    nav.append(themeBtn());
     const badge = (n) => (n ? h('span', { class: 'badge' }, n > 99 ? '99+' : n) : null);
     if (me) {
       const menu = h('details', { class: 'menu navmenu' }, h('summary', { class: 'navbtn', 'aria-label': 'More' }, icon('more')),
@@ -941,7 +962,7 @@
     const newPw = h('input', { id: 'np', type: 'password', autocomplete: 'new-password' });
     const delPw = h('input', { id: 'dp', type: 'password', autocomplete: 'current-password' });
     const dmSel = h('select', { id: 'dmp', onchange: safe(async () => { await api('/me/settings', { method: 'PATCH', body: { dm: dmSel.value } }); me.dm = dmSel.value; toast('Saved!'); }) }, [['all', 'Everyone'], ['following', 'People I follow'], ['none', 'Nobody']].map(([v, l]) => h('option', { value: v, selected: (cur.dm || 'all') === v }, l)));
-    const themeSel = h('select', { id: 'thm', onchange: () => { store.set('beta_theme', themeSel.value === 'auto' ? '' : themeSel.value); applyPrefs(); } }, [['auto', 'Match my device'], ['light', 'Light'], ['dark', 'Dark']].map(([v, l]) => h('option', { value: v, selected: (store.get('beta_theme') || 'auto') === v }, l)));
+    const themeSel = h('select', { id: 'thm', onchange: () => setTheme(themeSel.value) }, [['auto', 'Match my device'], ['light', 'Light'], ['dark', 'Dark']].map(([v, l]) => h('option', { value: v, selected: (store.get('beta_theme') || 'auto') === v }, l)));
     const densSel = h('select', { id: 'dns', onchange: () => { store.set('beta_density', densSel.value === 'comfortable' ? '' : densSel.value); applyPrefs(); } }, [['comfortable', 'Comfortable'], ['compact', 'Compact']].map(([v, l]) => h('option', { value: v, selected: (store.get('beta_density') || 'comfortable') === v }, l)));
     const muted = h('div');
     api('/mutes').then((m) => {
@@ -1161,7 +1182,7 @@
 
   // ---------- looks: light or dark, and how roomy ----------
   function applyPrefs() {
-    const t = store.get('beta_theme') || 'auto';
+    const t = themeStore.get() || 'auto';
     const d = store.get('beta_density') || 'comfortable';
     if (t === 'auto') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t);
     window.dispatchEvent(new Event('kd-recolor'));

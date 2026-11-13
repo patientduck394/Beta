@@ -68,3 +68,5 @@ Outlets are forums. Each has Subjects inside it (like channels) to sort the talk
 - Posts in an Outlet stay inside it: they do not show in Everyone, Explore, Topics or search. People who joined an Outlet see its posts in their Following feed
 
 Profile pictures can be changed from Settings or straight from your profile page (Change picture).
+
+- Light and dark mode: a sun/moon button in the top bar flips between them (it is remembered in this browser), and Settings also has "Match my device". public/theme.js sets the theme before the page is drawn so nothing flashes.
