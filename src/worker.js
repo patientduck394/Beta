@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -156,6 +156,8 @@ const DDL = [
   "CREATE TABLE IF NOT EXISTS user_notes (user_id INTEGER NOT NULL, target_id INTEGER NOT NULL, note TEXT NOT NULL, PRIMARY KEY (user_id, target_id))",
   "CREATE TABLE IF NOT EXISTS post_versions (post_id INTEGER NOT NULL, v INTEGER NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (post_id, v))",
   "CREATE TABLE IF NOT EXISTS reply_policy (post_id INTEGER PRIMARY KEY, policy TEXT NOT NULL)",
+  // version 6: the admin audit log (site settings live in the meta table)
+  "CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, admin TEXT NOT NULL, action TEXT NOT NULL, created INTEGER NOT NULL)",
 ];
 let schemaReady = null;
 function ensureSchema(env) {
@@ -374,6 +376,7 @@ async function rssFeed(env, D, url, title, link, where, params) {
 // ---------- the routes ----------
 async function createPost(env, D, user, b) {
     const body = cleanBody(b.body);
+    if (!isAdmin(env, user)) await checkBlocked(D, body);
     if ([...body].length > MAX_POST) bad('Posts are up to ' + MAX_POST + ' characters!');
     const cw = cleanLine(b.cw, 80);
     const files = Array.isArray(b.files) ? b.files.slice(0, 4) : [];
@@ -466,6 +469,38 @@ async function createPost(env, D, user, b) {
   return await onePost(env, D, user, id);
 }
 
+// everything a person owns, gone (used when they delete their account and when an admin removes them)
+async function purgeUser(D, u) {
+  const mine = (await D.all('SELECT id FROM posts WHERE user_id=?', u)).map((r) => r.id);
+  await purgePosts(D, mine);
+  await D.batch([
+    D.stmt('DELETE FROM likes WHERE user_id=?', u), D.stmt('DELETE FROM follows WHERE follower=? OR followee=?', u, u), D.stmt('DELETE FROM topic_follows WHERE user_id=?', u),
+    D.stmt('DELETE FROM bookmarks WHERE user_id=?', u), D.stmt('DELETE FROM mutes WHERE user_id=? OR target_id=?', u, u), D.stmt('DELETE FROM topic_mutes WHERE user_id=?', u),
+    D.stmt('DELETE FROM notifications WHERE user_id=? OR actor_id=?', u, u), D.stmt('DELETE FROM poll_votes WHERE user_id=?', u), D.stmt('DELETE FROM reports WHERE reporter_id=?', u),
+    D.stmt('DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE user_id=?)', u), D.stmt('DELETE FROM attachments WHERE user_id=?', u),
+    D.stmt('DELETE FROM dms WHERE sender_id=? OR recipient_id=?', u, u), D.stmt('DELETE FROM list_members WHERE user_id=? OR list_id IN (SELECT id FROM lists WHERE user_id=?)', u, u), D.stmt('DELETE FROM lists WHERE user_id=?', u),
+    D.stmt('DELETE FROM settings WHERE user_id=?', u), D.stmt('DELETE FROM avatars WHERE user_id=?', u), D.stmt('DELETE FROM bans WHERE user_id=?', u),
+    D.stmt('DELETE FROM profiles WHERE user_id=?', u), D.stmt('DELETE FROM sessions WHERE user_id=?', u), D.stmt('DELETE FROM users WHERE id=?', u),
+
+    D.stmt('DELETE FROM reactions WHERE user_id=?', u), D.stmt('DELETE FROM scheduled WHERE user_id=?', u), D.stmt('DELETE FROM word_filters WHERE user_id=?', u),
+    D.stmt('DELETE FROM bookmark_folder_items WHERE user_id=?', u), D.stmt('DELETE FROM bookmark_folders WHERE user_id=?', u), D.stmt('DELETE FROM badges WHERE user_id=?', u),
+    D.stmt('DELETE FROM profile_fields WHERE user_id=?', u), D.stmt('DELETE FROM user_notes WHERE user_id=? OR target_id=?', u, u),
+    D.stmt('DELETE FROM outlet_members WHERE user_id=?', u), D.stmt('DELETE FROM outlet_bans WHERE user_id=?', u),
+  ]);
+}
+
+// site settings (kept in the meta table): sign-ups open or paused, read-only mode, and words that are not allowed in posts
+async function siteGet(D, k, def) {
+  const r = await D.first('SELECT v FROM meta WHERE k=?', k);
+  return r ? r.v : def;
+}
+async function checkBlocked(D, text) {
+  const raw = await siteGet(D, 'blocked_words', '');
+  if (!raw) return;
+  const low = text.toLowerCase();
+  if (raw.split('\n').map((w) => w.trim()).filter(Boolean).some((w) => low.includes(w))) bad('That post has a word this site does not allow!');
+}
+
 // the posts people scheduled go out here (a Cloudflare cron runs this every minute, and signing in checks too)
 async function runDue(env) {
   const D = db(env);
@@ -542,11 +577,13 @@ async function route(req, env, url) {
     if (!origin || origin !== url.origin) bad('That request did not come from this site!', 403);
   }
   const need = () => user || bad('Log in first!', 401);
+  if (method !== 'GET' && !['login', 'logout', 'admin'].includes(seg[0]) && !isAdmin(env, user) && (await siteGet(D, 'readonly', '0')) === '1') bad('Beta is read-only for a moment while we fix something. Try again soon!', 503);
   const theme = async (u) => (await D.first('SELECT display_name, website, color FROM profiles WHERE user_id=?', u)) || { display_name: '', website: '', color: 'lime' };
 
   // --- accounts
   if (seg[0] === 'register' && method === 'POST') {
     await rate(D, 'reg:' + ip, 6, 3600);
+    if ((await siteGet(D, 'reg_open', '1')) === '0') bad('New sign-ups are paused for a little while. Please come back soon!', 403);
     const b = await readJson(req, 10000);
     const name = String(b.username || '').trim();
     if (!/^[a-z0-9][a-z0-9_-]{2,19}$/i.test(name)) bad('Usernames are 3 to 20 letters, numbers, - or _!');
@@ -621,18 +658,7 @@ async function route(req, env, url) {
     const b = await readJson(req, 5000);
     const row = await D.first('SELECT pw FROM users WHERE id=?', user.id);
     if (!(await checkPw(String(b.password || ''), row.pw))) bad('That is not your password!', 403);
-    const mine = (await D.all('SELECT id FROM posts WHERE user_id=?', user.id)).map((r) => r.id);
-    await purgePosts(D, mine);
-    const u = user.id;
-    await D.batch([
-      D.stmt('DELETE FROM likes WHERE user_id=?', u), D.stmt('DELETE FROM follows WHERE follower=? OR followee=?', u, u), D.stmt('DELETE FROM topic_follows WHERE user_id=?', u),
-      D.stmt('DELETE FROM bookmarks WHERE user_id=?', u), D.stmt('DELETE FROM mutes WHERE user_id=? OR target_id=?', u, u), D.stmt('DELETE FROM topic_mutes WHERE user_id=?', u),
-      D.stmt('DELETE FROM notifications WHERE user_id=? OR actor_id=?', u, u), D.stmt('DELETE FROM poll_votes WHERE user_id=?', u), D.stmt('DELETE FROM reports WHERE reporter_id=?', u),
-      D.stmt('DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE user_id=?)', u), D.stmt('DELETE FROM attachments WHERE user_id=?', u),
-      D.stmt('DELETE FROM dms WHERE sender_id=? OR recipient_id=?', u, u), D.stmt('DELETE FROM list_members WHERE user_id=? OR list_id IN (SELECT id FROM lists WHERE user_id=?)', u, u), D.stmt('DELETE FROM lists WHERE user_id=?', u),
-      D.stmt('DELETE FROM settings WHERE user_id=?', u), D.stmt('DELETE FROM avatars WHERE user_id=?', u), D.stmt('DELETE FROM bans WHERE user_id=?', u),
-      D.stmt('DELETE FROM profiles WHERE user_id=?', u), D.stmt('DELETE FROM sessions WHERE user_id=?', u), D.stmt('DELETE FROM users WHERE id=?', u),
-    ]);
+    await purgeUser(D, user.id);
     return json({ ok: true }, 200, { 'set-cookie': cookie(req, '', 0) });
   }
 
@@ -706,6 +732,7 @@ async function route(req, env, url) {
     if (Date.now() - p.created > EDIT_WINDOW) bad('Posts can only be edited in the first 15 minutes!', 403);
     const b = await readJson(req, 5000);
     const body = cleanBody(b.body);
+    if (!isAdmin(env, user)) await checkBlocked(D, body);
     const hasFiles = (await D.first('SELECT 1 AS x FROM attachments WHERE post_id=?', id)) || (await D.first('SELECT 1 AS x FROM polls WHERE post_id=?', id));
     if (!body && !hasFiles) bad('Write something first!');
     if ([...body].length > MAX_POST) bad('Posts are up to ' + MAX_POST + ' characters!');
@@ -1251,7 +1278,7 @@ async function route(req, env, url) {
     return json({ users: rows });
   }
   if (seg[0] === 'announcements' && method === 'GET') {
-    return json({ items: await D.all('SELECT id, text, created FROM announcements WHERE ends IS NULL OR ends>? ORDER BY id DESC LIMIT 3', Date.now()) });
+    return json({ items: await D.all('SELECT id, text, created FROM announcements WHERE ends IS NULL OR ends>? ORDER BY id DESC LIMIT 3', Date.now()), readonly: (await siteGet(D, 'readonly', '0')) === '1', signupsPaused: (await siteGet(D, 'reg_open', '1')) === '0' });
   }
   if (seg[0] === 'dm') {
     need();
@@ -1535,6 +1562,8 @@ async function route(req, env, url) {
   if (seg[0] === 'admin') {
     need();
     if (!isAdmin(env, user)) bad('Admins only!', 403);
+    // every change an admin makes is written down
+    if (method !== 'GET') await D.run('INSERT INTO audit(admin,action,created) VALUES(?,?,?)', user.username, method + ' ' + seg.slice(1).join('/'), Date.now());
     if (seg[1] === 'reports' && !seg[2] && method === 'GET') {
       const reps = await D.all('SELECT r.id, r.post_id, r.reason, r.created, u.username AS reporter FROM reports r JOIN users u ON u.id=r.reporter_id ORDER BY r.id DESC LIMIT 50');
       if (!reps.length) return json({ items: [] });
@@ -1554,6 +1583,82 @@ async function route(req, env, url) {
       return json({ ok: true });
     }
     if (seg[1] === 'users' && seg[2] && seg[3] === 'unban' && method === 'POST') { await D.run('DELETE FROM bans WHERE user_id=(SELECT id FROM users WHERE username=?)', seg[2]); return json({ ok: true }); }
+    if (seg[1] === 'stats' && method === 'GET') {
+      const n = async (sql, ...a) => (await D.first(sql, ...a)).n;
+      const since = Date.now() - 14 * 864e5;
+      const day = "strftime('%Y-%m-%d', created/1000, 'unixepoch')";
+      const att = await D.first('SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS bytes FROM attachments');
+      return json({
+        users: await n('SELECT COUNT(*) AS n FROM users'),
+        posts: await n("SELECT COUNT(*) AS n FROM posts WHERE parent_id IS NULL AND id NOT IN (SELECT post_id FROM refs WHERE kind='repost')"),
+        replies: await n('SELECT COUNT(*) AS n FROM posts WHERE parent_id IS NOT NULL'),
+        outlets: await n('SELECT COUNT(*) AS n FROM outlets'),
+        files: att.n, bytes: att.bytes,
+        reports: await n('SELECT COUNT(*) AS n FROM reports'),
+        bans: await n('SELECT COUNT(*) AS n FROM bans'),
+        activeToday: await n('SELECT COUNT(DISTINCT user_id) AS n FROM posts WHERE created>?', Date.now() - 864e5),
+        signupDays: await D.all(`SELECT ${day} AS d, COUNT(*) AS n FROM users WHERE created>? GROUP BY d`, since),
+        postDays: await D.all(`SELECT ${day} AS d, COUNT(*) AS n FROM posts WHERE created>? GROUP BY d`, since),
+        newest: await D.all('SELECT username, created FROM users ORDER BY id DESC LIMIT 6'),
+      });
+    }
+    if (seg[1] === 'users' && !seg[2] && method === 'GET') {
+      const q = String(url.searchParams.get('q') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 30);
+      const before = intParam(url.searchParams.get('before'));
+      const rows = await D.all(`SELECT u.id, u.username, u.created, (SELECT COUNT(*) FROM posts WHERE user_id=u.id) AS posts, (SELECT COUNT(*) FROM follows WHERE followee=u.id) AS followers,
+        (SELECT kind FROM badges WHERE user_id=u.id) AS badge, (SELECT reason FROM bans WHERE user_id=u.id) AS banned_reason, (SELECT COUNT(*) FROM bans WHERE user_id=u.id) AS banned,
+        (SELECT MAX(created) FROM sessions WHERE user_id=u.id) AS last_login FROM users u WHERE u.username LIKE ? ESCAPE '\\' ${before ? 'AND u.id < ?' : ''} ORDER BY u.id DESC LIMIT 30`, '%' + q.replace(/[%_\\]/g, '\\$&') + '%', ...(before ? [before] : []));
+      return json({ users: rows.map((r) => ({ ...r, banned: !!r.banned, admin: isAdmin(env, r) })), cursor: rows.length === 30 ? rows[rows.length - 1].id : null });
+    }
+    if (seg[1] === 'users' && seg[2] && ['signout', 'password', 'delete', 'purge-posts'].includes(seg[3]) && method === 'POST') {
+      const u = await D.first('SELECT id, username FROM users WHERE username=?', seg[2]);
+      if (!u) bad('We could not find that person!', 404);
+      if (isAdmin(env, u)) bad('You cannot do that to an admin!', 403);
+      if (seg[3] === 'signout') await D.run('DELETE FROM sessions WHERE user_id=?', u.id);
+      else if (seg[3] === 'password') {
+        const b = await readJson(req, 1000);
+        const pw = String(b.password || '');
+        if (pw.length < 8 || pw.length > 200) bad('Passwords need at least 8 characters!');
+        await D.batch([D.stmt('UPDATE users SET pw=? WHERE id=?', await hashPw(pw), u.id), D.stmt('DELETE FROM sessions WHERE user_id=?', u.id)]);
+      } else if (seg[3] === 'purge-posts') {
+        const ids = (await D.all('SELECT id FROM posts WHERE user_id=?', u.id)).map((r) => r.id);
+        return json({ ok: true, removed: await purgePosts(D, ids) });
+      } else await purgeUser(D, u.id);
+      return json({ ok: true });
+    }
+    if (seg[1] === 'settings' && method === 'GET') {
+      return json({ reg_open: (await siteGet(D, 'reg_open', '1')) !== '0', readonly: (await siteGet(D, 'readonly', '0')) === '1', blocked_words: (await siteGet(D, 'blocked_words', '')).split('\n').filter(Boolean) });
+    }
+    if (seg[1] === 'settings' && method === 'POST') {
+      const b = await readJson(req, 6000);
+      const put = (k, v) => D.stmt('INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v', k, v);
+      const list = [];
+      if (b.reg_open !== undefined) list.push(put('reg_open', b.reg_open ? '1' : '0'));
+      if (b.readonly !== undefined) list.push(put('readonly', b.readonly ? '1' : '0'));
+      if (b.blocked_words !== undefined) {
+        const words = [...new Set((Array.isArray(b.blocked_words) ? b.blocked_words : []).map((w) => cleanLine(w, 40).toLowerCase()).filter(Boolean))].slice(0, 200);
+        list.push(put('blocked_words', words.join('\n')));
+      }
+      if (list.length) await D.batch(list);
+      return json({ ok: true });
+    }
+    if (seg[1] === 'audit' && method === 'GET') return json({ items: await D.all('SELECT admin, action, created FROM audit ORDER BY id DESC LIMIT 100') });
+    if (seg[1] === 'outlets' && !seg[2] && method === 'GET') {
+      return json({ outlets: await D.all('SELECT o.slug, o.name, o.created, (SELECT COUNT(*) FROM outlet_members m WHERE m.outlet_id=o.id) AS members, (SELECT COUNT(*) FROM outlet_posts p WHERE p.outlet_id=o.id) AS posts, (SELECT u.username FROM outlet_members m JOIN users u ON u.id=m.user_id WHERE m.outlet_id=o.id AND m.role=\'owner\' LIMIT 1) AS owner FROM outlets o ORDER BY o.id DESC LIMIT 100') });
+    }
+    if (seg[1] === 'outlets' && seg[2] && seg[3] === 'remove' && method === 'POST') {
+      const o = await D.first('SELECT id FROM outlets WHERE slug=?', seg[2]);
+      if (!o) bad('We could not find that Outlet!', 404);
+      await purgePosts(D, (await D.all('SELECT post_id FROM outlet_posts WHERE outlet_id=?', o.id)).map((r) => r.post_id));
+      await D.batch([D.stmt('DELETE FROM outlet_posts WHERE outlet_id=?', o.id), D.stmt('DELETE FROM subjects WHERE outlet_id=?', o.id), D.stmt('DELETE FROM outlet_members WHERE outlet_id=?', o.id), D.stmt('DELETE FROM outlet_bans WHERE outlet_id=?', o.id), D.stmt('DELETE FROM outlets WHERE id=?', o.id)]);
+      return json({ ok: true });
+    }
+    if (seg[1] === 'posts' && seg[2] && !seg[3] && method === 'GET') {
+      const id = intParam(seg[2]);
+      const post = id && (await onePost(env, D, user, id));
+      if (!post) bad('We could not find that post!', 404);
+      return json({ post });
+    }
     if (seg[1] === 'badges' && method === 'POST') {
       const b = await readJson(req, 500);
       const u = await D.first('SELECT id FROM users WHERE username=?', String(b.username || ''));
