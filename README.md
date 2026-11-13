@@ -66,3 +66,5 @@ Outlets are forums. Each has Subjects inside it (like channels) to sort the talk
 - Anyone can make an Outlet (up to 5 each) and join, post in and read Outlets. A new Outlet starts with a Subject called General
 - Owners and moderators add, rename and delete Subjects, pin posts, lock a thread, move a post to another Subject, remove posts and replies, and ban people
 - Posts in an Outlet stay inside it: they do not show in Everyone, Explore, Topics or search. People who joined an Outlet see its posts in their Following feed
+
+Profile pictures can be changed from Settings or straight from your profile page (Change picture).

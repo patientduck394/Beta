@@ -822,7 +822,7 @@
     const f = feed('/feed', { user: user.username, tab }, { empty: { posts: 'No posts yet!', replies: 'No replies yet!', media: 'No pictures or files yet!', likes: 'No likes yet!' }[tab], pinnedId: user.pinned ? user.pinned.id : null });
     show(h('div', { class: 'card profile' },
       h('div', { class: 'top2' }, avatar(user, true), h('div', { class: 'who2' }, h('h1', null, nameOf(user)), h('div', { class: 'muted' }, '@' + user.username, user.followsYou ? h('span', { class: 'chip small' }, 'Follows you') : null, user.muted ? h('span', { class: 'chip small' }, 'Muted') : null, user.blocked ? h('span', { class: 'chip small' }, 'Blocked') : null)),
-        h('div', { class: 'pbtns' }, mineU ? h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Edit profile') : fbtn, me && !mineU ? h('a', { class: 'btn ghost small', href: '/messages/' + enc(user.username), 'data-link': true, title: 'Send a message' }, icon('mail')) : null, me && !mineU ? h('button', { class: 'btn ghost small', type: 'button', title: 'Add to a list', onclick: safe(() => listPicker(user.username)) }, icon('list')) : null, h('a', { class: 'btn ghost small', href: '/rss/user/' + enc(user.username), title: 'RSS feed' }, icon('rss')))),
+        h('div', { class: 'pbtns' }, mineU ? h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Edit profile') : fbtn, mineU ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => changePicture(() => render()) }, 'Change picture') : null, me && !mineU ? h('a', { class: 'btn ghost small', href: '/messages/' + enc(user.username), 'data-link': true, title: 'Send a message' }, icon('mail')) : null, me && !mineU ? h('button', { class: 'btn ghost small', type: 'button', title: 'Add to a list', onclick: safe(() => listPicker(user.username)) }, icon('list')) : null, h('a', { class: 'btn ghost small', href: '/rss/user/' + enc(user.username), title: 'RSS feed' }, icon('rss')))),
       user.bio ? h('p', null, rich(user.bio)) : null,
       h('p', { class: 'muted small' }, user.website ? [h('a', { href: user.website, rel: 'noopener noreferrer nofollow ugc', target: '_blank' }, user.website.replace(/^https?:\/\//, '')), ' · '] : null, 'Joined ' + new Date(user.created).toLocaleDateString()),
       stats, relBtns.length ? h('div', { class: 'row2' }, relBtns) : null),
@@ -977,6 +977,23 @@
       h('p', { class: 'muted' }, 'This removes your posts, pictures, likes and follows for good. Type your password to confirm.'),
       delPw,
       h('p', null, h('button', { class: 'btn danger', onclick: guard(err3, async () => { if (!confirm('Really delete your Beta account? This cannot be undone.')) return; await api('/me/delete', { method: 'POST', body: { password: delPw.value } }); me = null; drawNav(); go('/'); toast('Your account is deleted. Goodbye!'); }) }, 'Delete my account')), err3));
+  }
+
+  // pick a picture, crop it square, and save it as your profile picture
+  function changePicture(after) {
+    const inp = h('input', { type: 'file', accept: 'image/*', hidden: true, onchange: safe(async () => {
+      const f = inp.files[0];
+      inp.remove();
+      if (!f) return;
+      const blob = await avatarBlob(f);
+      const r = await api('/me/avatar', { method: 'POST', raw: true, body: blob, headers: { 'content-type': 'application/octet-stream' } });
+      me.avatar = r.avatar;
+      drawNav();
+      toast('Profile picture saved!');
+      if (after) after();
+    }) });
+    document.body.append(inp);
+    inp.click();
   }
 
   function shortcuts() {
