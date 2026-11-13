@@ -70,3 +70,23 @@ Outlets are forums. Each has Subjects inside it (like channels) to sort the talk
 Profile pictures can be changed from Settings or straight from your profile page (Change picture).
 
 - Light and dark mode: a sun/moon button in the top bar flips between them (it is remembered in this browser), and Settings also has "Match my device". public/theme.js sets the theme before the page is drawn so nothing flashes.
+
+## Instances: a decentralized Beta (version 9)
+
+Beta is made of **instances**: communities that each have their own people, house rules, sign-up policy, Outlets and Local timeline. The main instance is `beta.radii-office.com` (the original Beta, nothing about it changed). Anyone can start another one at **`name.beta.radii-office.com`** from the front page (Start your own instance), and every instance is part of one network:
+
+* **Local** shows only the people on this instance. **Federated** shows every instance together, with a small tag on people from elsewhere. You can follow, like and reply across instances.
+* Usernames are unique across all of Beta. An account lives on the instance where it was made and logs in there.
+* The instance admin (the person who made it) edits the name, description, house rules and sign-up (open, invite-only with a code, or closed) in **Instance settings**, and can unlist it from the directory. Site admins can unlist or delete any instance on the Admin page, Instances tab.
+* The front page of the main instance (before you log in) is a picker: the main instance plus a searchable directory of every listed instance.
+* Instances share one D1 database: `users.inst` and `outlets.inst` say where they belong, and the Worker adds those columns and the main instance by itself the first time it runs.
+
+### Cloudflare setup for the name.beta.radii-office.com addresses (one time)
+
+1. **DNS:** in the radii-office.com zone add a record of type `AAAA`, name `*.beta`, value `100::`, proxied (orange cloud). (`beta` itself already works.)
+2. **Certificate:** Universal SSL only covers one level (`*.radii-office.com`), so `*.beta.radii-office.com` needs its own certificate: SSL/TLS > Edge Certificates > Order Advanced Certificate, hostnames `beta.radii-office.com` and `*.beta.radii-office.com` (or turn on Total TLS). This is a paid Cloudflare feature.
+3. **Route:** `wrangler.toml` already lists the route `*.beta.radii-office.com/*`, so the next deploy adds it. (If a deploy ever complains about the route, add it by hand: Workers > beta > Settings > Domains & Routes > Add route.)
+
+Until the wildcard DNS record and certificate exist, the main instance keeps working as before, and new instances are created fine but their addresses will not open yet.
+
+Testing on your computer: `wrangler dev` always rewrites the host, so put `ALLOW_INSTANCE_HEADER=1` in a file called `.dev.vars` (it is not committed) and send a header `x-beta-instance: name` to act as an instance. Never set it in production.

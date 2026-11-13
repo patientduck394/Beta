@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -170,6 +170,8 @@ const DDL = [
   "CREATE TABLE IF NOT EXISTS muted_threads (user_id INTEGER NOT NULL, post_id INTEGER NOT NULL, PRIMARY KEY (user_id, post_id))",
   "CREATE TABLE IF NOT EXISTS saved_searches (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, q TEXT NOT NULL, created INTEGER NOT NULL)",
   "CREATE INDEX IF NOT EXISTS saved_searches_user ON saved_searches(user_id)",
+  // version 9: instances (every instance is its own community at slug.beta.radii-office.com; the main one is id 1)
+  "CREATE TABLE IF NOT EXISTS instances (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', reg TEXT NOT NULL DEFAULT 'open', invite_code TEXT NOT NULL DEFAULT '', owner_id INTEGER, listed INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL)",
 ];
 let schemaReady = null;
 function ensureSchema(env) {
@@ -184,6 +186,16 @@ function ensureSchema(env) {
       }
       if (v >= SCHEMA_VERSION) return;
       for (let i = 0; i < DDL.length; i += 10) await env.DB.batch(DDL.slice(i, i + 10).map((q) => env.DB.prepare(q)));
+      // people and Outlets belong to an instance (everything that existed before belongs to the main one)
+      for (const t of ['users', 'outlets']) {
+        try { await env.DB.prepare(`SELECT inst FROM ${t} LIMIT 1`).first(); }
+        catch (e) { await env.DB.prepare(`ALTER TABLE ${t} ADD COLUMN inst INTEGER NOT NULL DEFAULT 1`).run(); }
+      }
+      await env.DB.batch([
+        env.DB.prepare('CREATE INDEX IF NOT EXISTS users_inst ON users(inst)'),
+        env.DB.prepare('CREATE INDEX IF NOT EXISTS outlets_inst ON outlets(inst)'),
+        env.DB.prepare("INSERT OR IGNORE INTO instances(id,slug,name,description,rules,reg,created) VALUES(1,'main','Beta','The original Beta instance. Everyone is welcome!','','open',?)").bind(Date.now()),
+      ]);
       await env.DB.prepare("INSERT INTO meta(k,v) VALUES('schema',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(String(SCHEMA_VERSION)).run();
     })().catch((e) => {
       schemaReady = null;
@@ -267,7 +279,7 @@ const unnotify = (D, userId, actorId, kind, postId) => D.run('DELETE FROM notifi
 
 // ---------- reading posts: one base query, then counts for all of them at once ----------
 const AV = (col) => `(SELECT file_id FROM avatars WHERE user_id=${col}) AS avatar`;
-const BASE = `SELECT p.id, p.body, p.created, p.parent_id, p.user_id, u.username,
+const BASE = `SELECT p.id, p.body, p.created, p.parent_id, p.user_id, u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug,
   COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, ${AV('p.user_id')},
   (SELECT text FROM post_cw WHERE post_id=p.id) AS cw, (SELECT kind FROM badges WHERE user_id=p.user_id) AS badge, r.target_id, r.kind AS rkind
   FROM posts p JOIN users u ON u.id=p.user_id LEFT JOIN profiles pr ON pr.user_id=p.user_id LEFT JOIN refs r ON r.post_id=p.id`;
@@ -338,17 +350,17 @@ async function hydrate(env, D, user, rows) {
   const all = [...rows, ...extra];
   const ids = [...new Set(all.map((r) => r.id))];
   const M = await metrics(env, user && user.id, ids);
-  const shape = (r) => ({ id: r.id, body: r.body, created: r.created, parent_id: r.parent_id, username: r.username, display_name: r.display_name, color: r.color, avatar: r.avatar, cw: r.cw, badge: r.badge, ...M[r.id] });
+  const shape = (r) => ({ id: r.id, body: r.body, created: r.created, parent_id: r.parent_id, username: r.username, display_name: r.display_name, color: r.color, avatar: r.avatar, cw: r.cw, badge: r.badge, inst_slug: r.inst_slug, ...M[r.id] });
   const by = {};
   all.forEach((r) => (by[r.id] = shape(r)));
   const out = [];
   for (const r of rows) {
     if (r.rkind === 'repost') {
       const t = by[r.target_id];
-      if (t) out.push({ id: r.id, kind: 'repost', created: r.created, username: r.username, display_name: r.display_name, color: r.color, avatar: r.avatar, badge: r.badge, target: t });
+      if (t) out.push({ id: r.id, kind: 'repost', created: r.created, username: r.username, display_name: r.display_name, color: r.color, avatar: r.avatar, badge: r.badge, inst_slug: r.inst_slug, target: t });
     } else if (r.rkind === 'quote') {
       const t = by[r.target_id];
-      out.push({ ...by[r.id], quote: t ? { id: t.id, body: t.body, created: t.created, username: t.username, display_name: t.display_name, color: t.color, avatar: t.avatar, badge: t.badge, cw: t.cw, files: t.files } : null, quoteGone: !t });
+      out.push({ ...by[r.id], quote: t ? { id: t.id, body: t.body, created: t.created, username: t.username, display_name: t.display_name, color: t.color, avatar: t.avatar, badge: t.badge, inst_slug: t.inst_slug, cw: t.cw, files: t.files } : null, quoteGone: !t });
     } else out.push(by[r.id]);
   }
   return out;
@@ -520,6 +532,29 @@ async function checkBlocked(D, text) {
   if (raw.split('\n').map((w) => w.trim()).filter(Boolean).some((w) => low.includes(w))) bad('That post has a word this site does not allow!');
 }
 
+// ---------- instances: every instance is a community at slug.beta.radii-office.com (the main Beta is beta.radii-office.com) ----------
+const RESERVED_SLUGS = new Set(['www', 'api', 'admin', 'administrator', 'beta', 'main', 'mail', 'app', 'apps', 'assets', 'static', 'cdn', 'help', 'about', 'status', 'blog', 'docs', 'rss', 'dev', 'test', 'staging', 'demo', 'instances', 'instance', 'login', 'register', 'settings', 'support', 'root', 'radii', 'radii-office', 'ns1', 'ns2', 'smtp', 'imap', 'ftp', 'files', 'localhost']);
+const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,28}[a-z0-9]$/;
+const baseDomain = (env) => String(env.BASE_DOMAIN || 'beta.radii-office.com').toLowerCase();
+const isLocalHost = (h) => h === 'localhost' || h === '127.0.0.1' || h.endsWith('.localhost');
+async function instanceOf(env, D, url, req) {
+  const host = url.hostname.toLowerCase(), base = baseDomain(env);
+  let slug = null;
+  if (host.endsWith('.' + base)) slug = host.slice(0, -base.length - 1);
+  else if (host.endsWith('.localhost')) slug = host.slice(0, -'.localhost'.length);
+  // local testing only: .dev.vars sets ALLOW_INSTANCE_HEADER=1 (wrangler dev always rewrites the host to the production one)
+  if (env.ALLOW_INSTANCE_HEADER === '1' && req.headers.get('x-beta-instance')) slug = String(req.headers.get('x-beta-instance')).toLowerCase();
+  if (!slug || slug === 'main') return D.first('SELECT * FROM instances WHERE id=1');
+  if (!/^[a-z0-9][a-z0-9-]{0,29}$/.test(slug)) return null;
+  return D.first('SELECT * FROM instances WHERE slug=?', slug);
+}
+function instUrl(env, url, slug) {
+  const host = url.hostname.toLowerCase(), port = url.port ? ':' + url.port : '';
+  if (isLocalHost(host)) return slug === 'main' ? 'http://localhost' + port : 'http://' + slug + '.localhost' + port;
+  return slug === 'main' ? 'https://' + baseDomain(env) : 'https://' + slug + '.' + baseDomain(env);
+}
+const instPublic = (r, env, url) => ({ id: r.id, slug: r.slug, name: r.name, description: r.description, rules: r.rules, reg: r.reg, listed: !!r.listed, isMain: r.id === 1, created: r.created, url: instUrl(env, url, r.slug) });
+
 // the posts people scheduled go out here (a Cloudflare cron runs this every minute, and signing in checks too)
 async function runDue(env) {
   const D = db(env);
@@ -543,6 +578,7 @@ async function tokenHash(req) {
   return m ? sha256(m[1]) : '';
 }
 const BADGES = ['verified', 'staff', 'supporter'];
+const genCode = () => [...crypto.getRandomValues(new Uint8Array(8))].map((x) => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[x % 32]).join('');
 // moderators can read reports and act on posts and people, but not change the site
 const modAllowed = (seg, method) => {
   const a = seg[1];
@@ -578,6 +614,8 @@ async function route(req, env, url) {
 
   const seg = url.pathname.split('/').filter(Boolean).slice(1).map(decodeURIComponent);
   const user = await authUser(D, req);
+  const inst = await instanceOf(env, D, url, req);
+  if (!inst) return json({ error: 'There is no Beta instance at this address!', code: 'no_instance' }, 404);
 
   // pictures and files are public to read (every post is public)
   if (seg[0] === 'files' && seg[1] && method === 'GET') {
@@ -624,12 +662,17 @@ async function route(req, env, url) {
     if (pw.length < 8 || pw.length > 200) bad('Passwords need at least 8 characters!');
     if (await D.first('SELECT 1 AS x FROM users WHERE username=?', name)) bad('That username is taken!', 409);
     if ((await siteGet(D, 'reserved_names', '')).split('\n').map((w) => w.trim().toLowerCase()).filter(Boolean).includes(name.toLowerCase())) bad('That name is saved for the site. Pick another!');
+    // an instance decides who may join it (the main Beta follows the site-wide switches)
+    if (inst.id !== 1) {
+      if (inst.reg === 'closed') bad('This instance is not accepting new members right now!', 403);
+      if (inst.reg === 'invite' && (!inst.invite_code || String(b.invite || '').trim().toUpperCase() !== inst.invite_code.toUpperCase())) bad('This instance is invite-only. Ask its admins for the code!', 403);
+    }
     let invite = null;
-    if ((await siteGet(D, 'invite_only', '0')) === '1') {
+    if (inst.id === 1 && (await siteGet(D, 'invite_only', '0')) === '1') {
       invite = await D.first('SELECT code, max, uses, disabled FROM invites WHERE code=?', String(b.invite || '').trim().toUpperCase());
       if (!invite || invite.disabled || (invite.max && invite.uses >= invite.max)) bad('Beta is invite-only right now. Ask for an invite link!', 403);
     }
-    const r = await D.run('INSERT INTO users(username,pw,created) VALUES(?,?,?)', name, await hashPw(pw), Date.now());
+    const r = await D.run('INSERT INTO users(username,pw,created,inst) VALUES(?,?,?,?)', name, await hashPw(pw), Date.now(), inst.id);
     if (invite) await D.run('UPDATE invites SET uses=uses+1 WHERE code=?', invite.code);
     const token = await newSession(D, r.meta.last_row_id, 'web');
     return json({ user: { username: name, bio: '', display_name: '', color: 'lime', unread: 0 } }, 200, { 'set-cookie': cookie(req, token, 2592000) });
@@ -639,9 +682,13 @@ async function route(req, env, url) {
     const b = await readJson(req, 10000);
     const name = String(b.username || '').trim();
     await rate(D, 'loginu:' + name.toLowerCase(), 10, 600);
-    const row = await D.first('SELECT id, username, bio, pw FROM users WHERE username=?', name);
+    const row = await D.first('SELECT id, username, bio, pw, inst FROM users WHERE username=?', name);
     const ok = row ? await checkPw(String(b.password || ''), row.pw) : (await hashPw('x'), false);
     if (!ok) bad('That username or password is not right!', 401);
+    if (row.inst !== inst.id) {
+      const home = await D.first('SELECT slug, name FROM instances WHERE id=?', row.inst);
+      bad('That account lives on ' + (home ? home.name : 'another instance') + (home ? ', at ' + instUrl(env, url, home.slug).replace(/^https?:\/\//, '') : '') + '. Log in there!', 403);
+    }
     let ban = await D.first('SELECT reason FROM bans WHERE user_id=?', row.id);
     if (ban) {
       const bu = await D.first('SELECT until FROM ban_until WHERE user_id=?', row.id);
@@ -668,7 +715,8 @@ async function route(req, env, url) {
     const filters = (await D.all('SELECT word FROM word_filters WHERE user_id=?', user.id)).map((r) => r.word);
     const isModer = !!(await D.first('SELECT 1 AS x FROM site_mods WHERE user_id=?', user.id));
     const warnings = await D.all('SELECT id, text, created FROM warnings WHERE user_id=? AND seen=0 ORDER BY id LIMIT 3', user.id);
-    return json({ user: { ...row, filters, mod: isModer, warnings, display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, admin: isAdmin(env, user), avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
+    const homeInst = await D.first('SELECT slug, name FROM instances WHERE id=(SELECT inst FROM users WHERE id=?)', user.id);
+    return json({ user: { ...row, filters, mod: isModer, warnings, instance: instPublic(inst, env, url), homeSlug: homeInst ? homeInst.slug : 'main', display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, admin: isAdmin(env, user), avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
   }
   if (seg[0] === 'me' && !seg[1] && method === 'PATCH') {
     need();
@@ -975,6 +1023,8 @@ async function route(req, env, url) {
       }
       for (const w of words.slice(0, 5)) { where += " AND p.body LIKE ? ESCAPE '\\'"; params.push('%' + w.replace(/[\\%_]/g, '\\$&') + '%'); }
     }
+    // the Local timeline (and Explore on this instance) only shows people who live on this instance
+    if ((sp.get('local') === '1' || sp.get('scope') === 'local') && !sp.get('user') && !sp.get('outlet')) { where += ' AND u.inst=?'; params.push(inst.id); }
     if (noOutlets && !sp.get('list')) where += ' AND p.id NOT IN (SELECT post_id FROM outlet_posts)';
     if (hide && user) {
       where += " AND p.user_id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)";
@@ -1030,6 +1080,10 @@ async function route(req, env, url) {
 
   // --- topics
   if (seg[0] === 'topics' && !seg[1] && method === 'GET') {
+    if (url.searchParams.get('local') === '1') {
+      const hot = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id JOIN users u ON u.id=p.user_id WHERE u.inst=? AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY SUM(CASE WHEN p.created>? THEN 1 ELSE 0 END) DESC, n DESC, MAX(p.id) DESC LIMIT 10', inst.id, Date.now() - 3 * 864e5);
+      return json({ topics: hot });
+    }
     const since = Date.now() - 3 * 864e5;
     let rows = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY n DESC, MAX(p.id) DESC LIMIT 10', since);
     if (!rows.length) rows = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt WHERE pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY n DESC, MAX(pt.post_id) DESC LIMIT 10');
@@ -1075,6 +1129,7 @@ async function route(req, env, url) {
         followsYou: user ? !!(await D.first('SELECT 1 AS x FROM follows WHERE follower=? AND followee=?', u.id, user.id)) : false,
         muted: !!rel && rel.kind === 'mute', blocked: !!rel && rel.kind === 'block',
         badge: ((await D.first('SELECT kind FROM badges WHERE user_id=?', u.id)) || {}).kind || null,
+        inst_slug: ((await D.first('SELECT slug FROM instances WHERE id=(SELECT inst FROM users WHERE id=?)', u.id)) || {}).slug || 'main',
         fields: await D.all('SELECT label, value FROM profile_fields WHERE user_id=? ORDER BY idx', u.id),
         hasNote: user ? !!(await D.first('SELECT 1 AS x FROM user_notes WHERE user_id=? AND target_id=?', user.id, u.id)) : false,
         pinned: pr && pr.pinned ? await onePost(env, D, user, pr.pinned) : null,
@@ -1133,9 +1188,9 @@ async function route(req, env, url) {
         (SELECT COUNT(*) FROM follows f WHERE f.followee=x.id) AS fans
        FROM users x LEFT JOIN profiles pr ON pr.user_id=x.id
        WHERE x.id != ? AND x.id NOT IN (SELECT followee FROM follows WHERE follower=?) AND x.id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)
-         AND EXISTS (SELECT 1 FROM posts p WHERE p.user_id=x.id)
+         AND EXISTS (SELECT 1 FROM posts p WHERE p.user_id=x.id)${url.searchParams.get('local') === '1' ? ' AND x.inst=?' : ''}
        ORDER BY fans DESC, x.id DESC LIMIT 5`,
-      me, me, me
+      me, me, me, ...(url.searchParams.get('local') === '1' ? [inst.id] : [])
     );
     return json({ users: rows });
   }
@@ -1201,6 +1256,66 @@ async function route(req, env, url) {
 
   // --- direct messages
 
+  // ---------- instances ----------
+  if (seg[0] === 'instance' && !seg[1] && method === 'GET') {
+    const members = (await D.first('SELECT COUNT(*) AS n FROM users WHERE inst=?', inst.id)).n;
+    const posts = (await D.first('SELECT COUNT(*) AS n FROM posts p JOIN users u ON u.id=p.user_id WHERE u.inst=? AND p.parent_id IS NULL', inst.id)).n;
+    const owner = inst.owner_id ? await D.first('SELECT username FROM users WHERE id=?', inst.owner_id) : null;
+    const canManage = !!user && (isAdmin(env, user) || inst.owner_id === user.id);
+    return json({ instance: { ...instPublic(inst, env, url), members, posts, owner: owner ? owner.username : null, inviteCode: canManage ? inst.invite_code : undefined }, canManage, mainUrl: instUrl(env, url, 'main') });
+  }
+  if (seg[0] === 'instance' && !seg[1] && method === 'PATCH') {
+    need();
+    if (!(isAdmin(env, user) || inst.owner_id === user.id)) bad("Only this instance's owner can change it!", 403);
+    const b = await readJson(req, 6000);
+    const name = b.name === undefined ? inst.name : cleanLine(b.name, 40);
+    if (name.length < 2) bad('Give the instance a name!');
+    const description = b.description === undefined ? inst.description : cleanLine(b.description, 300);
+    const rules = b.rules === undefined ? inst.rules : cleanBody(b.rules).slice(0, 1500);
+    let reg = inst.reg, code = inst.invite_code;
+    if (b.reg !== undefined && b.reg !== inst.reg) {
+      if (!['open', 'invite', 'closed'].includes(b.reg)) bad('Pick open, invite-only or closed!');
+      if (inst.id === 1) bad('The main instance follows the site-wide sign-up switches in Admin!');
+      reg = b.reg;
+    }
+    if (reg === 'invite' && (!code || b.regen_invite)) code = genCode();
+    const listed = b.listed === undefined || inst.id === 1 ? inst.listed : b.listed ? 1 : 0;
+    await D.run('UPDATE instances SET name=?, description=?, rules=?, reg=?, invite_code=?, listed=? WHERE id=?', name, description, rules, reg, code, listed, inst.id);
+    return json({ ok: true, inviteCode: code });
+  }
+  if (seg[0] === 'instances' && !seg[1] && method === 'GET') {
+    const q = cleanLine(url.searchParams.get('q'), 40).replace(/[\\%_]/g, '\\$&');
+    const like = '%' + q + '%';
+    const rows = await D.all(`SELECT i.id, i.slug, i.name, i.description, i.reg, i.created, (SELECT COUNT(*) FROM users u WHERE u.inst=i.id) AS members,
+        (SELECT COUNT(*) FROM posts p JOIN users u ON u.id=p.user_id WHERE u.inst=i.id AND p.parent_id IS NULL) AS posts
+      FROM instances i WHERE (i.listed=1 OR i.id=1)${q ? " AND (i.name LIKE ? ESCAPE '\\' OR i.slug LIKE ? ESCAPE '\\' OR i.description LIKE ? ESCAPE '\\')" : ''}
+      ORDER BY (i.id=1) DESC, members DESC, i.id DESC LIMIT 100`, ...(q ? [like, like, like] : []));
+    return json({ instances: rows.map((r) => ({ slug: r.slug, name: r.name, description: r.description, reg: r.reg, members: r.members, posts: r.posts, created: r.created, isMain: r.id === 1, url: instUrl(env, url, r.slug) })), here: inst.slug, mainUrl: instUrl(env, url, 'main') });
+  }
+  if (seg[0] === 'instances' && !seg[1] && method === 'POST') {
+    await rate(D, 'inst:' + ip, 3, 86400);
+    if ((await siteGet(D, 'reg_open', '1')) === '0') bad('New sign-ups are paused for a little while. Please come back soon!', 403);
+    const b = await readJson(req, 8000);
+    const slug = String(b.slug || '').trim().toLowerCase();
+    const name = cleanLine(b.name, 40);
+    if (name.length < 2) bad('Give your instance a name!');
+    if (!SLUG_RE.test(slug) || slug.includes('--')) bad('The address is 3 to 30 letters, numbers and dashes!');
+    if (RESERVED_SLUGS.has(slug)) bad('That address is saved for the site. Pick another!');
+    if (await D.first('SELECT 1 AS x FROM instances WHERE slug=?', slug)) bad('That address is taken!', 409);
+    const uname = String(b.username || '').trim();
+    if (!/^[a-z0-9][a-z0-9_-]{2,19}$/i.test(uname)) bad('Usernames are 3 to 20 letters, numbers, - or _!');
+    if (RESERVED.has(uname.toLowerCase())) bad('That name is saved for the site. Pick another!');
+    if (await D.first('SELECT 1 AS x FROM users WHERE username=?', uname)) bad('That username is taken!', 409);
+    const pw = String(b.password || '');
+    if (pw.length < 8 || pw.length > 200) bad('Passwords need at least 8 characters!');
+    const reg = ['open', 'invite', 'closed'].includes(b.reg) ? b.reg : 'open';
+    const now = Date.now();
+    const r = await D.run('INSERT INTO instances(slug,name,description,rules,reg,invite_code,created) VALUES(?,?,?,?,?,?,?)', slug, name, cleanLine(b.description, 300), cleanBody(b.rules).slice(0, 1500), reg, reg === 'invite' ? genCode() : '', now);
+    const iid = r.meta.last_row_id;
+    const u = await D.run('INSERT INTO users(username,pw,created,inst) VALUES(?,?,?,?)', uname, await hashPw(pw), now, iid);
+    await D.run('UPDATE instances SET owner_id=? WHERE id=?', u.meta.last_row_id, iid);
+    return json({ ok: true, slug, username: uname, url: instUrl(env, url, slug) });
+  }
   // ---------- version 5 ----------
   if (seg[0] === 'me' && seg[1] === 'filters') {
     need();
@@ -1332,8 +1447,9 @@ async function route(req, env, url) {
   }
   if (seg[0] === 'trending' && method === 'GET') {
     const since = Date.now() - 864e5;
-    const topics = await D.all('SELECT pt.topic AS topic, COUNT(DISTINCT p.user_id) AS people, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? AND p.id NOT IN (SELECT post_id FROM outlet_posts) AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY people DESC, n DESC, pt.topic LIMIT 10', since);
-    const rows = await D.all('SELECT p.id, (SELECT COUNT(*) FROM likes WHERE post_id=p.id) + (SELECT COUNT(*) FROM reactions WHERE post_id=p.id) + 2*(SELECT COUNT(*) FROM refs WHERE target_id=p.id) + (SELECT COUNT(*) FROM posts c WHERE c.parent_id=p.id) AS score FROM posts p WHERE p.parent_id IS NULL AND p.created>? AND p.id NOT IN (SELECT post_id FROM refs) AND p.id NOT IN (SELECT post_id FROM outlet_posts) AND p.id NOT IN (SELECT post_id FROM post_topics WHERE topic IN (SELECT topic FROM hidden_topics)) ORDER BY score DESC, p.id DESC LIMIT 5', since);
+    const loc = url.searchParams.get('local') === '1';
+    const topics = await D.all('SELECT pt.topic AS topic, COUNT(DISTINCT p.user_id) AS people, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? ' + (loc ? 'AND p.user_id IN (SELECT id FROM users WHERE inst=?) ' : '') + 'AND p.id NOT IN (SELECT post_id FROM outlet_posts) AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY people DESC, n DESC, pt.topic LIMIT 10', since, ...(loc ? [inst.id] : []));
+    const rows = await D.all('SELECT p.id, (SELECT COUNT(*) FROM likes WHERE post_id=p.id) + (SELECT COUNT(*) FROM reactions WHERE post_id=p.id) + 2*(SELECT COUNT(*) FROM refs WHERE target_id=p.id) + (SELECT COUNT(*) FROM posts c WHERE c.parent_id=p.id) AS score FROM posts p WHERE p.parent_id IS NULL AND p.created>? ' + (loc ? 'AND p.user_id IN (SELECT id FROM users WHERE inst=?) ' : '') + 'AND p.id NOT IN (SELECT post_id FROM refs) AND p.id NOT IN (SELECT post_id FROM outlet_posts) AND p.id NOT IN (SELECT post_id FROM post_topics WHERE topic IN (SELECT topic FROM hidden_topics)) ORDER BY score DESC, p.id DESC LIMIT 5', since, ...(loc ? [inst.id] : []));
     const hot = rows.filter((r) => r.score > 0);
     const posts = hot.length ? (await listPosts(env, D, user, `p.id IN (${ph(hot.length)})`, hot.map((r) => r.id), { limit: 5 })).posts : [];
     const rank = new Map(hot.map((r, i) => [r.id, i]));
@@ -1476,9 +1592,9 @@ async function route(req, env, url) {
       const rows = await D.all(
         `SELECT o.slug, o.name, o.description, o.color, o.created, ${SELECT_COUNTS},
            EXISTS(SELECT 1 FROM outlet_members m WHERE m.outlet_id=o.id AND m.user_id=?) AS joined
-         FROM outlets o ${q ? "WHERE o.name LIKE ? ESCAPE '\\' OR o.slug LIKE ? ESCAPE '\\' OR o.description LIKE ? ESCAPE '\\'" : ''}
+         FROM outlets o WHERE o.inst=? ${q ? "AND (o.name LIKE ? ESCAPE '\\' OR o.slug LIKE ? ESCAPE '\\' OR o.description LIKE ? ESCAPE '\\')" : ''}
          ORDER BY ${popular ? '(members * 3 + posts) DESC, o.id DESC' : 'o.id DESC'} LIMIT ${Math.min(intParam(sp.get('limit')) || 40, 60)}`,
-        user ? user.id : 0, ...(q ? [like, like, like] : []));
+        user ? user.id : 0, inst.id, ...(q ? [like, like, like] : []));
       return json({ outlets: rows.map((r) => ({ ...r, joined: !!r.joined })) });
     }
     if (seg[1] === 'mine' && method === 'GET') {
@@ -1499,7 +1615,7 @@ async function route(req, env, url) {
       if ((await D.first('SELECT COUNT(*) AS n FROM outlets WHERE owner_id=?', user.id)).n >= 5) bad('You already run 5 Outlets, which is the limit for now!');
       if (await D.first('SELECT 1 AS x FROM outlets WHERE slug=?', slug)) bad('That Outlet address is taken!', 409);
       const now = Date.now();
-      const r = await D.run('INSERT INTO outlets(slug,name,description,rules,color,owner_id,created) VALUES(?,?,?,?,?,?,?)', slug, name, cleanLine(b.description, 200), cleanBody(b.rules).slice(0, 1500), color, user.id, now);
+      const r = await D.run('INSERT INTO outlets(slug,name,description,rules,color,owner_id,created,inst) VALUES(?,?,?,?,?,?,?,?)', slug, name, cleanLine(b.description, 200), cleanBody(b.rules).slice(0, 1500), color, user.id, now, inst.id);
       const oid = r.meta.last_row_id;
       await D.batch([D.stmt("INSERT INTO outlet_members(outlet_id,user_id,role,joined) VALUES(?,?,'owner',?)", oid, user.id, now), D.stmt("INSERT INTO subjects(outlet_id,slug,name,description,position,created) VALUES(?,'general','General','Anything goes',0,?)", oid, now)]);
       return json({ slug });
@@ -1813,6 +1929,27 @@ async function route(req, env, url) {
         const rows = await D.all('SELECT admin, action, created FROM audit ORDER BY id');
         return new Response(csv([['when', 'admin', 'action'], ...rows.map((r) => [new Date(r.created).toISOString(), r.admin, r.action])]), { headers: { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': 'attachment; filename="beta-activity-log.csv"', 'cache-control': 'no-store' } });
       }
+    }
+    if (seg[1] === 'instances' && !seg[2] && method === 'GET') {
+      const rows = await D.all('SELECT i.id, i.slug, i.name, i.listed, i.reg, i.created, (SELECT username FROM users WHERE id=i.owner_id) AS owner, (SELECT COUNT(*) FROM users u WHERE u.inst=i.id) AS members, (SELECT COUNT(*) FROM posts p JOIN users u ON u.id=p.user_id WHERE u.inst=i.id) AS posts FROM instances i ORDER BY i.id');
+      return json({ instances: rows.map((r) => ({ ...r, listed: !!r.listed, isMain: r.id === 1, url: instUrl(env, url, r.slug) })) });
+    }
+    if (seg[1] === 'instances' && seg[2] && seg[3] === 'listed' && method === 'POST') {
+      const b = await readJson(req, 300);
+      await D.run('UPDATE instances SET listed=? WHERE slug=? AND id != 1', b.listed ? 1 : 0, seg[2]);
+      return json({ ok: true });
+    }
+    if (seg[1] === 'instances' && seg[2] && !seg[3] && method === 'DELETE') {
+      const row = await D.first('SELECT id FROM instances WHERE slug=?', seg[2]);
+      if (!row) bad('We could not find that instance!', 404);
+      if (row.id === 1) bad('The main instance cannot be removed!', 403);
+      for (const o of await D.all('SELECT id FROM outlets WHERE inst=?', row.id)) {
+        await purgePosts(D, (await D.all('SELECT post_id FROM outlet_posts WHERE outlet_id=?', o.id)).map((r) => r.post_id));
+        await D.batch([D.stmt('DELETE FROM outlet_posts WHERE outlet_id=?', o.id), D.stmt('DELETE FROM subjects WHERE outlet_id=?', o.id), D.stmt('DELETE FROM outlet_members WHERE outlet_id=?', o.id), D.stmt('DELETE FROM outlet_bans WHERE outlet_id=?', o.id), D.stmt('DELETE FROM outlets WHERE id=?', o.id)]);
+      }
+      for (const u of await D.all('SELECT id FROM users WHERE inst=?', row.id)) await purgeUser(D, u.id);
+      await D.run('DELETE FROM instances WHERE id=?', row.id);
+      return json({ ok: true });
     }
     if (seg[1] === 'badges' && method === 'POST') {
       const b = await readJson(req, 500);

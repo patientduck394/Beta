@@ -130,3 +130,7 @@ CREATE TABLE IF NOT EXISTS hidden_topics (topic TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS muted_threads (user_id INTEGER NOT NULL, post_id INTEGER NOT NULL, PRIMARY KEY (user_id, post_id));
 CREATE TABLE IF NOT EXISTS saved_searches (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, q TEXT NOT NULL, created INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS saved_searches_user ON saved_searches(user_id);
+-- version 9 (the Worker also adds users.inst and outlets.inst and the main instance by itself)
+CREATE TABLE IF NOT EXISTS instances (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', reg TEXT NOT NULL DEFAULT 'open', invite_code TEXT NOT NULL DEFAULT '', owner_id INTEGER, listed INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL);
+-- version 9 (the Worker also adds users.inst and outlets.inst and the main instance by itself)
+CREATE TABLE IF NOT EXISTS instances (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', reg TEXT NOT NULL DEFAULT 'open', invite_code TEXT NOT NULL DEFAULT '', owner_id INTEGER, listed INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL);

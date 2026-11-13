@@ -471,3 +471,32 @@ a.tile:hover { border-color: var(--lime-d); }
 .pop.fmtpop { max-height: 60vh; overflow: auto; min-width: 190px; }
 .pop.fmtpop hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }
 .savedsearch { margin: 8px 0; }
+
+/* ===== instances: the landing page, the directory and instance cards ===== */
+.brand .instname { font-size: .62em; font-weight: 700; margin-left: 4px; padding: 1px 9px; border-radius: 99px; background: var(--lime-l); color: var(--lime-dd); align-self: center; }
+.itag { font-size: .7rem; font-weight: 700; padding: 0 8px; border-radius: 99px; background: var(--lime-l); color: var(--lime-dd); border: 1px solid var(--line); }
+.landing .lhero { text-align: center; padding: 28px 16px 24px; border-radius: var(--radius); background: linear-gradient(180deg, var(--lime-l), var(--card)); border: 1.5px solid var(--line); margin-bottom: 20px; }
+.landing .lhero h1 { font-size: clamp(1.6rem, 4vw, 2.3rem); line-height: 1.15; margin: 8px auto; max-width: 18em; }
+.landing .lead { max-width: 40em; margin: 8px auto 14px; color: var(--muted); font-size: 1.05rem; }
+.landing .llogo { object-fit: contain; }
+.row2c { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 12px 0 0; }
+.igrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin: 12px 0 20px; }
+.icard { display: flex; flex-direction: column; gap: 6px; background: var(--card); border: 1.5px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+.icard.main { border-color: var(--lime-d); background: linear-gradient(180deg, var(--lime-ll), var(--card)); }
+.icard.here { box-shadow: 0 0 0 2px var(--lime); }
+.icard .ihead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.icard h3 { margin: 0; font-size: 1.1rem; }
+.icard .idesc { margin: 0; flex: 1; }
+.icard .row2 { margin-top: 6px; }
+.icard .iurl { margin-left: auto; overflow-wrap: anywhere; }
+.how { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 8px 0 24px; }
+.step3 { background: var(--card); border: 1.5px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+.step3 .n { display: inline-flex; width: 28px; height: 28px; align-items: center; justify-content: center; border-radius: 50%; background: var(--lime); color: #1d3205; }
+.step3 h3 { margin: 6px 0 4px; }
+.irules { margin: 8px 0; text-align: left; }
+.irules summary { cursor: pointer; font-weight: 700; }
+.scopesw { margin-left: auto; align-self: center; }
+.scopesw a.on { font-weight: 800; color: var(--lime-dd); }
+.slugrow { display: flex; align-items: center; gap: 8px; }
+.slugrow input { flex: 1; }
+.icardside .irules { margin: 4px 0; }

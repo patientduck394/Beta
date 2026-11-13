@@ -72,7 +72,7 @@
   };
   const link = (href, ...kids) => h('a', { href, 'data-link': true }, ...kids);
   const params = () => new URLSearchParams(location.search);
-  const setTitle = (t) => (document.title = t ? t + ' · Beta' : 'Beta');
+  const setTitle = (t) => (document.title = (t ? t + ' · ' : '') + (inst.isMain ? 'Beta' : inst.name + ' · Beta'));
   const errBox = () => h('div', { class: 'err', role: 'alert' });
   const guard = (box, fn) => async (e) => {
     e && e.preventDefault && e.preventDefault();
@@ -85,6 +85,8 @@
   };
   const safe = (fn) => (...a) => Promise.resolve(fn(...a)).catch((e) => toast(e.message));
   const nameOf = (u) => u.display_name || u.username;
+  // the instance this address belongs to (the main Beta, or a community like garden.beta.radii-office.com)
+  let inst = { slug: 'main', name: 'Beta', isMain: true, reg: 'open', description: '', rules: '' }, instInfo = null, noInstance = false;
   const BADGE_TITLES = { verified: 'Verified', staff: 'Beta staff', supporter: 'Supporter' };
   const badgeEl = (u) => (u && u.badge ? h('span', { class: 'vbadge b-' + u.badge, title: BADGE_TITLES[u.badge] || u.badge, role: 'img', 'aria-label': BADGE_TITLES[u.badge] || u.badge }, '\u2713') : null);
   const REACT = ['\u{1F602}', '\u{1F525}', '\u{1F44F}', '\u{1F62E}', '\u{1F622}', '\u{1F389}'];
@@ -189,6 +191,8 @@
       const menu = h('details', { class: 'menu navmenu' }, h('summary', { class: 'navbtn', 'aria-label': 'More' }, icon('more')),
         h('div', { class: 'pop right' },
           h('a', { href: '/bookmarks', 'data-link': true }, 'Saved posts'),
+          h('a', { href: '/instances', 'data-link': true }, 'Instances'),
+          instInfo && instInfo.canManage ? h('a', { href: '/instance/settings', 'data-link': true }, 'Instance settings') : null,
           h('a', { href: '/scheduled', 'data-link': true }, 'Scheduled posts'),
           h('a', { href: '/stats', 'data-link': true }, 'Your stats'),
           h('a', { href: '/lists', 'data-link': true }, 'Lists'),
@@ -203,7 +207,7 @@
         h('a', { class: 'navbtn', href: '/notifications', 'data-link': true, title: 'Notifications (g then n)', 'aria-label': 'Notifications' }, icon('bell'), badge(me.unread)),
         h('a', { class: 'navuser', href: '/u/' + enc(me.username), 'data-link': true, title: 'Your profile' }, avatar(me), h('span', { class: 'navname' }, nameOf(me))),
         menu);
-    } else nav.append(h('a', { class: 'navbtn', href: '/outlets', 'data-link': true, title: 'Outlets', 'aria-label': 'Outlets' }, icon('forum')), h('a', { class: 'navbtn', href: '/explore', 'data-link': true, title: 'Explore', 'aria-label': 'Explore' }, icon('explore')), h('a', { class: 'btn ghost small', href: '/login', 'data-link': true }, 'Log in'), h('a', { class: 'btn small', href: '/register', 'data-link': true }, 'Sign up'));
+    } else nav.append(h('a', { class: 'navbtn', href: '/instances', 'data-link': true, title: 'Instances', 'aria-label': 'Instances' }, icon('users')), h('a', { class: 'navbtn', href: '/outlets', 'data-link': true, title: 'Outlets', 'aria-label': 'Outlets' }, icon('forum')), h('a', { class: 'navbtn', href: '/explore', 'data-link': true, title: 'Explore', 'aria-label': 'Explore' }, icon('explore')), h('a', { class: 'btn ghost small', href: '/login', 'data-link': true }, 'Log in'), h('a', { class: 'btn small', href: '/register', 'data-link': true }, 'Sign up'));
   }
   async function refreshUnread() {
     if (!me) return;
@@ -238,7 +242,7 @@
 
   async function drawSide() {
     try {
-      const [t, s, ol] = await Promise.all([api('/topics'), api('/suggest'), me ? api('/outlets/mine') : api('/outlets?limit=5')]);
+      const [t, s, ol] = await Promise.all([api('/topics?local=1'), api('/suggest?local=1'), me ? api('/outlets/mine') : api('/outlets?limit=5')]);
       const outletsCard = me
         ? h('nav', { class: 'card side osb', 'aria-label': 'Your Outlets' }, h('h2', null, link('/outlets', 'Outlets')),
             ol.outlets.length ? ol.outlets.map((o) => h('details', { class: 'osub' }, h('summary', null, outletBadge(o), h('span', { class: 'oname2' }, o.name)),
@@ -246,6 +250,7 @@
             h('p', { class: 'small' }, link('/outlets', 'Browse every Outlet'), ' · ', link('/outlets/new', 'Make one')))
         : h('nav', { class: 'card side osb', 'aria-label': 'Popular Outlets' }, h('h2', null, link('/outlets', 'Outlets')), ol.outlets.length ? h('ul', { class: 'olist' }, ol.outlets.map((o) => h('li', null, outletBadge(o), link(outletPath(o.slug), o.name), h('span', { class: 'muted small' }, o.members + ' members')))) : h('p', { class: 'muted small' }, 'No Outlets yet.'));
       put(side,
+        instCard(),
         outletsCard,
         h('div', { class: 'card side' }, h('h2', null, 'Trending Topics'),
           t.topics.length ? h('ol', null, t.topics.map((x) => h('li', null, link('/topic/' + enc(x.topic), h('span', { class: 'tn' }, '#' + x.topic)), h('span', { class: 'muted small' }, x.n + (x.n === 1 ? ' post' : ' posts')))))
@@ -422,7 +427,7 @@
     const article = h('article', { class: 'post' + (opts.focus ? ' focus' : '') },
       avatar(x),
       h('div', { class: 'pb' },
-        h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), badgeEl(x), h('span', { class: 'muted small' }, '@' + x.username), h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, opts.pinned || (ol && ol.pinned) ? h('span', { class: 'pinned' }, icon('pin', 'solid'), 'Pinned') : null, ol && ol.locked ? h('span', { class: 'pinned' }, icon('lock'), 'Locked') : null),
+        h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), badgeEl(x), h('span', { class: 'muted small' }, '@' + x.username), x.inst_slug && x.inst_slug !== inst.slug ? h('span', { class: 'itag', title: 'From the ' + x.inst_slug + ' instance' }, x.inst_slug) : null, h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, opts.pinned || (ol && ol.pinned) ? h('span', { class: 'pinned' }, icon('pin', 'solid'), 'Pinned') : null, ol && ol.locked ? h('span', { class: 'pinned' }, icon('lock'), 'Locked') : null),
         outletChip,
         x.replyPolicy ? h('div', { class: 'ptag muted small' }, icon('lock'), x.replyPolicy === 'following' ? ' Only people the author follows can reply' : ' Only mentioned people can reply') : null,
         warn,
@@ -858,21 +863,159 @@
   async function home() {
     setTitle('');
     drawSide();
-    const tab = params().get('tab') || (me ? 'home' : 'all');
-    const f = feed('/feed', tab === 'home' && me ? { scope: 'home' } : {}, { empty: tab === 'home' ? 'Your home feed is empty. Follow people and Topics, or look at Everyone!' : 'No posts yet. Be the first!' });
+    const tabParam = params().get('tab');
+    // before you log in, the main Beta is a front door: pick where to join
+    if (!me && !tabParam && inst.isMain) return landingPage();
+    const tab = tabParam || (me ? 'home' : 'local');
+    const query = tab === 'home' && me ? { scope: 'home' } : tab === 'local' ? { scope: 'local' } : {};
+    const f = feed('/feed', query, { empty: tab === 'home' ? 'Your home feed is empty. Follow people and Topics, or look at the Local and Federated timelines!' : 'No posts yet. Be the first!' });
     const banner = h('button', { class: 'btn newposts', type: 'button', hidden: true, onclick: () => render() }, 'New posts, show them!');
+    const onTab = (k, label, title) => h('a', { href: k === 'home' ? '/' : '/?tab=' + k, 'data-link': true, class: tab === k ? 'on' : '', title }, label);
     show(
-      !me ? h('section', { class: 'hero' }, h('h1', null, 'Short posts. Big conversations!'), h('p', null, 'Beta is a microblog where every post can live in a Topic. Add a #hashtag, a picture, a poll or a file, and join the conversation!'), h('p', null, h('a', { class: 'btn', href: '/register', 'data-link': true }, 'Join Beta'))) : null,
+      !me ? instanceHero() : null,
       me ? composer({ onPosted: (p) => { f.add(p); toast('Posted!'); drawSide(); } }) : null,
-      me ? h('div', { class: 'tabs' }, h('a', { href: '/', 'data-link': true, class: tab === 'home' ? 'on' : '' }, 'Following'), h('a', { href: '/?tab=all', 'data-link': true, class: tab === 'all' ? 'on' : '' }, 'Everyone')) : null,
+      h('div', { class: 'tabs' }, me ? onTab('home', 'Following', 'People and Topics you follow') : null, onTab('local', inst.isMain ? 'Local' : 'Local', 'Everyone on ' + inst.name), onTab('all', 'Federated', 'Every instance together')),
       banner, f);
     await f.ready;
     timers.push(setInterval(async () => {
       try {
-        const r = await api('/feed?limit=1' + (tab === 'home' && me ? '&scope=home' : ''));
+        const r = await api('/feed?limit=1' + (tab === 'home' && me ? '&scope=home' : tab === 'local' ? '&scope=local' : ''));
         if (r.posts[0] && f.topId && r.posts[0].id > f.topId && !(me && r.posts[0].username === me.username)) banner.hidden = false;
       } catch (e) {}
     }, 45000));
+  }
+
+  // ---------- instances: communities at name.beta.radii-office.com, all part of one Beta ----------
+  const REG_WORDS = { open: 'Open sign-up', invite: 'Invite only', closed: 'Not accepting members' };
+  function drawBrand() {
+    const b = document.querySelector('.brand span');
+    if (b) put(b, 'Beta', inst.isMain ? null : h('small', { class: 'instname' }, inst.name));
+  }
+  function noInstancePage() {
+    setTitle('No such instance');
+    side.replaceChildren();
+    const main = location.protocol + '//' + location.hostname.replace(/^[^.]+\./, '') + (location.port ? ':' + location.port : '');
+    return h('div', { class: 'card empty' }, h('h1', null, 'There is no Beta instance here!'), h('p', null, 'Nobody has made an instance at this address yet. It could be yours!'),
+      h('p', null, h('a', { class: 'btn', href: main + '/instances/new' }, 'Make an instance'), ' ', h('a', { class: 'btn ghost', href: main + '/instances' }, 'See every instance')));
+  }
+  function instanceCard(i, opts = {}) {
+    const here = i.slug === inst.slug;
+    return h('article', { class: 'icard' + (i.isMain ? ' main' : '') + (here ? ' here' : '') },
+      h('div', { class: 'ihead' }, h('h3', null, i.name), i.isMain ? h('span', { class: 'chip small' }, 'Main') : null, here ? h('span', { class: 'chip small' }, 'You are here') : null),
+      h('p', { class: 'idesc' }, i.description || (i.isMain ? 'The original Beta instance. Everyone is welcome!' : 'A Beta community.')),
+      h('div', { class: 'imeta small muted' }, i.members + (i.members === 1 ? ' member' : ' members') + ' · ' + i.posts + (i.posts === 1 ? ' post' : ' posts') + ' · ' + REG_WORDS[i.reg]),
+      h('div', { class: 'row2' }, i.reg === 'closed' ? null : h('a', { class: 'btn small', href: i.url + '/register' }, 'Join'), h('a', { class: 'btn ghost small', href: i.url + '/?tab=local' }, 'Look around'),
+        h('span', { class: 'iurl small muted' }, i.url.replace(/^https?:\/\//, ''))));
+  }
+  async function landingPage() {
+    side.replaceChildren();
+    const r = await api('/instances');
+    const grid = h('div', { class: 'igrid' });
+    const draw = (list) => put(grid, list.length ? list.map((i) => instanceCard(i)) : h('p', { class: 'muted' }, 'No instance matches that. Why not make it?'));
+    draw(r.instances);
+    const find = h('input', { type: 'search', placeholder: 'Find an instance', 'aria-label': 'Find an instance', maxlength: 40 });
+    let tm = 0;
+    find.addEventListener('input', () => { clearTimeout(tm); tm = setTimeout(safe(async () => { draw((await api('/instances?q=' + enc(find.value.trim()))).instances); }), 220); });
+    const step = (n, t, d) => h('div', { class: 'step3' }, h('b', { class: 'n' }, n), h('h3', null, t), h('p', { class: 'muted' }, d));
+    show(h('div', { class: 'landing' },
+      h('section', { class: 'lhero' }, h('img', { class: 'llogo', src: '/logo.png', alt: '', width: 56, height: 60 }),
+        h('h1', null, 'Short posts. Big conversations. Your corner of the network!'),
+        h('p', { class: 'lead' }, 'Beta is a microblog made of instances: friendly communities that each have their own people, rules and local timeline, all connected by one Federated timeline. Join the main instance, pick a community, or start your own!'),
+        h('p', { class: 'row2c' }, h('a', { class: 'btn', href: '/register', 'data-link': true }, 'Join the main instance'), ' ', h('a', { class: 'btn ghost', href: '/login', 'data-link': true }, 'Log in'), ' ', h('a', { class: 'btn ghost', href: '/instances/new', 'data-link': true }, 'Start your own instance'))),
+      h('section', null, h('div', { class: 'row' }, h('h2', null, 'Pick an instance'), find), grid),
+      h('section', { class: 'how' }, step('1', 'Instances are communities', 'Each one lives at its own address, like garden.beta.radii-office.com, with its own members, rules and sign-up policy.'),
+        step('2', 'One network', 'The Local timeline is just your instance. The Federated timeline shows every instance together, and you can follow and reply across them.'),
+        step('3', 'Make your own', 'Pick a name and an address, choose open, invite-only or closed sign-up, and you are the admin. It takes a minute!'))));
+  }
+  function instanceHero() {
+    return h('section', { class: 'hero' }, h('h1', null, inst.isMain ? 'Short posts. Big conversations!' : 'Welcome to ' + inst.name + '!'),
+      h('p', null, inst.isMain ? 'Beta is a microblog where every post can live in a Topic. Add a #hashtag, a picture, a poll or a file, and join the conversation!' : (inst.description || 'A community on Beta.')),
+      inst.rules ? h('details', { class: 'irules' }, h('summary', null, 'House rules'), h('div', { class: 'vbody' }, inst.rules)) : null,
+      h('p', null, inst.reg === 'closed' ? h('span', { class: 'muted' }, 'This instance is not accepting new members right now. ') : h('a', { class: 'btn', href: '/register', 'data-link': true }, 'Join ' + (inst.isMain ? 'Beta' : inst.name)), ' ', h('a', { class: 'btn ghost', href: '/login', 'data-link': true }, 'Log in'), ' ', link('/instances', 'All instances')));
+  }
+  async function instancesPage() {
+    setTitle('Instances');
+    side.replaceChildren();
+    const r = await api('/instances');
+    const grid = h('div', { class: 'igrid' });
+    const draw = (list) => put(grid, list.length ? list.map((i) => instanceCard(i)) : h('p', { class: 'muted' }, 'No instance matches that!'));
+    draw(r.instances);
+    const find = h('input', { type: 'search', placeholder: 'Find an instance', 'aria-label': 'Find an instance', maxlength: 40 });
+    let tm = 0;
+    find.addEventListener('input', () => { clearTimeout(tm); tm = setTimeout(safe(async () => { draw((await api('/instances?q=' + enc(find.value.trim()))).instances); }), 220); });
+    show(h('div', { class: 'row' }, h('h1', null, 'Instances'), h('a', { class: 'btn small', href: '/instances/new', 'data-link': true }, 'Make an instance')),
+      h('p', { class: 'muted' }, 'Every instance is its own community, and they are all part of one Beta. Your account lives on the instance where you joined!'), h('div', { class: 'row2' }, find), grid);
+  }
+  function newInstancePage() {
+    setTitle('Make an instance');
+    side.replaceChildren();
+    const err = errBox();
+    const name = h('input', { id: 'in', maxlength: 40, placeholder: 'Garden Club', required: true });
+    const slug = h('input', { id: 'is', maxlength: 30, placeholder: 'garden', required: true, autocapitalize: 'off', spellcheck: 'false' });
+    const desc = h('input', { id: 'id', maxlength: 300, placeholder: 'What is it about?' });
+    const rules = h('textarea', { id: 'ir', rows: 4, maxlength: 1500, placeholder: 'Be kind. No spam. Keep it on topic.' });
+    const reg = h('select', { id: 'ig' }, [['open', 'Open: anyone can join'], ['invite', 'Invite only: people need a code'], ['closed', 'Closed: nobody new for now']].map(([v, l]) => h('option', { value: v }, l)));
+    const user = h('input', { id: 'iu', maxlength: 20, autocomplete: 'username', required: true });
+    const pw = h('input', { id: 'ip', type: 'password', autocomplete: 'new-password', required: true });
+    let touched = false;
+    slug.addEventListener('input', () => { touched = true; });
+    name.addEventListener('input', () => { if (!touched) slug.value = name.value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30); });
+    const host = location.hostname.replace(/^[^.]+\.(?=.*beta\.)/, '');
+    const done = h('div');
+    const form = h('form', { class: 'card formcard wide', onsubmit: guard(err, async () => {
+      const r = await api('/instances', { method: 'POST', body: { name: name.value, slug: slug.value, description: desc.value, rules: rules.value, reg: reg.value, username: user.value, password: pw.value } });
+      form.hidden = true;
+      put(done, h('div', { class: 'card formcard wide' }, h('h1', null, 'Your instance is live!'), h('p', null, h('b', null, r.url.replace(/^https?:\/\//, ''))),
+        h('p', { class: 'muted' }, 'You are its admin as @' + r.username + '. Log in there with the password you just chose!'), h('p', null, h('a', { class: 'btn', href: r.url + '/login' }, 'Go to your instance'))));
+    }) },
+      h('h1', null, 'Make an instance'),
+      h('p', { class: 'muted' }, 'An instance is your own community inside Beta. You pick the name, the rules and who may join, and you are its admin!'),
+      h('label', { for: 'in' }, 'Name'), name,
+      h('label', { for: 'is' }, 'Address'), h('div', { class: 'slugrow' }, slug, h('span', { class: 'muted' }, '.' + host.replace(/^beta\./, 'beta.'))),
+      h('label', { for: 'id' }, 'Description'), desc,
+      h('label', { for: 'ir' }, 'House rules'), rules,
+      h('label', { for: 'ig' }, 'Sign-up'), reg,
+      h('h2', null, 'Your admin account'), h('p', { class: 'muted small' }, 'Accounts live on one instance, so this one is made on your new instance. Usernames are unique across all of Beta!'),
+      h('label', { for: 'iu' }, 'Username'), user, h('label', { for: 'ip' }, 'Password (8 or more characters)'), pw,
+      err, h('p', null, h('button', { class: 'btn', type: 'submit' }, 'Create the instance')));
+    show(form, done);
+  }
+  async function instanceSettingsPage() {
+    if (!me) return go('/login', true);
+    const r = await api('/instance');
+    inst = r.instance; instInfo = r;
+    if (!r.canManage) return show(h('div', { class: 'card empty' }, h('h2', null, 'Only the instance admin can do that'), link('/', 'Back home')));
+    setTitle('Instance settings');
+    side.replaceChildren();
+    const i = r.instance;
+    const err = errBox();
+    const name = h('input', { id: 'sn', maxlength: 40, value: i.name });
+    const desc = h('input', { id: 'sd', maxlength: 300, value: i.description });
+    const rules = h('textarea', { id: 'sr', rows: 5, maxlength: 1500, value: i.rules });
+    const reg = h('select', { id: 'sg', disabled: i.isMain }, [['open', 'Open: anyone can join'], ['invite', 'Invite only: people need a code'], ['closed', 'Closed: nobody new for now']].map(([v, l]) => h('option', { value: v, selected: i.reg === v }, l)));
+    const listed = h('input', { type: 'checkbox', id: 'sl', checked: i.listed, disabled: i.isMain });
+    const code = h('div', { class: 'codebox' });
+    const drawCode = (c) => put(code, c ? h('p', null, 'Invite code: ', h('code', null, c), ' ', h('button', { class: 'btn ghost small', type: 'button', onclick: async () => { try { await navigator.clipboard.writeText(i.url + '/register?invite=' + c); toast('Invite link copied!'); } catch (e) { prompt('Copy this invite link:', i.url + '/register?invite=' + c); } } }, 'Copy invite link'), ' ',
+      h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { const x = await api('/instance', { method: 'PATCH', body: { regen_invite: true } }); drawCode(x.inviteCode); toast('New code!'); }) }, 'Make a new code')) : null);
+    drawCode(i.reg === 'invite' ? i.inviteCode : '');
+    show(h('form', { class: 'card formcard wide', onsubmit: guard(err, async () => {
+      const x = await api('/instance', { method: 'PATCH', body: { name: name.value, description: desc.value, rules: rules.value, ...(i.isMain ? {} : { reg: reg.value, listed: listed.checked }) } });
+      drawCode(!i.isMain && reg.value === 'invite' ? x.inviteCode : '');
+      inst = { ...inst, name: name.value, description: desc.value, rules: rules.value, reg: i.isMain ? inst.reg : reg.value };
+      drawBrand(); toast('Saved!');
+    }) },
+      h('h1', null, 'Instance settings'), h('p', { class: 'muted' }, h('b', null, i.url.replace(/^https?:\/\//, '')), ' · ' + i.members + ' members · ' + i.posts + ' posts'),
+      h('label', { for: 'sn' }, 'Name'), name, h('label', { for: 'sd' }, 'Description'), desc, h('label', { for: 'sr' }, 'House rules'), rules,
+      h('label', { for: 'sg' }, 'Sign-up'), reg, i.isMain ? h('p', { class: 'muted small' }, 'The main instance follows the site-wide sign-up switches in Admin.') : null, code,
+      i.isMain ? null : h('label', { class: 'checkrow', for: 'sl' }, listed, h('span', null, h('b', null, 'Show in the instance directory'), h('div', { class: 'muted small' }, 'Turn off to keep it unlisted. People with the address can still join.'))),
+      err, h('p', null, h('button', { class: 'btn', type: 'submit' }, 'Save'))));
+  }
+  function instCard() {
+    const i = instInfo ? instInfo.instance : inst;
+    return h('div', { class: 'card side icardside' }, h('h2', null, i.isMain ? 'Beta' : i.name), i.description ? h('p', { class: 'muted small' }, i.description) : null,
+      i.members !== undefined ? h('p', { class: 'muted small' }, i.members + (i.members === 1 ? ' member' : ' members') + ' · ' + REG_WORDS[i.reg]) : null,
+      i.rules ? h('details', { class: 'irules small' }, h('summary', null, 'House rules'), h('div', { class: 'vbody' }, i.rules)) : null,
+      h('p', { class: 'small' }, link('/instances', 'All instances'), instInfo && instInfo.canManage ? [' · ', link('/instance/settings', 'Manage')] : null));
   }
 
   async function topicPage(name) {
@@ -927,7 +1070,7 @@
     const path = '/u/' + enc(user.username);
     const f = feed('/feed', { user: user.username, tab }, { empty: { posts: 'No posts yet!', replies: 'No replies yet!', media: 'No pictures or files yet!', likes: 'No likes yet!' }[tab], pinnedId: user.pinned ? user.pinned.id : null });
     show(h('div', { class: 'card profile' },
-      h('div', { class: 'top2' }, avatar(user, true), h('div', { class: 'who2' }, h('h1', null, nameOf(user), badgeEl(user)), h('div', { class: 'muted' }, '@' + user.username, user.followsYou ? h('span', { class: 'chip small' }, 'Follows you') : null, user.muted ? h('span', { class: 'chip small' }, 'Muted') : null, user.blocked ? h('span', { class: 'chip small' }, 'Blocked') : null)),
+      h('div', { class: 'top2' }, avatar(user, true), h('div', { class: 'who2' }, h('h1', null, nameOf(user), badgeEl(user)), h('div', { class: 'muted' }, '@' + user.username, user.inst_slug && user.inst_slug !== inst.slug ? h('span', { class: 'itag', title: 'From the ' + user.inst_slug + ' instance' }, user.inst_slug) : null, user.followsYou ? h('span', { class: 'chip small' }, 'Follows you') : null, user.muted ? h('span', { class: 'chip small' }, 'Muted') : null, user.blocked ? h('span', { class: 'chip small' }, 'Blocked') : null)),
         h('div', { class: 'pbtns' }, mineU ? h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Edit profile') : fbtn, mineU ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => changePicture(() => render()) }, 'Change picture') : null, me && !mineU ? h('a', { class: 'btn ghost small', href: '/messages/' + enc(user.username), 'data-link': true, title: 'Send a message' }, icon('mail')) : null, me && !mineU ? h('button', { class: 'btn ghost small', type: 'button', title: 'Add to a list', onclick: safe(() => listPicker(user.username)) }, icon('list')) : null, h('a', { class: 'btn ghost small', href: '/rss/user/' + enc(user.username), title: 'RSS feed' }, icon('rss')))),
       user.bio ? h('p', null, rich(user.bio)) : null,
       user.fields && user.fields.length ? h('dl', { class: 'pfields' }, user.fields.map((f) => [h('dt', null, f.label), h('dd', null, /^https?:\/\/[^\s<>"']{3,100}$/i.test(f.value) ? h('a', { href: f.value, rel: 'noopener noreferrer nofollow ugc', target: '_blank' }, f.value.replace(/^https?:\/\//, '')) : f.value)])) : null,
@@ -1033,19 +1176,23 @@
     const pw = h('input', { id: 'p', type: 'password', autocomplete: mode === 'login' ? 'current-password' : 'new-password', required: true });
     const inv = h('input', { id: 'inv', maxlength: 20, value: params().get('invite') || '', autocomplete: 'off' });
     const invRow = h('div', { hidden: true }, h('label', { for: 'inv' }, 'Invite code'), inv);
-    if (mode === 'register') api('/announcements').then((r) => { if (r.inviteOnly) invRow.hidden = false; }).catch(() => {});
+    if (mode === 'register') { if (!inst.isMain && inst.reg === 'invite') invRow.hidden = false; else if (inst.isMain) api('/announcements').then((r) => { if (r.inviteOnly) invRow.hidden = false; }).catch(() => {}); }
     show(h('form', { class: 'card formcard', onsubmit: guard(err, async () => {
       const r = await api('/' + mode, { method: 'POST', body: { username: user.value, password: pw.value, invite: inv.value } });
       me = r.user;
+      try { instInfo = await api('/instance'); } catch (e) {}
       drawNav();
       go('/', true);
       toast(mode === 'login' ? 'Welcome back!' : 'Welcome to Beta!');
     }) },
-      h('h1', null, mode === 'login' ? 'Log in' : 'Join Beta'),
+      h('h1', null, mode === 'login' ? 'Log in' : 'Join ' + (inst.isMain ? 'Beta' : inst.name)),
+      mode === 'register' && !inst.isMain && inst.rules ? h('details', { class: 'irules' }, h('summary', null, 'House rules'), h('div', { class: 'vbody' }, inst.rules)) : null,
+      mode === 'register' && !inst.isMain && inst.reg === 'closed' ? h('p', { class: 'cwbox' }, 'This instance is not accepting new members right now. ', link('/instances', 'Pick another instance')) : null,
       h('label', { for: 'u' }, 'Username'), user,
       h('label', { for: 'p' }, mode === 'login' ? 'Password' : 'Password (8 or more characters)'), pw,
       mode === 'register' ? invRow : null,
       err, h('p', null, h('button', { class: 'btn', type: 'submit' }, mode === 'login' ? 'Log in' : 'Sign up')),
+      mode === 'login' ? h('p', { class: 'muted small' }, 'Accounts belong to the instance where they were made. Not sure where yours lives? ', link('/instances', 'Browse instances')) : null,
       h('p', { class: 'muted small' }, mode === 'login' ? 'New here? ' : 'Already a member? ', link(mode === 'login' ? '/register' : '/login', mode === 'login' ? 'Join Beta' : 'Log in'))));
     user.focus();
   }
@@ -1182,22 +1329,25 @@
     setTitle('Explore');
     drawSide();
     const tab = ['trending', 'media', 'topics', 'people'].includes(params().get('tab')) ? params().get('tab') : 'top';
+    const wide = params().get('where') === 'all';
+    const lq = wide ? '' : '?local=1';
     const tabs = h('div', { class: 'tabs' }, [['top', 'Top posts'], ['trending', 'Trending'], ['media', 'Pictures'], ['topics', 'Topics'], ['people', 'People']].map(([k, l]) => h('a', { href: '/explore' + (k === 'top' ? '' : '?tab=' + k), 'data-link': true, class: tab === k ? 'on' : '' }, l)));
+    tabs.append(h('span', { class: 'scopesw small' }, h('a', { href: '/explore' + (tab === 'top' ? '' : '?tab=' + tab), 'data-link': true, class: wide ? '' : 'on' }, 'This instance'), ' · ', h('a', { href: '/explore?' + (tab === 'top' ? '' : 'tab=' + tab + '&') + 'where=all', 'data-link': true, class: wide ? 'on' : '' }, 'All instances')));
     if (tab === 'trending') {
-      const t = await api('/trending');
+      const t = await api('/trending' + lq);
       return show(h('h1', null, 'Explore'), tabs, h('div', { class: 'card side' }, h('h2', null, 'Trending Topics, last 24 hours'),
         t.topics.length ? h('ol', { class: 'trend' }, t.topics.map((x, i) => h('li', null, h('span', { class: 'rank' }, i + 1), h('a', { href: '/topic/' + enc(x.topic), 'data-link': true }, '#' + x.topic), h('span', { class: 'muted small' }, x.people + (x.people === 1 ? ' person' : ' people') + ', ' + x.n + (x.n === 1 ? ' post' : ' posts'))))) : h('div', { class: 'empty' }, 'Nothing is trending yet. Start a Topic!')),
         h('h2', { class: 'gap' }, 'Hot right now'), h('div', { class: 'card feed' }, t.posts.length ? t.posts.map((p) => postCard(p)) : h('div', { class: 'empty' }, 'No hot posts yet!')));
     }
     if (tab === 'topics') {
-      const t = await api('/topics');
+      const t = await api('/topics' + lq);
       return show(h('h1', null, 'Explore'), tabs, h('div', { class: 'card side' }, t.topics.length ? h('div', null, t.topics.map((x) => h('a', { class: 'chip', href: '/topic/' + enc(x.topic), 'data-link': true }, '#' + x.topic + ' · ' + x.n))) : h('p', { class: 'muted' }, 'No Topics yet!')));
     }
     if (tab === 'people') {
-      const s2 = await api('/suggest');
+      const s2 = await api('/suggest' + lq);
       return show(h('h1', null, 'Explore'), tabs, h('div', { class: 'card' }, s2.users.length ? h('ul', { class: 'ulist big' }, s2.users.map((u) => userRow({ ...u, isFollowing: false }))) : h('div', { class: 'empty' }, 'No one new to follow right now!')));
     }
-    const f = feed('/feed', tab === 'media' ? { scope: 'explore', media: '1' } : { scope: 'explore' }, { empty: 'Nothing is popular yet. Post something!' });
+    const f = feed('/feed', tab === 'media' ? { scope: 'explore', media: '1', ...(wide ? {} : { local: '1' }) } : { scope: 'explore', ...(wide ? {} : { local: '1' }) }, { empty: 'Nothing is popular yet. Post something!' });
     show(h('h1', null, 'Explore'), h('p', { class: 'muted' }, tab === 'media' ? 'The most popular posts with pictures or files this week.' : 'The most popular posts this week.'), tabs, f);
     await f.ready;
   }
@@ -1297,13 +1447,13 @@
     if (!me || !(me.admin || me.mod)) return show(h('div', { class: 'card empty' }, h('h2', null, 'Admins only'), link('/', 'Back to Beta')));
     setTitle(me.admin ? 'Admin' : 'Moderation');
     side.replaceChildren();
-    const ALL = [['overview', 'Overview'], ['reports', 'Reports'], ['people', 'People'], ['content', 'Content'], ['outlets', 'Outlets'], ['files', 'Files'], ['invites', 'Invites'], ['site', 'Site'], ['audit', 'Activity log']];
+    const ALL = [['overview', 'Overview'], ['reports', 'Reports'], ['people', 'People'], ['content', 'Content'], ['outlets', 'Outlets'], ['files', 'Files'], ['invites', 'Invites'], ['instances', 'Instances'], ['site', 'Site'], ['audit', 'Activity log']];
     const TABS = me.admin ? ALL : ALL.filter((t) => ['overview', 'reports', 'people', 'content', 'audit'].includes(t[0]));
     const tab = TABS.some((t) => t[0] === params().get('tab')) ? params().get('tab') : 'overview';
     const tabs = h('div', { class: 'tabs' }, TABS.map(([k, l]) => h('a', { href: '/admin' + (k === 'overview' ? '' : '?tab=' + k), 'data-link': true, class: tab === k ? 'on' : '' }, l)));
     const dismissAll = h('div', { class: 'row2' }, h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { if (!confirm('Dismiss every report?')) return; await api('/admin/reports/dismiss-all', { method: 'POST' }); render(); }) }, 'Dismiss all reports'));
     const body = tab === 'reports' ? [dismissAll, ...(await adminReports())] : tab === 'people' ? [adminPeople()] : tab === 'content' ? [adminContent()] : tab === 'outlets' ? [await adminOutlets()] : tab === 'files' ? [await adminFiles()]
-      : tab === 'invites' ? [await adminInvites()] : tab === 'site' ? [await adminSite()] : tab === 'audit' ? [await adminAudit()] : [await adminOverview()];
+      : tab === 'invites' ? [await adminInvites()] : tab === 'instances' ? [await adminInstances()] : tab === 'site' ? [await adminSite()] : tab === 'audit' ? [await adminAudit()] : [await adminOverview()];
     show(h('h1', null, me.admin ? 'Admin' : 'Moderation'), tabs, ...body);
   }
   async function adminOverview() {
@@ -1424,6 +1574,18 @@
     const draw = (items) => put(list, items.length ? items.map((o) => h('div', { class: 'urow pad16' }, h('div', { class: 'ut' }, link('/o/' + enc(o.slug), o.name), h('div', { class: 'muted small' }, o.members + ' members · ' + o.posts + ' posts · owner ' + (o.owner ? '@' + o.owner : 'none') + ' · made ' + ago(o.created))),
       h('button', { class: 'btn danger small', type: 'button', onclick: safe(async () => { if (!confirm('Remove the Outlet “' + o.name + '” and all its posts?')) return; await api('/admin/outlets/' + enc(o.slug) + '/remove', { method: 'POST' }); items = items.filter((x) => x !== o); draw(items); toast('Removed!'); }) }, 'Remove'))) : h('div', { class: 'empty' }, 'No Outlets yet!'));
     let items = r.outlets;
+    draw(items);
+    return list;
+  }
+  async function adminInstances() {
+    const r = await api('/admin/instances');
+    const list = h('div', { class: 'card' });
+    const draw = (items) => put(list, items.map((i) => h('div', { class: 'urow pad16' }, h('div', { class: 'ut' }, h('a', { href: i.url, target: '_blank', rel: 'noopener' }, i.name), ' ', h('code', null, i.slug), i.isMain ? h('span', { class: 'chip small' }, 'Main') : null, i.listed ? null : h('span', { class: 'chip small bad' }, 'Unlisted'),
+      h('div', { class: 'muted small' }, i.members + ' members · ' + i.posts + ' posts · ' + REG_WORDS[i.reg] + (i.owner ? ' · admin @' + i.owner : '') + ' · made ' + ago(i.created))),
+      i.isMain ? null : h('details', { class: 'menu' }, h('summary', { class: 'btn ghost small' }, 'Actions'), h('div', { class: 'pop right' },
+        h('button', { type: 'button', onclick: safe(async (e) => { e.currentTarget.closest('details').removeAttribute('open'); await api('/admin/instances/' + enc(i.slug) + '/listed', { method: 'POST', body: { listed: !i.listed } }); i.listed = !i.listed; draw(items); toast('Done!'); }) }, i.listed ? 'Hide from the directory' : 'Show in the directory'),
+        h('button', { type: 'button', class: 'danger', onclick: safe(async (e) => { e.currentTarget.closest('details').removeAttribute('open'); if (prompt('Type ' + i.slug + ' to delete this instance, its people and all their posts for good:') !== i.slug) return toast('Cancelled!'); await api('/admin/instances/' + enc(i.slug), { method: 'DELETE' }); items = items.filter((x) => x !== i); draw(items); toast('Deleted!'); }) }, 'Delete the instance'))))));
+    let items = r.instances;
     draw(items);
     return list;
   }
@@ -1608,7 +1770,8 @@
     const seg = location.pathname.split('/').filter(Boolean).map(decodeURIComponent);
     try {
       const [a, b, c, d] = seg;
-      if (!seg.length) await home();
+      if (noInstance) show(noInstancePage());
+      else if (!seg.length) await home();
       else if (a === 'login' && !b) authPage('login');
       else if (a === 'register' && !b) authPage('register');
       else if (a === 'settings' && !b) await settingsPage();
@@ -1616,6 +1779,9 @@
       else if (a === 'notifications' && !b) await notificationsPage();
       else if (a === 'bookmarks' && !b) await bookmarksPage();
       else if (a === 'explore' && !b) await explorePage();
+      else if (a === 'instances' && !b) await instancesPage();
+      else if (a === 'instances' && b === 'new') newInstancePage();
+      else if (a === 'instance' && b === 'settings') await instanceSettingsPage();
       else if (a === 'scheduled' && !b) await scheduledPage();
       else if (a === 'stats' && !b) await statsPage();
       else if (a === 'outlets' && !b) await outletsPage();
@@ -1651,7 +1817,8 @@
   });
 
   applyPrefs();
-  api('/me').then((r) => { me = r.user; }).catch(() => {}).then(() => {
+  api('/instance').then((r) => { inst = r.instance; instInfo = r; }).catch((e) => { if (e.status === 404) noInstance = true; }).then(() => api('/me')).then((r) => { me = r.user; }).catch(() => {}).then(() => {
+    drawBrand();
     drawNav();
     render();
     showAnnouncements();

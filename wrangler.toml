@@ -3,11 +3,17 @@ main = "src/worker.js"
 compatibility_date = "2026-11-01"
 
 # The address the app lives at (the radii-office.com site must be in the same Cloudflare account)
-routes = [{ pattern = "beta.radii-office.com", custom_domain = true }]
+# beta.radii-office.com is the main instance; every other instance lives at its own name.beta.radii-office.com
+# (needs a proxied wildcard DNS record "*.beta" and a certificate that covers *.beta.radii-office.com, see the README)
+routes = [
+  { pattern = "beta.radii-office.com", custom_domain = true },
+  { pattern = "*.beta.radii-office.com/*", zone_name = "radii-office.com" },
+]
 
 # People who can use the /admin page (reports and suspensions). Put usernames here, separated by commas.
 [vars]
 ADMINS = "patientduck394"
+BASE_DOMAIN = "beta.radii-office.com"
 
 [assets]
 directory = "./public"
