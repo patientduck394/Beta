@@ -9,7 +9,7 @@
     loading = new Promise((ok, no) => {
       window.__KeydownNoAuto = true; // we draw things ourselves; do not let it scan the whole page
       const s = document.createElement('script');
-      s.src = '/Keydown.js?v=5';
+      s.src = '/Keydown.js?v=6';
       s.onload = () => (window.Keydown ? ok(window.Keydown) : no(new Error('Keydown did not start!')));
       s.onerror = () => {
         loading = null;
