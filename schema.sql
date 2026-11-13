@@ -89,3 +89,14 @@ CREATE INDEX IF NOT EXISTS list_members_user ON list_members(user_id);
 CREATE TABLE IF NOT EXISTS post_cw (post_id INTEGER PRIMARY KEY, text TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS bans (user_id INTEGER PRIMARY KEY, reason TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS avatars (user_id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL);
+
+
+-- ---- added in version 4 (Outlets) ----
+CREATE TABLE IF NOT EXISTS outlets (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', owner_id INTEGER NOT NULL, created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS outlet_members (outlet_id INTEGER NOT NULL, user_id INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'member', joined INTEGER NOT NULL, PRIMARY KEY (outlet_id, user_id));
+CREATE INDEX IF NOT EXISTS outlet_members_user ON outlet_members(user_id);
+CREATE TABLE IF NOT EXISTS subjects (id INTEGER PRIMARY KEY AUTOINCREMENT, outlet_id INTEGER NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL, UNIQUE (outlet_id, slug));
+CREATE TABLE IF NOT EXISTS outlet_posts (post_id INTEGER PRIMARY KEY, outlet_id INTEGER NOT NULL, subject_id INTEGER, pinned INTEGER NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS outlet_posts_outlet ON outlet_posts(outlet_id, post_id);
+CREATE INDEX IF NOT EXISTS outlet_posts_subject ON outlet_posts(subject_id, post_id);
+CREATE TABLE IF NOT EXISTS outlet_bans (outlet_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY (outlet_id, user_id));

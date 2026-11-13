@@ -171,12 +171,13 @@
           h('button', { type: 'button', onclick: () => shortcuts() }, 'Keyboard shortcuts'),
           h('button', { type: 'button', onclick: safe(async () => { await api('/logout', { method: 'POST' }); me = null; drawNav(); go('/'); }) }, 'Log out')));
       nav.append(
+        h('a', { class: 'navbtn', href: '/outlets', 'data-link': true, title: 'Outlets (g then o)', 'aria-label': 'Outlets' }, icon('forum')),
         h('a', { class: 'navbtn', href: '/explore', 'data-link': true, title: 'Explore (g then e)', 'aria-label': 'Explore' }, icon('explore')),
         h('a', { class: 'navbtn', href: '/messages', 'data-link': true, title: 'Messages (g then m)', 'aria-label': 'Messages' }, icon('mail'), badge(me.dmUnread)),
         h('a', { class: 'navbtn', href: '/notifications', 'data-link': true, title: 'Notifications (g then n)', 'aria-label': 'Notifications' }, icon('bell'), badge(me.unread)),
         h('a', { class: 'navuser', href: '/u/' + enc(me.username), 'data-link': true, title: 'Your profile' }, avatar(me), h('span', { class: 'navname' }, nameOf(me))),
         menu);
-    } else nav.append(h('a', { class: 'navbtn', href: '/explore', 'data-link': true, title: 'Explore', 'aria-label': 'Explore' }, icon('explore')), h('a', { class: 'btn ghost small', href: '/login', 'data-link': true }, 'Log in'), h('a', { class: 'btn small', href: '/register', 'data-link': true }, 'Sign up'));
+    } else nav.append(h('a', { class: 'navbtn', href: '/outlets', 'data-link': true, title: 'Outlets', 'aria-label': 'Outlets' }, icon('forum')), h('a', { class: 'navbtn', href: '/explore', 'data-link': true, title: 'Explore', 'aria-label': 'Explore' }, icon('explore')), h('a', { class: 'btn ghost small', href: '/login', 'data-link': true }, 'Log in'), h('a', { class: 'btn small', href: '/register', 'data-link': true }, 'Sign up'));
   }
   async function refreshUnread() {
     if (!me) return;
@@ -211,8 +212,15 @@
 
   async function drawSide() {
     try {
-      const [t, s] = await Promise.all([api('/topics'), api('/suggest')]);
+      const [t, s, ol] = await Promise.all([api('/topics'), api('/suggest'), me ? api('/outlets/mine') : api('/outlets?limit=5')]);
+      const outletsCard = me
+        ? h('nav', { class: 'card side osb', 'aria-label': 'Your Outlets' }, h('h2', null, link('/outlets', 'Outlets')),
+            ol.outlets.length ? ol.outlets.map((o) => h('details', { class: 'osub' }, h('summary', null, outletBadge(o), h('span', { class: 'oname2' }, o.name)),
+              h('ul', null, h('li', null, link(outletPath(o.slug), 'All of ' + o.name)), o.subjects.map((sj) => h('li', null, link(outletPath(o.slug, sj.slug), '# ' + sj.name)))))) : h('p', { class: 'muted small' }, 'You have not joined any Outlets yet.'),
+            h('p', { class: 'small' }, link('/outlets', 'Browse every Outlet'), ' · ', link('/outlets/new', 'Make one')))
+        : h('nav', { class: 'card side osb', 'aria-label': 'Popular Outlets' }, h('h2', null, link('/outlets', 'Outlets')), ol.outlets.length ? h('ul', { class: 'olist' }, ol.outlets.map((o) => h('li', null, outletBadge(o), link(outletPath(o.slug), o.name), h('span', { class: 'muted small' }, o.members + ' members')))) : h('p', { class: 'muted small' }, 'No Outlets yet.'));
       put(side,
+        outletsCard,
         h('div', { class: 'card side' }, h('h2', null, 'Trending Topics'),
           t.topics.length ? h('ol', null, t.topics.map((x) => h('li', null, link('/topic/' + enc(x.topic), h('span', { class: 'tn' }, '#' + x.topic)), h('span', { class: 'muted small' }, x.n + (x.n === 1 ? ' post' : ' posts')))))
             : h('p', { class: 'muted' }, 'No Topics yet. Add a #hashtag to a post to start one!')),
@@ -293,6 +301,7 @@
   function build(p, opts, redraw, wrap) {
     const rp = p.kind === 'repost' ? p : null;
     const x = rp ? rp.target : p;
+    const ol = x.outlet;
     const mineP = me && me.username.toLowerCase() === x.username.toLowerCase();
     const canEdit = mineP && !rp && Date.now() - x.created < 15 * 60 * 1000;
     const gone = () => { wrap.remove(); if (opts.onDelete) opts.onDelete(wrap); };
@@ -353,16 +362,29 @@
     }
     if (x.likes) items.unshift(h('button', { type: 'button', onclick: act(async () => { const r = await api('/posts/' + x.id + '/likes'); peopleDialog('Liked by', r.users); }) }, 'See who liked'));
     if (me && !mineP) items.push(h('button', { type: 'button', onclick: act(async () => { listPicker(x.username); }) }, 'Add @' + x.username + ' to a list'));
+    // Outlet moderators
+    const modSlug = ol && ol.canMod ? ol.slug : opts.modOutlet;
+    if (modSlug) {
+      const base = '/outlets/' + enc(modSlug) + '/posts/' + x.id;
+      if (ol && !x.parent_id) {
+        items.push(h('button', { type: 'button', onclick: act(async () => { const r = await api(base + (ol.pinned ? '/unpin' : '/pin'), { method: 'POST' }); ol.pinned = r.pinned; redraw(); toast(r.pinned ? 'Pinned in the Outlet!' : 'Unpinned!'); }) }, ol.pinned ? 'Unpin from the Outlet' : 'Pin to the Outlet'));
+        items.push(h('button', { type: 'button', onclick: act(async () => { const r = await api(base + (ol.locked ? '/unlock' : '/lock'), { method: 'POST' }); ol.locked = r.locked; redraw(); toast(r.locked ? 'Locked: only moderators can reply!' : 'Unlocked!'); }) }, ol.locked ? 'Unlock replies' : 'Lock replies'));
+        items.push(h('button', { type: 'button', onclick: act(async () => { await moveDialog(modSlug, x, () => render()); }) }, 'Move to a Subject'));
+      }
+      if (!mineP) items.push(h('button', { type: 'button', class: 'danger', onclick: act(async () => { if (!confirm('Remove this ' + (x.parent_id ? 'reply' : 'post and its replies') + ' as a moderator?')) return; await api(base, { method: 'DELETE' }); toast('Removed!'); gone(); }) }, 'Remove (moderator)'));
+    }
     const moreMenu = h('details', { class: 'menu' }, h('summary', { class: 'act', 'aria-label': 'More' }, icon('more')), h('div', { class: 'pop right' }, items));
 
     const quoteEl = x.quote ? h('a', { class: 'quote', href: '/post/' + x.quote.id, 'data-link': true }, h('div', { class: 'ph' }, avatar(x.quote, false), h('span', { class: 'who' }, nameOf(x.quote)), h('span', { class: 'muted small' }, '@' + x.quote.username + ' · ' + ago(x.quote.created))), h('div', { class: 'qbody' }, x.quote.body.slice(0, 200)), x.quote.files && x.quote.files[0] && x.quote.files[0].image ? h('img', { class: 'qimg', src: '/api/files/' + x.quote.files[0].id, alt: x.quote.files[0].alt || '', loading: 'lazy' }) : null)
       : x.quoteGone ? h('div', { class: 'quote gone muted small' }, 'This post was deleted.') : null;
 
+    const outletChip = ol && !opts.hideOutlet ? h('a', { class: 'ochip c-' + ol.color, href: outletPath(ol.slug, ol.subject), 'data-link': true }, icon('forum'), ol.name + (ol.subject_name ? ' \u203A ' + ol.subject_name : '')) : null;
     const warn = hidden ? h('div', { class: 'cwbox' }, icon('warn'), h('b', null, x.cw), h('button', { class: 'btn ghost small', type: 'button', onclick: () => { (opts.revealed = opts.revealed || new Set()).add(x.id); redraw(); } }, 'Show')) : (x.cw ? h('div', { class: 'cwnote muted small' }, icon('warn'), x.cw) : null);
     const article = h('article', { class: 'post' + (opts.focus ? ' focus' : '') },
       avatar(x),
       h('div', { class: 'pb' },
-        h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), h('span', { class: 'muted small' }, '@' + x.username), h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, opts.pinned ? h('span', { class: 'pinned' }, icon('pin', 'solid'), 'Pinned') : null),
+        h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), h('span', { class: 'muted small' }, '@' + x.username), h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, opts.pinned || (ol && ol.pinned) ? h('span', { class: 'pinned' }, icon('pin', 'solid'), 'Pinned') : null, ol && ol.locked ? h('span', { class: 'pinned' }, icon('lock'), 'Locked') : null),
+        outletChip,
         warn,
         hidden ? null : bodyHolder,
         hidden ? null : (x.files.length ? filesView(x) : null),
@@ -395,6 +417,7 @@
     const count = h('span', { class: 'count' });
     const btn = h('button', { class: 'btn', type: 'submit' }, opts.button || 'Post');
     const err = errBox();
+    const subSel = opts.outlet ? h('select', { class: 'subsel', 'aria-label': 'Subject' }, h('option', { value: '' }, 'No Subject'), (opts.subjects || []).map((sj) => h('option', { value: sj.slug, selected: sj.slug === opts.subject }, sj.name))) : null;
     const files = [];
     const tray = h('div', { class: 'tray' });
     const preview = h('div', { class: 'preview', hidden: true });
@@ -524,7 +547,7 @@
     const form = h('form', { class: 'card compose', onsubmit: guard(err, async () => {
       btn.disabled = true;
       try {
-        const body = { body: area.value, parent: opts.parent, quote: opts.quote ? opts.quote.id : undefined, cw: cwOn ? cwIn.value : undefined, files: files.filter((f) => f.id).map((f) => ({ id: f.id, alt: f.alt || '' })) };
+        const body = { body: area.value, parent: opts.parent, quote: opts.quote ? opts.quote.id : undefined, outlet: opts.outlet, subject: subSel && subSel.value ? subSel.value : undefined, cw: cwOn ? cwIn.value : undefined, files: files.filter((f) => f.id).map((f) => ({ id: f.id, alt: f.alt || '' })) };
         if (pollOn) body.poll = { options: pollInputs.map((i) => i.value).filter((v) => v.trim()), hours: parseInt(dur.value, 10) };
         const r = await api('/posts', { method: 'POST', body });
         // the rest of a thread: each one replies to the first
@@ -541,6 +564,7 @@
         if (opts.onPosted) opts.onPosted(r.post);
       } finally { update(); }
     }) },
+      subSel ? h('label', { class: 'small muted subrow' }, icon('forum'), ' Post in ', subSel) : null,
       area, cwIn, tray, pollBox, extraBox, preview,
       opts.quote ? h('div', { class: 'quote small' }, h('b', null, nameOf(opts.quote)), ' ', '@' + opts.quote.username, h('div', { class: 'qbody' }, opts.quote.body.slice(0, 200))) : null,
       h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, opts.parent || opts.noPoll ? null : pollBtn, cwBtn, emojiMenu, opts.parent || opts.quote ? null : threadBtn, count), btn),
@@ -561,15 +585,168 @@
       if (cursor) qsx.set('before', cursor);
       const r = await api(path + '?' + qsx);
       list.querySelectorAll('.empty').forEach((e) => e.remove());
-      r.posts.forEach((p) => list.append(postCard(p, { pinned: opts.pinnedId === p.id, onDelete: empty, onUnsave: opts.onUnsave && empty })));
+      r.posts.forEach((p) => list.append(postCard(p, { pinned: opts.pinnedId === p.id, onDelete: empty, onUnsave: opts.onUnsave && empty, hideOutlet: opts.hideOutlet })));
       cursor = r.cursor;
       empty();
       if (r.more) more.append(h('button', { class: 'btn ghost', type: 'button', onclick: safe(load) }, 'Load more'));
       wrap.topId = wrap.topId || (r.posts[0] && r.posts[0].id);
     };
-    wrap.add = (p) => { list.querySelectorAll('.empty').forEach((e) => e.remove()); list.prepend(postCard(p, { onDelete: empty })); };
+    wrap.add = (p) => { list.querySelectorAll('.empty').forEach((e) => e.remove()); list.prepend(postCard(p, { onDelete: empty, hideOutlet: opts.hideOutlet })); };
     wrap.ready = load();
     return wrap;
+  }
+
+
+  // ---------- Outlets: forums with Subjects ----------
+  const outletBadge = (o) => h('span', { class: 'obadge c-' + (o.color || 'lime') }, (o.name || '?')[0].toUpperCase());
+  const outletPath = (slug, subject) => '/o/' + enc(slug) + (subject ? '/s/' + enc(subject) : '');
+  const joinBtn = (o, after) => {
+    const b = h('button', { class: 'btn small' });
+    const paint = () => { b.textContent = o.role === 'owner' ? 'You run this' : o.joined ? 'Joined' : 'Join'; b.className = 'btn small' + (o.joined ? ' on' : ''); b.disabled = o.role === 'owner' || !!o.banned; };
+    b.addEventListener('click', safe(async () => {
+      if (!me) return go('/login');
+      const r = await api('/outlets/' + enc(o.slug) + (o.joined ? '/leave' : '/join'), { method: 'POST' });
+      o.joined = r.joined;
+      if (o.members !== undefined) o.members += r.joined ? 1 : -1;
+      paint();
+      if (after) after();
+      drawSide();
+    }));
+    paint();
+    return b;
+  };
+
+  async function outletsPage() {
+    setTitle('Outlets');
+    drawSide();
+    const sort = params().get('sort') === 'new' ? 'new' : 'popular';
+    const qv = (params().get('q') || '').trim();
+    const r = await api('/outlets?sort=' + sort + (qv ? '&q=' + enc(qv) : ''));
+    const search = h('form', { class: 'row2', onsubmit: (e) => { e.preventDefault(); go('/outlets?sort=' + sort + (search.q.value.trim() ? '&q=' + enc(search.q.value.trim()) : '')); } },
+      h('input', { name: 'q', value: qv, placeholder: 'Find an Outlet...', 'aria-label': 'Find an Outlet', maxlength: 40 }), h('button', { class: 'btn small', type: 'submit' }, 'Search'));
+    show(h('div', { class: 'orow' }, h('h1', null, 'Outlets'), me ? h('a', { class: 'btn', href: '/outlets/new', 'data-link': true }, '+ Make an Outlet') : null),
+      h('p', { class: 'muted' }, 'Outlets are forums for one kind of talk. Each has Subjects inside it, so you can read only what you care about!'),
+      search,
+      h('div', { class: 'tabs' }, h('a', { href: '/outlets', 'data-link': true, class: sort === 'popular' ? 'on' : '' }, 'Popular'), h('a', { href: '/outlets?sort=new', 'data-link': true, class: sort === 'new' ? 'on' : '' }, 'New')),
+      r.outlets.length ? h('div', { class: 'ogrid' }, r.outlets.map((o) => {
+        const j = { ...o };
+        return h('div', { class: 'card ocard' }, h('div', { class: 'otop' }, outletBadge(o), h('div', { class: 'ot' }, h('a', { class: 'oname', href: outletPath(o.slug), 'data-link': true }, o.name), h('div', { class: 'muted small' }, o.members + (o.members === 1 ? ' member' : ' members') + ' · ' + o.posts + (o.posts === 1 ? ' post' : ' posts')))),
+          h('p', { class: 'muted odesc' }, o.description || 'No description yet.'), joinBtn(j));
+      })) : h('div', { class: 'card empty' }, qv ? 'No Outlet matched that!' : 'No Outlets yet. Make the first one!'));
+  }
+
+  function newOutletPage() {
+    if (!me) return go('/login', true);
+    setTitle('Make an Outlet');
+    side.replaceChildren();
+    const err = errBox();
+    const name = h('input', { id: 'on', maxlength: 40, required: true, autocomplete: 'off', placeholder: 'Garden Club' });
+    const slug = h('input', { id: 'os', maxlength: 30, autocomplete: 'off', placeholder: 'garden-club' });
+    const desc = h('input', { id: 'od', maxlength: 200, autocomplete: 'off', placeholder: 'What is this Outlet for?' });
+    const rules = h('textarea', { id: 'or', maxlength: 1500, placeholder: 'A few ground rules (optional)' });
+    let color = 'lime';
+    let slugTouched = false;
+    slug.addEventListener('input', () => (slugTouched = true));
+    name.addEventListener('input', () => { if (!slugTouched) slug.value = name.value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30); });
+    const sw = h('div', { class: 'swatches', role: 'radiogroup', 'aria-label': 'Color' });
+    const paintSw = () => put(sw, ['lime', 'mint', 'sky', 'sun', 'rose', 'violet', 'slate'].map((c) => h('button', { type: 'button', class: 'sw c-' + c + (color === c ? ' sel' : ''), role: 'radio', 'aria-checked': String(color === c), 'aria-label': c, onclick: () => { color = c; paintSw(); } })));
+    paintSw();
+    show(h('form', { class: 'card formcard wide', onsubmit: guard(err, async () => { const r = await api('/outlets', { method: 'POST', body: { name: name.value, slug: slug.value, description: desc.value, rules: rules.value, color } }); toast('Outlet made!'); drawSide(); go(outletPath(r.slug)); }) },
+      h('h1', null, 'Make an Outlet'),
+      h('p', { class: 'muted' }, 'It starts with one Subject called General. You can add more Subjects after!'),
+      h('label', { for: 'on' }, 'Name'), name, h('label', { for: 'os' }, 'Address (letters, numbers and dashes)'), slug, h('label', { for: 'od' }, 'Description'), desc, h('label', { for: 'or' }, 'Rules'), rules, h('label', null, 'Color'), sw, err,
+      h('p', null, h('button', { class: 'btn', type: 'submit' }, 'Make Outlet'))));
+    name.focus();
+  }
+
+  async function outletPage(slug, subSlug, sub2) {
+    const r = await api('/outlets/' + enc(slug));
+    const o = r.outlet;
+    setTitle(o.name);
+    drawSide();
+    if (subSlug === 'settings') return outletSettings(r);
+    const path = outletPath(o.slug);
+    const onAbout = subSlug === 'about';
+    const curSub = subSlug === 's' ? sub2 : null;
+    const subj = curSub ? r.subjects.find((s) => s.slug === curSub) : null;
+    if (curSub && curSub !== 'none' && !subj) throw Object.assign(new Error('We could not find that Subject!'), { status: 404 });
+    const info = { slug: o.slug, joined: o.joined, role: o.role, members: o.members, banned: o.banned };
+    const memberCount = h('span');
+    const refreshCount = () => (memberCount.textContent = info.members + (info.members === 1 ? ' member' : ' members'));
+    refreshCount();
+    const head = h('div', { class: 'card ohead' }, h('div', { class: 'oband c-' + o.color }),
+      h('div', { class: 'otop pad16' }, outletBadge(o), h('div', { class: 'ot' }, h('h1', null, o.name), h('div', { class: 'muted small' }, memberCount, ' · ' + o.posts + (o.posts === 1 ? ' post' : ' posts') + ' · ' + r.subjects.length + (r.subjects.length === 1 ? ' Subject' : ' Subjects'))),
+        h('div', { class: 'pbtns' }, joinBtn(info, refreshCount), isModRole(o.role) ? h('a', { class: 'btn ghost small', href: path + '/settings', 'data-link': true }, icon('gear'), o.role === 'owner' ? 'Manage' : 'Moderate') : null)),
+      o.description ? h('p', { class: 'pad16nb' }, o.description) : null,
+      o.banned ? h('p', { class: 'err pad16nb' }, 'You have been banned from this Outlet.') : null);
+    const subjectChips = h('div', { class: 'subs', role: 'navigation', 'aria-label': 'Subjects' },
+      h('a', { class: 'chip' + (!curSub && !onAbout ? ' on' : ''), href: path, 'data-link': true }, 'All'),
+      r.subjects.map((s) => h('a', { class: 'chip' + (curSub === s.slug ? ' on' : ''), href: outletPath(o.slug, s.slug), 'data-link': true, title: s.description || '' }, s.name, h('span', { class: 'cnt' }, s.posts))),
+      o.uncategorized ? h('a', { class: 'chip' + (curSub === 'none' ? ' on' : ''), href: outletPath(o.slug, 'none'), 'data-link': true }, 'No Subject', h('span', { class: 'cnt' }, o.uncategorized)) : null);
+    const tabs = h('div', { class: 'tabs' }, h('a', { href: path, 'data-link': true, class: !onAbout ? 'on' : '' }, 'Posts'), h('a', { href: path + '/about', 'data-link': true, class: onAbout ? 'on' : '' }, 'About & rules'));
+    if (onAbout) {
+      const mem = await api('/outlets/' + enc(o.slug) + '/members');
+      return show(head, tabs, h('div', { class: 'card pad16' }, h('h2', null, 'Rules'), o.rules ? h('div', { class: 'body' }, ...rich(o.rules)) : h('p', { class: 'muted' }, 'No rules written yet.'), h('h2', { class: 'gap' }, 'Moderators'),
+        h('ul', { class: 'ulist' }, r.mods.map((m) => h('li', { class: 'urow' }, h('div', { class: 'ut' }, link('/u/' + enc(m.username), h('b', null, m.username)), ' ', h('span', { class: 'chip small' }, m.role === 'owner' ? 'Owner' : 'Moderator'))))),
+        h('h2', { class: 'gap' }, 'Members (' + mem.users.length + ')'), h('ul', { class: 'ulist' }, mem.users.map((u) => userRow({ ...u, isFollowing: undefined }))), h('p', { class: 'muted small' }, 'Started ' + new Date(o.created).toLocaleDateString())));
+    }
+    const f = feed('/feed', curSub ? { outlet: o.slug, subject: curSub } : { outlet: o.slug }, { hideOutlet: true, empty: curSub ? 'Nothing in this Subject yet. Start the talk!' : 'Nothing here yet. Start the talk!' });
+    const pinnedBox = !curSub && r.pinned.length ? h('div', { class: 'card feed pinnedbox' }, r.pinned.map((p) => postCard(p, { hideOutlet: true, onDelete: () => render() }))) : null;
+    const canPost = me && !o.banned;
+    show(head, subjectChips, tabs,
+      canPost ? composer({ outlet: o.slug, subjects: r.subjects, subject: curSub && curSub !== 'none' ? curSub : '', draftKey: 'outlet-' + o.slug, placeholder: 'Start a conversation in ' + o.name + '...', onPosted: (p) => { f.add(p); toast('Posted!'); } }) : (!me ? h('p', { class: 'muted' }, link('/login', 'Log in'), ' to post here.') : null),
+      pinnedBox, f);
+    await f.ready;
+  }
+  const isModRole = (role) => role === 'owner' || role === 'mod';
+
+  async function outletSettings(r) {
+    const o = r.outlet;
+    if (!isModRole(o.role)) return show(h('div', { class: 'card empty' }, h('h2', null, 'Moderators only'), link(outletPath(o.slug), 'Back to the Outlet')));
+    setTitle('Manage ' + o.name);
+    const owner = o.role === 'owner';
+    const base = '/outlets/' + enc(o.slug);
+    const err = errBox(), err2 = errBox(), err3 = errBox();
+    const name = h('input', { id: 'sn', value: o.name, maxlength: 40 });
+    const desc = h('input', { id: 'sd', value: o.description, maxlength: 200 });
+    const rules = h('textarea', { id: 'sr', maxlength: 1500, value: o.rules });
+    let color = o.color;
+    const sw = h('div', { class: 'swatches' });
+    const paintSw = () => put(sw, ['lime', 'mint', 'sky', 'sun', 'rose', 'violet', 'slate'].map((c) => h('button', { type: 'button', class: 'sw c-' + c + (color === c ? ' sel' : ''), 'aria-label': c, onclick: () => { color = c; paintSw(); } })));
+    paintSw();
+    const subBox = h('div', { class: 'card' });
+    const drawSubs = (list) => put(subBox, list.length ? list.map((s) => {
+      const nm = h('input', { value: s.name, maxlength: 40, 'aria-label': 'Subject name' });
+      return h('div', { class: 'row pad16nb srow' }, nm, h('span', { class: 'muted small' }, s.posts + ' posts'),
+        h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api(base + '/subjects/' + enc(s.slug), { method: 'PATCH', body: { name: nm.value } }); toast('Renamed!'); drawSide(); }) }, 'Rename'),
+        h('button', { class: 'btn danger small', type: 'button', onclick: safe(async () => { if (!confirm('Delete the Subject "' + s.name + '"? Its posts stay in the Outlet with no Subject.')) return; await api(base + '/subjects/' + enc(s.slug), { method: 'DELETE' }); render(); drawSide(); }) }, 'Delete'));
+    }) : h('div', { class: 'empty' }, 'No Subjects yet.'));
+    drawSubs(r.subjects);
+    const newSub = h('input', { placeholder: 'New Subject name', maxlength: 40, 'aria-label': 'New Subject name' });
+    const modName = h('input', { placeholder: 'Username', maxlength: 20, 'aria-label': 'Username to make a moderator' });
+    const banName = h('input', { placeholder: 'Username', maxlength: 20, 'aria-label': 'Username to ban' });
+    const bansBox = h('div');
+    const drawBans = async () => { const b = await api(base + '/bans'); put(bansBox, b.users.length ? b.users.map((u) => h('div', { class: 'row pad16nb' }, link('/u/' + enc(u.username), '@' + u.username), h('span', { class: 'grow' }), h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api(base + '/bans/' + enc(u.username), { method: 'DELETE' }); drawBans(); }) }, 'Unban'))) : h('p', { class: 'muted' }, 'Nobody is banned.')); };
+    drawBans().catch(() => {});
+    show(h('div', { class: 'row2' }, link(outletPath(o.slug), '← Back to ' + o.name)),
+      h('div', { class: 'card formcard wide' }, h('h1', null, owner ? 'Manage ' + o.name : 'Moderate ' + o.name),
+        owner ? [h('h2', null, 'Details'), h('label', { for: 'sn' }, 'Name'), name, h('label', { for: 'sd' }, 'Description'), desc, h('label', { for: 'sr' }, 'Rules'), rules, h('label', null, 'Color'), sw,
+          h('p', null, h('button', { class: 'btn', type: 'button', onclick: guard(err, async () => { await api(base, { method: 'PATCH', body: { name: name.value, description: desc.value, rules: rules.value, color } }); toast('Saved!'); drawSide(); }) }, 'Save details')), err] : null,
+        h('h2', null, 'Subjects'), h('p', { class: 'muted' }, 'Subjects sort the talk inside this Outlet.'), subBox,
+        h('div', { class: 'row2' }, newSub, h('button', { class: 'btn small', type: 'button', onclick: guard(err2, async () => { await api(base + '/subjects', { method: 'POST', body: { name: newSub.value } }); newSub.value = ''; toast('Subject added!'); render(); drawSide(); }) }, 'Add Subject')), err2,
+        owner ? [h('h2', null, 'Moderators'), h('ul', { class: 'ulist' }, r.mods.map((m) => h('li', { class: 'urow' }, h('div', { class: 'ut' }, '@' + m.username, ' ', h('span', { class: 'chip small' }, m.role === 'owner' ? 'Owner' : 'Moderator')), m.role === 'mod' ? h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api(base + '/mods/' + enc(m.username), { method: 'DELETE' }); render(); }) }, 'Remove') : null))),
+          h('div', { class: 'row2' }, modName, h('button', { class: 'btn small', type: 'button', onclick: guard(err3, async () => { await api(base + '/mods', { method: 'POST', body: { username: modName.value } }); modName.value = ''; render(); }) }, 'Make moderator')), err3] : null,
+        h('h2', null, 'Banned people'), bansBox,
+        h('div', { class: 'row2' }, banName, h('button', { class: 'btn danger small', type: 'button', onclick: safe(async () => { const u = banName.value.trim().replace(/^@/, ''); if (!u) return; await api(base + '/bans/' + enc(u), { method: 'POST' }); banName.value = ''; drawBans(); toast('Banned!'); }) }, 'Ban')),
+        owner ? [h('h2', null, 'Delete this Outlet'), h('p', { class: 'muted' }, 'This removes the Outlet, its Subjects and every post in it for good.'),
+          h('button', { class: 'btn danger', type: 'button', onclick: safe(async () => { if (!confirm('Delete the Outlet "' + o.name + '" and all its posts? This cannot be undone.')) return; await api(base, { method: 'DELETE' }); toast('Outlet deleted!'); drawSide(); go('/outlets'); }) }, 'Delete Outlet')] : null));
+  }
+
+  // choose a Subject for a post (moderators)
+  async function moveDialog(slug, x, after) {
+    const r = await api('/outlets/' + enc(slug));
+    const box = modal('Move to a Subject', h('div', { class: 'liclist' }, [h('button', { type: 'button', onclick: go1(null) }, 'No Subject'), ...r.subjects.map((s) => h('button', { type: 'button', onclick: go1(s.slug) }, s.name))]));
+    function go1(sl) { return safe(async () => { await api('/outlets/' + enc(slug) + '/posts/' + x.id + '/move', { method: 'POST', body: { subject: sl } }); box.remove(); toast('Moved!'); if (after) after(); }); }
   }
 
   // ---------- pages ----------
@@ -661,12 +838,13 @@
     setTitle(nameOf(top) + ': ' + top.body.slice(0, 40));
     drawSide();
     const replies = h('div', { class: 'card feed' });
-    const addReply = (p) => replies.append(postCard(p, { noReplyLink: true, focus: p.id === r.focus && r.focus !== r.post.id, onDelete: () => {} }));
+    const topOl = (r.post.kind === 'repost' ? r.post.target : r.post).outlet;
+    const addReply = (p) => replies.append(postCard(p, { noReplyLink: true, focus: p.id === r.focus && r.focus !== r.post.id, onDelete: () => {}, modOutlet: topOl && topOl.canMod ? topOl.slug : null }));
     r.replies.forEach(addReply);
     show(link('/', '← Back'),
       h('div', { class: 'card feed' }, postCard(r.post, { noReplyLink: true, focus: r.focus === r.post.id, onDelete: () => go('/', true) })),
       h('div', { class: 'pad' }),
-      me ? composer({ parent: r.post.id, placeholder: 'Reply to ' + nameOf(r.post), button: 'Reply', label: 'Write a reply', onPosted: (p) => { addReply(p); toast('Replied!'); } }) : h('p', { class: 'muted' }, link('/login', 'Log in'), ' to reply.'),
+      topOl && topOl.locked && !topOl.canMod ? h('p', { class: 'muted' }, icon('lock'), ' This thread is locked. Only moderators can reply.') : me ? composer({ parent: r.post.id, placeholder: 'Reply to ' + nameOf(r.post), button: 'Reply', label: 'Write a reply', onPosted: (p) => { addReply(p); toast('Replied!'); } }) : h('p', { class: 'muted' }, link('/login', 'Log in'), ' to reply.'),
       replies);
   }
 
@@ -802,7 +980,7 @@
   }
 
   function shortcuts() {
-    const rows = [['n', 'Write a new post'], ['/', 'Search'], ['g then h', 'Go home'], ['g then n', 'Notifications'], ['g then b', 'Saved posts'], ['g then e', 'Explore'], ['g then m', 'Messages'], ['?', 'Show this list'], ['Esc', 'Close pictures and menus']];
+    const rows = [['n', 'Write a new post'], ['/', 'Search'], ['g then h', 'Go home'], ['g then n', 'Notifications'], ['g then b', 'Saved posts'], ['g then e', 'Explore'], ['g then o', 'Outlets'], ['g then m', 'Messages'], ['?', 'Show this list'], ['Esc', 'Close pictures and menus']];
     const box = h('div', { class: 'modal', role: 'dialog', 'aria-label': 'Keyboard shortcuts', onclick: (e) => { if (e.target === box) box.remove(); } },
       h('div', { class: 'card sheet' }, h('div', { class: 'row' }, h('h2', null, 'Keyboard shortcuts'), h('button', { class: 'btn ghost small', type: 'button', onclick: () => box.remove() }, 'Close')), h('table', null, rows.map(([k, d]) => h('tr', null, h('td', null, h('kbd', null, k)), h('td', null, d))))));
     document.body.append(box);
@@ -814,7 +992,7 @@
     if (e.key === 'Escape') { document.querySelectorAll('.modal').forEach((m) => m.remove()); document.querySelectorAll('details.menu[open]').forEach((d) => d.removeAttribute('open')); return; }
     if (gPending && Date.now() - gPending < 1500) {
       gPending = 0;
-      const to = { h: '/', n: '/notifications', b: '/bookmarks', e: '/explore', m: '/messages' }[e.key];
+      const to = { h: '/', n: '/notifications', b: '/bookmarks', e: '/explore', m: '/messages', o: '/outlets' }[e.key];
       if (to) { e.preventDefault(); go(to); }
       return;
     }
@@ -995,7 +1173,7 @@
     window.scrollTo(0, 0);
     const seg = location.pathname.split('/').filter(Boolean).map(decodeURIComponent);
     try {
-      const [a, b, c] = seg;
+      const [a, b, c, d] = seg;
       if (!seg.length) await home();
       else if (a === 'login' && !b) authPage('login');
       else if (a === 'register' && !b) authPage('register');
@@ -1004,6 +1182,9 @@
       else if (a === 'notifications' && !b) await notificationsPage();
       else if (a === 'bookmarks' && !b) await bookmarksPage();
       else if (a === 'explore' && !b) await explorePage();
+      else if (a === 'outlets' && !b) await outletsPage();
+      else if (a === 'outlets' && b === 'new') newOutletPage();
+      else if (a === 'o' && b) await outletPage(b, c, d);
       else if (a === 'messages') await messagesPage(b);
       else if (a === 'lists' && !b) await listsPage();
       else if (a === 'list' && b) await listPage(b);

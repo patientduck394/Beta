@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -131,6 +131,15 @@ const DDL = [
   'CREATE TABLE IF NOT EXISTS post_cw (post_id INTEGER PRIMARY KEY, text TEXT NOT NULL)',
   'CREATE TABLE IF NOT EXISTS bans (user_id INTEGER PRIMARY KEY, reason TEXT NOT NULL DEFAULT \'\', created INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS avatars (user_id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL)',
+  // version 4: Outlets (forums) with Subjects inside them
+  "CREATE TABLE IF NOT EXISTS outlets (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', owner_id INTEGER NOT NULL, created INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS outlet_members (outlet_id INTEGER NOT NULL, user_id INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'member', joined INTEGER NOT NULL, PRIMARY KEY (outlet_id, user_id))",
+  'CREATE INDEX IF NOT EXISTS outlet_members_user ON outlet_members(user_id)',
+  "CREATE TABLE IF NOT EXISTS subjects (id INTEGER PRIMARY KEY AUTOINCREMENT, outlet_id INTEGER NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL, UNIQUE (outlet_id, slug))",
+  'CREATE TABLE IF NOT EXISTS outlet_posts (post_id INTEGER PRIMARY KEY, outlet_id INTEGER NOT NULL, subject_id INTEGER, pinned INTEGER NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0)',
+  'CREATE INDEX IF NOT EXISTS outlet_posts_outlet ON outlet_posts(outlet_id, post_id)',
+  'CREATE INDEX IF NOT EXISTS outlet_posts_subject ON outlet_posts(subject_id, post_id)',
+  'CREATE TABLE IF NOT EXISTS outlet_bans (outlet_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY (outlet_id, user_id))',
 ];
 let schemaReady = null;
 function ensureSchema(env) {
@@ -199,6 +208,15 @@ async function settingsOf(D, uid) {
   (await D.all('SELECT k, v FROM settings WHERE user_id=?', uid)).forEach((r) => (out[r.k] = r.v));
   return out;
 }
+const OUTLET_SLUG = /^[a-z0-9][a-z0-9-]{2,29}$/;
+const slugify = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30);
+// 'owner', 'mod', 'member' or null
+async function outletRole(D, outletId, userId) {
+  if (!userId) return null;
+  const r = await D.first('SELECT role FROM outlet_members WHERE outlet_id=? AND user_id=?', outletId, userId);
+  return r ? r.role : null;
+}
+const isMod = (role) => role === 'owner' || role === 'mod';
 async function blockedBetween(D, a, b) {
   return !!(await D.first("SELECT 1 AS x FROM mutes WHERE kind='block' AND ((user_id=? AND target_id=?) OR (user_id=? AND target_id=?))", a, b, b, a));
 }
@@ -221,7 +239,7 @@ const BASE = `SELECT p.id, p.body, p.created, p.parent_id, p.user_id, u.username
 
 async function metrics(env, viewerId, ids) {
   const M = {};
-  ids.forEach((id) => (M[id] = { likes: 0, liked: false, replies: 0, reposts: 0, quotes: 0, reposted: false, bookmarked: false, edited: null, poll: null, files: [] }));
+  ids.forEach((id) => (M[id] = { likes: 0, liked: false, replies: 0, reposts: 0, quotes: 0, reposted: false, bookmarked: false, edited: null, poll: null, files: [], outlet: null }));
   if (!ids.length) return M;
   const P = ph(ids.length);
   const v = viewerId || 0;
@@ -240,6 +258,8 @@ async function metrics(env, viewerId, ids) {
       q(`SELECT post_id k, idx, COUNT(*) n FROM poll_votes WHERE post_id IN (${P}) GROUP BY post_id, idx`),
       q(`SELECT post_id k, idx FROM poll_votes WHERE user_id=? AND post_id IN (${P})`, v),
       q(`SELECT post_id k, id, name, mime, size, alt FROM attachments WHERE post_id IN (${P}) ORDER BY id`),
+      q(`SELECT op.post_id k, op.outlet_id, op.pinned, op.locked, o.slug, o.name, o.color, s.slug AS subject, s.name AS subject_name FROM outlet_posts op JOIN outlets o ON o.id=op.outlet_id LEFT JOIN subjects s ON s.id=op.subject_id WHERE op.post_id IN (${P})`),
+      env.DB.prepare("SELECT outlet_id FROM outlet_members WHERE user_id=? AND role IN ('owner','mod')").bind(v),
     ])
   ).map((x) => x.results);
   res[0].forEach((r) => (M[r.k].likes = r.n));
@@ -261,6 +281,8 @@ async function metrics(env, viewerId, ids) {
   });
   res[10].forEach((r) => polls[r.k] && (polls[r.k].myVote = r.idx));
   Object.keys(polls).forEach((k) => (M[k].poll = polls[k]));
+  const modOf = new Set(res[13].map((r) => r.outlet_id));
+  res[12].forEach((r) => (M[r.k].outlet = { slug: r.slug, name: r.name, color: r.color, subject: r.subject, subject_name: r.subject_name, pinned: !!r.pinned, locked: !!r.locked, canMod: modOf.has(r.outlet_id) }));
   res[11].forEach((r) => M[r.k].files.push({ id: r.id, name: r.name, mime: r.mime, size: r.size, alt: r.alt, image: r.mime.startsWith('image/') }));
   return M;
 }
@@ -311,7 +333,7 @@ async function purgePosts(D, startIds) {
     const del = (t, col = 'post_id') => D.stmt(`DELETE FROM ${t} WHERE ${col} IN (${P})`, ...part);
     await D.batch([
       D.stmt(`DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE post_id IN (${P}))`, ...part),
-      del('attachments'), del('post_cw'), del('likes'), del('post_topics'), del('edits'), del('polls'), del('poll_options'), del('poll_votes'), del('bookmarks'), del('notifications'), del('reports'), del('refs'),
+      del('attachments'), del('post_cw'), del('outlet_posts'), del('likes'), del('post_topics'), del('edits'), del('polls'), del('poll_options'), del('poll_votes'), del('bookmarks'), del('notifications'), del('reports'), del('refs'),
       D.stmt(`UPDATE profiles SET pinned=NULL WHERE pinned IN (${P})`, ...part),
       del('posts', 'id'),
     ]);
@@ -523,6 +545,11 @@ async function route(req, env, url) {
       const p = pid && (await D.first('SELECT id, user_id, parent_id FROM posts WHERE id=?', pid));
       if (!p) bad('We could not find the post you are replying to!', 404);
       parent = p.parent_id || p.id;
+      const lk = await D.first('SELECT op.locked, op.outlet_id FROM outlet_posts op WHERE op.post_id=?', parent);
+      if (lk) {
+        if (await D.first('SELECT 1 AS x FROM outlet_bans WHERE outlet_id=? AND user_id=?', lk.outlet_id, user.id)) bad('You cannot post in this Outlet!', 403);
+        if (lk.locked && !isMod(await outletRole(D, lk.outlet_id, user.id))) bad('This thread is locked!', 403);
+      }
       parentAuthor = p.parent_id ? (await D.first('SELECT user_id FROM posts WHERE id=?', p.parent_id)).user_id : p.user_id;
       if (await blockedBetween(D, user.id, parentAuthor)) bad('You cannot reply to this person!', 403);
     }
@@ -551,11 +578,28 @@ async function route(req, env, url) {
       if (!a) bad('One of the files is not there any more. Add it again!');
       mine.push({ id: fid, alt: cleanLine(f.alt, 200) });
     }
+    // a new post can go into an Outlet (and a Subject inside it)
+    let outletRow = null, subjectId = null;
+    if (b.outlet) {
+      if (b.parent != null || b.quote != null) bad('Posts in an Outlet are new posts, not replies or quotes!');
+      outletRow = await D.first('SELECT id FROM outlets WHERE slug=?', String(b.outlet));
+      if (!outletRow) bad('We could not find that Outlet!', 404);
+      if (await D.first('SELECT 1 AS x FROM outlet_bans WHERE outlet_id=? AND user_id=?', outletRow.id, user.id)) bad('You cannot post in this Outlet!', 403);
+      if (b.subject) {
+        const sub = await D.first('SELECT id FROM subjects WHERE outlet_id=? AND slug=?', outletRow.id, String(b.subject));
+        if (!sub) bad('We could not find that Subject!', 404);
+        subjectId = sub.id;
+      }
+    }
     const r = await D.run('INSERT INTO posts(user_id,body,parent_id,created) VALUES(?,?,?,?)', user.id, body, parent, Date.now());
     const id = r.meta.last_row_id;
     const stmts = topicsIn(body).map((t) => D.stmt('INSERT OR IGNORE INTO post_topics(post_id,topic) VALUES(?,?)', id, t));
     if (quote) stmts.push(D.stmt("INSERT INTO refs(post_id,target_id,kind) VALUES(?,?,'quote')", id, quote));
     if (cw) stmts.push(D.stmt('INSERT INTO post_cw(post_id,text) VALUES(?,?)', id, cw));
+    if (outletRow) {
+      stmts.push(D.stmt('INSERT INTO outlet_posts(post_id,outlet_id,subject_id) VALUES(?,?,?)', id, outletRow.id, subjectId));
+      stmts.push(D.stmt("INSERT OR IGNORE INTO outlet_members(outlet_id,user_id,role,joined) VALUES(?,?,'member',?)", outletRow.id, user.id, Date.now()));
+    }
     if (poll) {
       stmts.push(D.stmt('INSERT INTO polls(post_id,ends) VALUES(?,?)', id, poll.ends));
       poll.opts.forEach((o, i) => stmts.push(D.stmt('INSERT INTO poll_options(post_id,idx,label) VALUES(?,?,?)', id, i, o)));
@@ -688,7 +732,23 @@ async function route(req, env, url) {
     let params = [];
     let hide = true; // leave out people and topics I muted
     let opts = { before, limit };
-    if (sp.get('topic')) {
+    let noOutlets = true; // Outlet posts stay inside their Outlet (except on Home for people who joined it)
+    if (sp.get('outlet')) {
+      noOutlets = false;
+      const o = await D.first('SELECT id FROM outlets WHERE slug=?', sp.get('outlet'));
+      if (!o) bad('We could not find that Outlet!', 404);
+      where += ' AND p.id IN (SELECT post_id FROM outlet_posts WHERE outlet_id=? AND pinned=0';
+      params = [o.id];
+      const sj = sp.get('subject');
+      if (sj === 'none') where += ' AND subject_id IS NULL';
+      else if (sj) {
+        const sub = await D.first('SELECT id FROM subjects WHERE outlet_id=? AND slug=?', o.id, sj);
+        if (!sub) bad('We could not find that Subject!', 404);
+        where += ' AND subject_id=?';
+        params.push(sub.id);
+      }
+      where += ')';
+    } else if (sp.get('topic')) {
       const t = cleanTopic(sp.get('topic'));
       where += ' AND p.id IN (SELECT post_id FROM post_topics WHERE topic=?)';
       params = [t];
@@ -699,6 +759,7 @@ async function route(req, env, url) {
       }
     } else if (sp.get('user')) {
       hide = false;
+      noOutlets = false;
       const tab = sp.get('tab') || 'posts';
       if (tab === 'replies') { where = 'p.parent_id IS NOT NULL AND u.username=?'; params = [sp.get('user')]; }
       else if (tab === 'likes') { where = 'p.id IN (SELECT post_id FROM likes WHERE user_id=(SELECT id FROM users WHERE username=?))'; params = [sp.get('user')]; }
@@ -706,9 +767,12 @@ async function route(req, env, url) {
       else { where += ' AND u.username=?'; params = [sp.get('user')]; }
     } else if (sp.get('scope') === 'home') {
       need();
-      where += ` AND (p.user_id=? OR p.user_id IN (SELECT followee FROM follows WHERE follower=?)
-                  OR p.id IN (SELECT post_id FROM post_topics WHERE topic IN (SELECT topic FROM topic_follows WHERE user_id=?)))`;
-      params = [user.id, user.id, user.id];
+      noOutlets = false;
+      where += ` AND ((p.user_id=? OR p.user_id IN (SELECT followee FROM follows WHERE follower=?)
+                  OR p.id IN (SELECT post_id FROM post_topics WHERE topic IN (SELECT topic FROM topic_follows WHERE user_id=?)))
+                  AND p.id NOT IN (SELECT post_id FROM outlet_posts)
+                  OR p.id IN (SELECT post_id FROM outlet_posts WHERE outlet_id IN (SELECT outlet_id FROM outlet_members WHERE user_id=?)))`;
+      params = [user.id, user.id, user.id, user.id];
     } else if (sp.get('list')) {
       const lid = intParam(sp.get('list'));
       if (!lid || !(await D.first('SELECT 1 AS x FROM lists WHERE id=?', lid))) bad('We could not find that list!', 404);
@@ -741,6 +805,7 @@ async function route(req, env, url) {
       }
       for (const w of words.slice(0, 5)) { where += " AND p.body LIKE ? ESCAPE '\\'"; params.push('%' + w.replace(/[\\%_]/g, '\\$&') + '%'); }
     }
+    if (noOutlets && !sp.get('list')) where += ' AND p.id NOT IN (SELECT post_id FROM outlet_posts)';
     if (hide && user) {
       where += " AND p.user_id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)";
       params.push(user.id);
@@ -1069,6 +1134,169 @@ async function route(req, env, url) {
       if (method === 'DELETE' && seg[3]) {
         await D.run('DELETE FROM list_members WHERE list_id=? AND user_id=(SELECT id FROM users WHERE username=?)', id, seg[3]);
         return json({ ok: true });
+      }
+    }
+  }
+
+  // --- Outlets: forums, with Subjects inside to sort the talk
+  if (seg[0] === 'outlets') {
+    const SELECT_COUNTS = `(SELECT COUNT(*) FROM outlet_members m WHERE m.outlet_id=o.id) AS members, (SELECT COUNT(*) FROM outlet_posts p WHERE p.outlet_id=o.id) AS posts`;
+    if (!seg[1] && method === 'GET') {
+      const sp = url.searchParams;
+      const q = cleanLine(sp.get('q'), 40).replace(/[\\%_]/g, '\\$&');
+      const like = '%' + q + '%';
+      const popular = sp.get('sort') !== 'new';
+      const rows = await D.all(
+        `SELECT o.slug, o.name, o.description, o.color, o.created, ${SELECT_COUNTS},
+           EXISTS(SELECT 1 FROM outlet_members m WHERE m.outlet_id=o.id AND m.user_id=?) AS joined
+         FROM outlets o ${q ? "WHERE o.name LIKE ? ESCAPE '\\' OR o.slug LIKE ? ESCAPE '\\' OR o.description LIKE ? ESCAPE '\\'" : ''}
+         ORDER BY ${popular ? '(members * 3 + posts) DESC, o.id DESC' : 'o.id DESC'} LIMIT ${Math.min(intParam(sp.get('limit')) || 40, 60)}`,
+        user ? user.id : 0, ...(q ? [like, like, like] : []));
+      return json({ outlets: rows.map((r) => ({ ...r, joined: !!r.joined })) });
+    }
+    if (seg[1] === 'mine' && method === 'GET') {
+      if (!user) return json({ outlets: [] });
+      const rows = await D.all(`SELECT o.id, o.slug, o.name, o.color, m.role, ${SELECT_COUNTS} FROM outlet_members m JOIN outlets o ON o.id=m.outlet_id WHERE m.user_id=? ORDER BY o.name LIMIT 60`, user.id);
+      const subs = rows.length ? await D.all(`SELECT outlet_id, slug, name FROM subjects WHERE outlet_id IN (${ph(rows.length)}) ORDER BY position, id`, ...rows.map((r) => r.id)) : [];
+      return json({ outlets: rows.map((r) => ({ slug: r.slug, name: r.name, color: r.color, role: r.role, members: r.members, posts: r.posts, subjects: subs.filter((x) => x.outlet_id === r.id).map((x) => ({ slug: x.slug, name: x.name })) })) });
+    }
+    if (!seg[1] && method === 'POST') {
+      need();
+      await rate(D, 'outlet:' + user.id, 5, 3600);
+      const b = await readJson(req, 4000);
+      const slug = String(b.slug || slugify(b.name)).toLowerCase();
+      const name = cleanLine(b.name, 40);
+      if (!name) bad('Give the Outlet a name!');
+      if (!OUTLET_SLUG.test(slug)) bad('The address is 3 to 30 letters, numbers and dashes!');
+      const color = COLORS.includes(b.color) ? b.color : 'lime';
+      if ((await D.first('SELECT COUNT(*) AS n FROM outlets WHERE owner_id=?', user.id)).n >= 5) bad('You already run 5 Outlets, which is the limit for now!');
+      if (await D.first('SELECT 1 AS x FROM outlets WHERE slug=?', slug)) bad('That Outlet address is taken!', 409);
+      const now = Date.now();
+      const r = await D.run('INSERT INTO outlets(slug,name,description,rules,color,owner_id,created) VALUES(?,?,?,?,?,?,?)', slug, name, cleanLine(b.description, 200), cleanBody(b.rules).slice(0, 1500), color, user.id, now);
+      const oid = r.meta.last_row_id;
+      await D.batch([D.stmt("INSERT INTO outlet_members(outlet_id,user_id,role,joined) VALUES(?,?,'owner',?)", oid, user.id, now), D.stmt("INSERT INTO subjects(outlet_id,slug,name,description,position,created) VALUES(?,'general','General','Anything goes',0,?)", oid, now)]);
+      return json({ slug });
+    }
+    // one Outlet
+    const o = seg[1] && (await D.first('SELECT id, slug, name, description, rules, color, owner_id, created FROM outlets WHERE slug=?', seg[1]));
+    if (seg[1] && !o) bad('We could not find that Outlet!', 404);
+    if (o) {
+      const role = await outletRole(D, o.id, user && user.id);
+      const needMod = () => { if (!user) bad('Log in first!', 401); if (!isMod(role)) bad('Only the Outlet owner and moderators can do that!', 403); };
+      const needOwner = () => { if (!user) bad('Log in first!', 401); if (role !== 'owner') bad('Only the Outlet owner can do that!', 403); };
+      if (!seg[2] && method === 'GET') {
+        const subjects = await D.all('SELECT s.slug, s.name, s.description, (SELECT COUNT(*) FROM outlet_posts p WHERE p.subject_id=s.id) AS posts FROM subjects s WHERE s.outlet_id=? ORDER BY s.position, s.id', o.id);
+        const uncat = (await D.first('SELECT COUNT(*) AS n FROM outlet_posts WHERE outlet_id=? AND subject_id IS NULL', o.id)).n;
+        const members = (await D.first('SELECT COUNT(*) AS n FROM outlet_members WHERE outlet_id=?', o.id)).n;
+        const postCount = (await D.first('SELECT COUNT(*) AS n FROM outlet_posts WHERE outlet_id=?', o.id)).n;
+        const mods = await D.all("SELECT u.username, m.role FROM outlet_members m JOIN users u ON u.id=m.user_id WHERE m.outlet_id=? AND m.role IN ('owner','mod') ORDER BY m.role DESC, u.username", o.id);
+        const pinIds = (await D.all('SELECT post_id FROM outlet_posts WHERE outlet_id=? AND pinned=1 ORDER BY post_id DESC LIMIT 5', o.id)).map((r) => r.post_id);
+        const pinned = pinIds.length ? (await listPosts(env, D, user, `p.id IN (${ph(pinIds.length)})`, pinIds, { limit: 5 })).posts : [];
+        const banned = user ? !!(await D.first('SELECT 1 AS x FROM outlet_bans WHERE outlet_id=? AND user_id=?', o.id, user.id)) : false;
+        return json({ outlet: { slug: o.slug, name: o.name, description: o.description, rules: o.rules, color: o.color, created: o.created, members, posts: postCount, uncategorized: uncat, role, joined: !!role, banned }, subjects, mods, pinned });
+      }
+      if (!seg[2] && method === 'PATCH') {
+        needOwner();
+        const b = await readJson(req, 4000);
+        await D.run('UPDATE outlets SET name=?, description=?, rules=?, color=? WHERE id=?', cleanLine(b.name ?? o.name, 40) || o.name, cleanLine(b.description ?? o.description, 200), cleanBody(b.rules ?? o.rules).slice(0, 1500), COLORS.includes(b.color) ? b.color : o.color, o.id);
+        return json({ ok: true });
+      }
+      if (!seg[2] && method === 'DELETE') {
+        needOwner();
+        const ids = (await D.all('SELECT post_id FROM outlet_posts WHERE outlet_id=?', o.id)).map((r) => r.post_id);
+        await purgePosts(D, ids);
+        await D.batch([D.stmt('DELETE FROM outlet_posts WHERE outlet_id=?', o.id), D.stmt('DELETE FROM subjects WHERE outlet_id=?', o.id), D.stmt('DELETE FROM outlet_members WHERE outlet_id=?', o.id), D.stmt('DELETE FROM outlet_bans WHERE outlet_id=?', o.id), D.stmt('DELETE FROM outlets WHERE id=?', o.id)]);
+        return json({ ok: true });
+      }
+      if (seg[2] === 'join' && method === 'POST') {
+        need();
+        if (await D.first('SELECT 1 AS x FROM outlet_bans WHERE outlet_id=? AND user_id=?', o.id, user.id)) bad('You cannot join this Outlet!', 403);
+        if (!role && (await D.first('SELECT COUNT(*) AS n FROM outlet_members WHERE user_id=?', user.id)).n >= 60) bad('That is 60 Outlets, which is the limit for now!');
+        await D.run("INSERT OR IGNORE INTO outlet_members(outlet_id,user_id,role,joined) VALUES(?,?,'member',?)", o.id, user.id, Date.now());
+        return json({ joined: true });
+      }
+      if (seg[2] === 'leave' && method === 'POST') {
+        need();
+        if (role === 'owner') bad('You run this Outlet, so you cannot leave it. Delete it instead!');
+        await D.run('DELETE FROM outlet_members WHERE outlet_id=? AND user_id=?', o.id, user.id);
+        return json({ joined: false });
+      }
+      if (seg[2] === 'members' && method === 'GET') {
+        return json({ users: await D.all(`SELECT x.username, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar, m.role FROM outlet_members m JOIN users x ON x.id=m.user_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE m.outlet_id=? ORDER BY m.role DESC, m.joined LIMIT 200`, o.id) });
+      }
+      if (seg[2] === 'mods' && method === 'POST') {
+        needOwner();
+        const b = await readJson(req, 1000);
+        const u = await D.first('SELECT id FROM users WHERE username=?', String(b.username || '').trim());
+        if (!u) bad('We could not find that person!', 404);
+        if (u.id === o.owner_id) bad('That is you, the owner!');
+        if ((await D.first("SELECT COUNT(*) AS n FROM outlet_members WHERE outlet_id=? AND role='mod'", o.id)).n >= 10) bad('An Outlet can have 10 moderators!');
+        await D.run("INSERT INTO outlet_members(outlet_id,user_id,role,joined) VALUES(?,?,'mod',?) ON CONFLICT(outlet_id,user_id) DO UPDATE SET role='mod'", o.id, u.id, Date.now());
+        return json({ ok: true });
+      }
+      if (seg[2] === 'mods' && seg[3] && method === 'DELETE') {
+        needOwner();
+        await D.run("UPDATE outlet_members SET role='member' WHERE outlet_id=? AND role='mod' AND user_id=(SELECT id FROM users WHERE username=?)", o.id, seg[3]);
+        return json({ ok: true });
+      }
+      if (seg[2] === 'bans' && method === 'GET') {
+        needMod();
+        return json({ users: await D.all('SELECT x.username FROM outlet_bans b JOIN users x ON x.id=b.user_id WHERE b.outlet_id=? ORDER BY x.username', o.id) });
+      }
+      if (seg[2] === 'bans' && seg[3] && (method === 'POST' || method === 'DELETE')) {
+        needMod();
+        const u = await D.first('SELECT id FROM users WHERE username=?', seg[3]);
+        if (!u) bad('We could not find that person!', 404);
+        if (method === 'DELETE') { await D.run('DELETE FROM outlet_bans WHERE outlet_id=? AND user_id=?', o.id, u.id); return json({ ok: true }); }
+        const target = await outletRole(D, o.id, u.id);
+        if (u.id === o.owner_id || (isMod(target) && role !== 'owner')) bad('You cannot ban a moderator or the owner!', 403);
+        await D.batch([D.stmt('INSERT OR IGNORE INTO outlet_bans(outlet_id,user_id) VALUES(?,?)', o.id, u.id), D.stmt('DELETE FROM outlet_members WHERE outlet_id=? AND user_id=?', o.id, u.id)]);
+        return json({ ok: true });
+      }
+      // Subjects
+      if (seg[2] === 'subjects' && !seg[3] && method === 'POST') {
+        needMod();
+        const b = await readJson(req, 2000);
+        const name = cleanLine(b.name, 40);
+        if (!name) bad('Give the Subject a name!');
+        if ((await D.first('SELECT COUNT(*) AS n FROM subjects WHERE outlet_id=?', o.id)).n >= 30) bad('An Outlet can have 30 Subjects!');
+        let base = slugify(name) || 'subject', slug = base, n = 2;
+        while (await D.first('SELECT 1 AS x FROM subjects WHERE outlet_id=? AND slug=?', o.id, slug)) slug = (base + '-' + n++).slice(0, 34);
+        const pos = (await D.first('SELECT COALESCE(MAX(position),0)+1 AS n FROM subjects WHERE outlet_id=?', o.id)).n;
+        await D.run('INSERT INTO subjects(outlet_id,slug,name,description,position,created) VALUES(?,?,?,?,?,?)', o.id, slug, name, cleanLine(b.description, 120), pos, Date.now());
+        return json({ slug });
+      }
+      if (seg[2] === 'subjects' && seg[3] && (method === 'PATCH' || method === 'DELETE')) {
+        needMod();
+        const sub = await D.first('SELECT id, name, description FROM subjects WHERE outlet_id=? AND slug=?', o.id, seg[3]);
+        if (!sub) bad('We could not find that Subject!', 404);
+        if (method === 'DELETE') { await D.batch([D.stmt('UPDATE outlet_posts SET subject_id=NULL WHERE subject_id=?', sub.id), D.stmt('DELETE FROM subjects WHERE id=?', sub.id)]); return json({ ok: true }); }
+        const b = await readJson(req, 2000);
+        await D.run('UPDATE subjects SET name=?, description=? WHERE id=?', cleanLine(b.name ?? sub.name, 40) || sub.name, cleanLine(b.description ?? sub.description, 120), sub.id);
+        return json({ ok: true });
+      }
+      // moderating posts
+      if (seg[2] === 'posts' && seg[3]) {
+        needMod();
+        const pid = intParam(seg[3]);
+        const row = pid && (await D.first('SELECT p.id, p.parent_id FROM posts p WHERE p.id=?', pid));
+        if (!row) bad('We could not find that post!', 404);
+        const topId = row.parent_id || row.id;
+        const op = await D.first('SELECT outlet_id, pinned, locked FROM outlet_posts WHERE post_id=?', topId);
+        if (!op || op.outlet_id !== o.id) bad('That post is not in this Outlet!', 404);
+        if (method === 'DELETE') { await purgePosts(D, [pid]); return json({ ok: true }); }
+        if (method === 'POST' && !row.parent_id) {
+          const act = seg[4];
+          if (act === 'pin' || act === 'unpin') { await D.run('UPDATE outlet_posts SET pinned=? WHERE post_id=?', act === 'pin' ? 1 : 0, pid); return json({ pinned: act === 'pin' }); }
+          if (act === 'lock' || act === 'unlock') { await D.run('UPDATE outlet_posts SET locked=? WHERE post_id=?', act === 'lock' ? 1 : 0, pid); return json({ locked: act === 'lock' }); }
+          if (act === 'move') {
+            const b = await readJson(req, 500);
+            let sid = null;
+            if (b.subject) { const sub = await D.first('SELECT id FROM subjects WHERE outlet_id=? AND slug=?', o.id, String(b.subject)); if (!sub) bad('We could not find that Subject!', 404); sid = sub.id; }
+            await D.run('UPDATE outlet_posts SET subject_id=? WHERE post_id=?', sid, pid);
+            return json({ ok: true });
+          }
+        }
       }
     }
   }

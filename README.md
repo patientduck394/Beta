@@ -59,3 +59,10 @@ The new database tables are made by the Worker itself the first time it runs aft
 - Search filters: `from:name`, `#topic`, `has:image`, `has:file`, `has:poll`, together with words
 - See who liked a post; Share button (uses the phone's share sheet when there is one); download all your data
 - Admin page for reports, removing posts and suspending people. To make yourself an admin, put your username in `wrangler.toml` where it says `ADMINS = ""` (several names can be separated by commas), then deploy
+
+## Outlets (version 4)
+
+Outlets are forums. Each has Subjects inside it (like channels) to sort the talk. Open them with the forum button in the top bar or from the side menu, which lists the Outlets you joined with their Subjects.
+- Anyone can make an Outlet (up to 5 each) and join, post in and read Outlets. A new Outlet starts with a Subject called General
+- Owners and moderators add, rename and delete Subjects, pin posts, lock a thread, move a post to another Subject, remove posts and replies, and ban people
+- Posts in an Outlet stay inside it: they do not show in Everyone, Explore, Topics or search. People who joined an Outlet see its posts in their Following feed

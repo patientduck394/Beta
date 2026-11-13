@@ -6,7 +6,7 @@ import json, os, re, sys, xml.etree.ElementTree as ET
 src, app, out = sys.argv[1], sys.argv[2], sys.argv[3]
 MAP = {
   'mintcode': {'repo': 'book', 'folder': 'folder', 'file': 'file', 'star': 'star', 'branch': 'git-branch', 'history': 'rotate-ccw-clock', 'code': 'code', 'plus': 'plus', 'lock': 'lock', 'gear': 'settings', 'copy': 'copy', 'fork': 'git-fork', 'issue': 'circle-dot', 'tag': 'tag', 'comment': 'message-square'},
-  'beta': {'comment': 'message-circle', 'repost': 'repeat-2', 'heart': 'heart', 'bookmark': 'bookmark', 'share': 'share', 'more': 'ellipsis', 'image': 'image', 'poll': 'chart-no-axes-column', 'file': 'file', 'bell': 'bell', 'x': 'x', 'pin': 'pin', 'rss': 'rss', 'mail': 'mail', 'explore': 'compass', 'list': 'list', 'smile': 'face-slightly-smiling', 'warn': 'circle-exclamation-point'},
+  'beta': {'comment': 'message-circle', 'repost': 'repeat-2', 'heart': 'heart', 'bookmark': 'bookmark', 'share': 'share', 'more': 'ellipsis', 'image': 'image', 'poll': 'chart-no-axes-column', 'file': 'file', 'bell': 'bell', 'x': 'x', 'pin': 'pin', 'rss': 'rss', 'mail': 'mail', 'explore': 'compass', 'list': 'list', 'smile': 'face-slightly-smiling', 'warn': 'circle-exclamation-point', 'forum': 'messages-square', 'users': 'users', 'gear': 'settings', 'lock': 'lock'},
 }[app]
 def parse(path):
     root = ET.parse(path).getroot()
