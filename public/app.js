@@ -85,6 +85,9 @@
   };
   const safe = (fn) => (...a) => Promise.resolve(fn(...a)).catch((e) => toast(e.message));
   const nameOf = (u) => u.display_name || u.username;
+  const BADGE_TITLES = { verified: 'Verified', staff: 'Beta staff', supporter: 'Supporter' };
+  const badgeEl = (u) => (u && u.badge ? h('span', { class: 'vbadge b-' + u.badge, title: BADGE_TITLES[u.badge] || u.badge, role: 'img', 'aria-label': BADGE_TITLES[u.badge] || u.badge }, '\u2713') : null);
+  const REACT = ['\u{1F602}', '\u{1F525}', '\u{1F44F}', '\u{1F62E}', '\u{1F622}', '\u{1F389}'];
   const avatar = (u, big) => (u.avatar
     ? h('img', { class: 'av img' + (big ? ' big' : ''), src: '/api/files/' + u.avatar, alt: '', loading: 'lazy' })
     : h('span', { class: 'av c-' + (u.color || 'lime') + (big ? ' big' : ''), 'aria-hidden': 'true' }, (nameOf(u)[0] || '?').toUpperCase()));
@@ -186,6 +189,8 @@
       const menu = h('details', { class: 'menu navmenu' }, h('summary', { class: 'navbtn', 'aria-label': 'More' }, icon('more')),
         h('div', { class: 'pop right' },
           h('a', { href: '/bookmarks', 'data-link': true }, 'Saved posts'),
+          h('a', { href: '/scheduled', 'data-link': true }, 'Scheduled posts'),
+          h('a', { href: '/stats', 'data-link': true }, 'Your stats'),
           h('a', { href: '/lists', 'data-link': true }, 'Lists'),
           h('a', { href: '/settings', 'data-link': true }, 'Settings'),
           me.admin ? h('a', { href: '/admin', 'data-link': true }, 'Admin') : null,
@@ -330,7 +335,8 @@
     const showBody = () => put(bodyHolder, x.body ? bodyEl(x.body) : null);
     showBody();
     // a content warning hides the post until you ask to see it
-    const hidden = !!x.cw && !(opts.revealed && opts.revealed.has(x.id));
+    const muteHit = !mineP && me && me.filters && me.filters.length && x.body ? me.filters.find((w) => x.body.toLowerCase().includes(w)) : null;
+    const hidden = (!!x.cw || !!muteHit) && !(opts.revealed && opts.revealed.has(x.id));
 
     const startEdit = () => {
       if (hidden) { (opts.revealed = opts.revealed || new Set()).add(x.id); redraw(); toast('Press Edit again!'); return; }
@@ -370,6 +376,15 @@
       try { await navigator.clipboard.writeText(u); toast('Link copied!'); } catch (e) { toast('Copy it from the address bar after opening the post!'); }
     } }, icon('share'));
     const act = (fn) => safe(async (e) => { closeMenu(e.currentTarget); await fn(); });
+    const react = safe(async (emoji) => {
+      if (!me) return go('/login');
+      const r = await api('/posts/' + x.id + '/react', { method: 'POST', body: { emoji } });
+      x.reactions = r.reactions; x.myReaction = r.myReaction; redraw();
+    });
+    const reactMenu = h('details', { class: 'menu' }, h('summary', { class: 'act' + (x.myReaction ? ' on' : ''), 'aria-label': 'React with an emoji', title: 'React' }, x.myReaction ? h('span', { class: 'mre' }, x.myReaction) : icon('smile')),
+      h('div', { class: 'pop rxpop' }, REACT.map((e) => h('button', { type: 'button', 'aria-label': 'React ' + e, onclick: (ev) => { closeMenu(ev.currentTarget); react(e); } }, e))));
+    const rxBar = x.reactions && Object.keys(x.reactions).length ? h('div', { class: 'rxbar' }, Object.entries(x.reactions).sort((a, b) => b[1] - a[1]).map(([e, n]) =>
+      h('button', { type: 'button', class: 'rx' + (x.myReaction === e ? ' mine' : ''), 'aria-pressed': String(x.myReaction === e), 'aria-label': e + ' ' + n, onclick: () => react(e) }, e + ' ', h('b', null, n)))) : null;
     const items = [];
     if (mineP) {
       if (canEdit) items.push(h('button', { type: 'button', onclick: (e) => { closeMenu(e.currentTarget); startEdit(); } }, 'Edit (first 15 minutes)'));
@@ -381,6 +396,8 @@
         h('button', { type: 'button', onclick: act(async () => { if (!me) return go('/login'); if (!confirm('Block @' + x.username + '? They will not be able to follow, reply to or like your posts.')) return; const r = await api('/users/' + enc(x.username) + '/block', { method: 'POST' }); toast(r.blocked ? 'Blocked!' : 'Unblocked!'); }) }, 'Block @' + x.username),
         h('button', { type: 'button', onclick: act(async () => { if (!me) return go('/login'); const reason = prompt('What is wrong with this post? (a few words)'); if (reason === null) return; await api('/posts/' + x.id + '/report', { method: 'POST', body: { reason } }); toast('Thanks, we will take a look!'); }) }, 'Report'));
     }
+    if (x.edited) items.push(h('button', { type: 'button', onclick: act(async () => { const r = await api('/posts/' + x.id + '/history'); historyDialog(r.versions); }) }, 'Edit history'));
+    if (me && x.bookmarked) items.push(h('button', { type: 'button', onclick: act(async () => { await folderPicker(x, redraw); }) }, 'Move to a folder'));
     if (x.likes) items.unshift(h('button', { type: 'button', onclick: act(async () => { const r = await api('/posts/' + x.id + '/likes'); peopleDialog('Liked by', r.users); }) }, 'See who liked'));
     if (me && !mineP) items.push(h('button', { type: 'button', onclick: act(async () => { listPicker(x.username); }) }, 'Add @' + x.username + ' to a list'));
     // Outlet moderators
@@ -400,20 +417,22 @@
       : x.quoteGone ? h('div', { class: 'quote gone muted small' }, 'This post was deleted.') : null;
 
     const outletChip = ol && !opts.hideOutlet ? h('a', { class: 'ochip c-' + ol.color, href: outletPath(ol.slug, ol.subject), 'data-link': true }, icon('forum'), ol.name + (ol.subject_name ? ' \u203A ' + ol.subject_name : '')) : null;
-    const warn = hidden ? h('div', { class: 'cwbox' }, icon('warn'), h('b', null, x.cw), h('button', { class: 'btn ghost small', type: 'button', onclick: () => { (opts.revealed = opts.revealed || new Set()).add(x.id); redraw(); } }, 'Show')) : (x.cw ? h('div', { class: 'cwnote muted small' }, icon('warn'), x.cw) : null);
+    const warn = hidden ? h('div', { class: 'cwbox' }, icon('warn'), h('b', null, x.cw || 'Hidden: you muted \u201C' + muteHit + '\u201D'), h('button', { class: 'btn ghost small', type: 'button', onclick: () => { (opts.revealed = opts.revealed || new Set()).add(x.id); redraw(); } }, 'Show')) : (x.cw ? h('div', { class: 'cwnote muted small' }, icon('warn'), x.cw) : null);
     const article = h('article', { class: 'post' + (opts.focus ? ' focus' : '') },
       avatar(x),
       h('div', { class: 'pb' },
-        h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), h('span', { class: 'muted small' }, '@' + x.username), h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, opts.pinned || (ol && ol.pinned) ? h('span', { class: 'pinned' }, icon('pin', 'solid'), 'Pinned') : null, ol && ol.locked ? h('span', { class: 'pinned' }, icon('lock'), 'Locked') : null),
+        h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), badgeEl(x), h('span', { class: 'muted small' }, '@' + x.username), h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, opts.pinned || (ol && ol.pinned) ? h('span', { class: 'pinned' }, icon('pin', 'solid'), 'Pinned') : null, ol && ol.locked ? h('span', { class: 'pinned' }, icon('lock'), 'Locked') : null),
         outletChip,
+        x.replyPolicy ? h('div', { class: 'ptag muted small' }, icon('lock'), x.replyPolicy === 'following' ? ' Only people the author follows can reply' : ' Only mentioned people can reply') : null,
         warn,
         hidden ? null : bodyHolder,
         hidden ? null : (x.files.length ? filesView(x) : null),
         hidden ? null : (x.poll ? pollView(x, redraw) : null),
         hidden ? null : quoteEl,
+        hidden ? null : rxBar,
         h('div', { class: 'acts' },
           opts.noReplyLink ? null : h('a', { class: 'act', href: '/post/' + x.id, 'data-link': true, 'aria-label': 'Replies' }, icon('comment'), x.replies || ''),
-          repostMenu, likeBtn, bmBtn, shareBtn, moreMenu)));
+          repostMenu, likeBtn, reactMenu, bmBtn, shareBtn, moreMenu)));
     return [rp ? h('div', { class: 'reposthead' }, icon('repost'), link('/u/' + enc(rp.username), nameOf(rp)), ' reposted') : null, article];
   }
   function postCard(p, opts = {}) {
@@ -463,6 +482,39 @@
       update();
     } }, '+');
 
+    // schedule it for later, and choose who can reply
+    const canPolicy = !opts.parent && !opts.quote && !opts.outlet;
+    const when = h('input', { type: 'datetime-local', class: 'whenin', 'aria-label': 'When to post', hidden: true });
+    const schedBtn = opts.parent || opts.quote ? null : h('button', { class: 'act txt', type: 'button', 'aria-pressed': 'false', title: 'Schedule this post for later', onclick: () => {
+      when.hidden = !when.hidden;
+      schedBtn.setAttribute('aria-pressed', String(!when.hidden));
+      if (!when.hidden) { const d = new Date(Date.now() + 3600000); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); when.value = d.toISOString().slice(0, 16); }
+      else when.value = '';
+      btn.textContent = when.hidden ? (opts.button || 'Post') : 'Schedule';
+    } }, 'Later');
+    const repSel = canPolicy ? h('select', { class: 'subsel', 'aria-label': 'Who can reply' }, [['everyone', 'Anyone can reply'], ['following', 'People I follow can reply'], ['mentioned', 'Only people I mention can reply']].map(([v, l]) => h('option', { value: v }, l))) : null;
+    // @name suggestions
+    const ac = h('div', { class: 'ac card', hidden: true, role: 'listbox' });
+    let acT = 0;
+    const acHide = () => { ac.hidden = true; };
+    area.addEventListener('input', () => {
+      clearTimeout(acT);
+      const m = /(?:^|[^A-Za-z0-9_@])@([A-Za-z0-9_-]{1,29})$/.exec(area.value.slice(0, area.selectionStart));
+      if (!m || !me) return acHide();
+      acT = setTimeout(async () => {
+        try {
+          const r = await api('/mention?q=' + enc(m[1]));
+          if (!r.users.length) return acHide();
+          ac.replaceChildren(...r.users.map((u) => h('button', { type: 'button', role: 'option', onclick: () => {
+            const at = area.selectionStart - m[1].length;
+            area.setRangeText(u.username + ' ', at, area.selectionStart, 'end');
+            acHide(); area.focus(); area.dispatchEvent(new Event('input'));
+          } }, avatar(u), h('span', null, h('b', null, nameOf(u)), ' @' + u.username))));
+          ac.hidden = false;
+        } catch (e) { acHide(); }
+      }, 160);
+    });
+    area.addEventListener('blur', () => setTimeout(acHide, 200));
     // emoji
     const EMOJI = ['😀', '😂', '😍', '🥳', '😎', '🤔', '😭', '😡', '👍', '👎', '👏', '🙏', '💪', '🎉', '🔥', '✨', '💯', '❤️', '💚', '💙', '🌟', '🌈', '☀️', '🌙', '🍕', '🍔', '🍰', '☕', '🎵', '🎮', '📚', '💻', '🚀', '🐶', '🐱', '🦊', '🐢', '🌱', '🌸', '🍀'];
     const emojiMenu = h('details', { class: 'menu' }, h('summary', { class: 'act', 'aria-label': 'Add an emoji', title: 'Emoji' }, icon('smile')),
@@ -570,9 +622,13 @@
       try {
         const body = { body: area.value, parent: opts.parent, quote: opts.quote ? opts.quote.id : undefined, outlet: opts.outlet, subject: subSel && subSel.value ? subSel.value : undefined, cw: cwOn ? cwIn.value : undefined, files: files.filter((f) => f.id).map((f) => ({ id: f.id, alt: f.alt || '' })) };
         if (pollOn) body.poll = { options: pollInputs.map((i) => i.value).filter((v) => v.trim()), hours: parseInt(dur.value, 10) };
-        const r = await api('/posts', { method: 'POST', body });
+        if (repSel && repSel.value !== 'everyone') body.replies = repSel.value;
+        const sched = !when.hidden && when.value && !opts.parent && !opts.quote;
+        if (sched) body.at = new Date(when.value).getTime();
+        const r = sched ? await api('/scheduled', { method: 'POST', body }) : await api('/posts', { method: 'POST', body });
+        if (sched) { toast('Scheduled for ' + new Date(body.at).toLocaleString() + '!'); when.value = ''; when.hidden = true; schedBtn.setAttribute('aria-pressed', 'false'); btn.textContent = opts.button || 'Post'; }
         // the rest of a thread: each one replies to the first
-        for (const t of extras.filter((x) => x.value.trim())) await api('/posts', { method: 'POST', body: { body: t.value, parent: r.post.id } });
+        if (!sched) for (const t of extras.filter((x) => x.value.trim())) await api('/posts', { method: 'POST', body: { body: t.value, parent: r.post.id } });
         extras.length = 0;
         extraBox.replaceChildren();
         if (cwOn) { cwIn.value = ''; cwBtn.click(); }
@@ -582,13 +638,15 @@
         drawTray();
         if (pollOn) { pollInputs.forEach((i) => (i.value = '')); togglePoll(); }
         preview.hidden = true;
-        if (opts.onPosted) opts.onPosted(r.post);
+        if (!sched && opts.onPosted) opts.onPosted(r.post);
       } finally { update(); }
     }) },
       subSel ? h('label', { class: 'small muted subrow' }, icon('forum'), ' Post in ', subSel) : null,
-      area, cwIn, tray, pollBox, extraBox, preview,
+      area, ac, cwIn, tray, pollBox, extraBox, preview,
+      schedBtn ? h('div', { class: 'schedrow' }, when) : null,
+      repSel ? h('label', { class: 'small muted subrow' }, icon('lock'), ' ', repSel) : null,
       opts.quote ? h('div', { class: 'quote small' }, h('b', null, nameOf(opts.quote)), ' ', '@' + opts.quote.username, h('div', { class: 'qbody' }, opts.quote.body.slice(0, 200))) : null,
-      h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, opts.parent || opts.noPoll ? null : pollBtn, cwBtn, emojiMenu, opts.parent || opts.quote ? null : threadBtn, count), btn),
+      h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, opts.parent || opts.noPoll ? null : pollBtn, cwBtn, emojiMenu, opts.parent || opts.quote ? null : threadBtn, schedBtn, count), btn),
       h('div', { class: 'muted small' }, 'Keydown works here: **bold**, *italic*, `code`, #G#chips#'), err);
     return form;
   }
@@ -838,13 +896,15 @@
     if (me && !mineU) {
       const mk = (kind, on, off, msg) => { const b = h('button', { class: 'btn ghost small' }); const p = () => (b.textContent = user[kind] ? off : on); b.addEventListener('click', safe(async () => { if (kind === 'blocked' && !user.blocked && !confirm('Block @' + user.username + '?')) return; const r = await api('/users/' + enc(user.username) + '/' + (kind === 'muted' ? 'mute' : 'block'), { method: 'POST' }); user.muted = !!r.muted; user.blocked = !!r.blocked; if (kind === 'blocked' && r.blocked) { user.isFollowing = false; } toast(msg(r)); render(); })); p(); return b; };
       relBtns.push(mk('muted', 'Mute', 'Unmute', (r) => (r.muted ? 'Muted!' : 'Unmuted!')), mk('blocked', 'Block', 'Unblock', (r) => (r.blocked ? 'Blocked!' : 'Unblocked!')));
+      relBtns.push(h('button', { class: 'btn ghost small', type: 'button', onclick: safe(() => noteDialog(user)) }, user.hasNote ? 'Edit note' : 'Add note'));
     }
     const path = '/u/' + enc(user.username);
     const f = feed('/feed', { user: user.username, tab }, { empty: { posts: 'No posts yet!', replies: 'No replies yet!', media: 'No pictures or files yet!', likes: 'No likes yet!' }[tab], pinnedId: user.pinned ? user.pinned.id : null });
     show(h('div', { class: 'card profile' },
-      h('div', { class: 'top2' }, avatar(user, true), h('div', { class: 'who2' }, h('h1', null, nameOf(user)), h('div', { class: 'muted' }, '@' + user.username, user.followsYou ? h('span', { class: 'chip small' }, 'Follows you') : null, user.muted ? h('span', { class: 'chip small' }, 'Muted') : null, user.blocked ? h('span', { class: 'chip small' }, 'Blocked') : null)),
+      h('div', { class: 'top2' }, avatar(user, true), h('div', { class: 'who2' }, h('h1', null, nameOf(user), badgeEl(user)), h('div', { class: 'muted' }, '@' + user.username, user.followsYou ? h('span', { class: 'chip small' }, 'Follows you') : null, user.muted ? h('span', { class: 'chip small' }, 'Muted') : null, user.blocked ? h('span', { class: 'chip small' }, 'Blocked') : null)),
         h('div', { class: 'pbtns' }, mineU ? h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Edit profile') : fbtn, mineU ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => changePicture(() => render()) }, 'Change picture') : null, me && !mineU ? h('a', { class: 'btn ghost small', href: '/messages/' + enc(user.username), 'data-link': true, title: 'Send a message' }, icon('mail')) : null, me && !mineU ? h('button', { class: 'btn ghost small', type: 'button', title: 'Add to a list', onclick: safe(() => listPicker(user.username)) }, icon('list')) : null, h('a', { class: 'btn ghost small', href: '/rss/user/' + enc(user.username), title: 'RSS feed' }, icon('rss')))),
       user.bio ? h('p', null, rich(user.bio)) : null,
+      user.fields && user.fields.length ? h('dl', { class: 'pfields' }, user.fields.map((f) => [h('dt', null, f.label), h('dd', null, /^https?:\/\/[^\s<>"']{3,100}$/i.test(f.value) ? h('a', { href: f.value, rel: 'noopener noreferrer nofollow ugc', target: '_blank' }, f.value.replace(/^https?:\/\//, '')) : f.value)])) : null,
       h('p', { class: 'muted small' }, user.website ? [h('a', { href: user.website, rel: 'noopener noreferrer nofollow ugc', target: '_blank' }, user.website.replace(/^https?:\/\//, '')), ' · '] : null, 'Joined ' + new Date(user.created).toLocaleDateString()),
       stats, relBtns.length ? h('div', { class: 'row2' }, relBtns) : null),
       h('div', { class: 'tabs' }, [['posts', 'Posts'], ['replies', 'Replies'], ['media', 'Media'], ['likes', 'Likes']].map(([k, l]) => h('a', { href: path + (k === 'posts' ? '' : '?tab=' + k), 'data-link': true, class: tab === k ? 'on' : '' }, l))),
@@ -918,9 +978,21 @@
     if (!me) return go('/login', true);
     setTitle('Saved posts');
     drawSide();
-    const f = feed('/bookmarks', {}, { empty: 'Nothing saved yet. Tap the ribbon on a post to keep it here!', onUnsave: true });
-    show(h('h1', null, 'Saved posts'), f);
-    await f.ready;
+    let cur = params().get('folder') || '';
+    const bar = h('div', { class: 'folderbar' });
+    const holder = h('div');
+    const draw = async () => {
+      const fl = (await api('/bookmark-folders')).folders;
+      const chip = (id, label, n, del) => h('span', { class: 'fchip' + (cur === id ? ' on' : '') }, h('button', { type: 'button', onclick: () => { cur = id; history.replaceState(null, '', '/bookmarks' + (id ? '?folder=' + id : '')); draw(); } }, label + (n != null ? ' (' + n + ')' : '')),
+        del ? h('button', { type: 'button', class: 'fdel', 'aria-label': 'Delete folder ' + label, onclick: safe(async () => { if (!confirm('Delete the folder “' + label + '”? Your posts stay saved.')) return; await api('/bookmark-folders/' + id, { method: 'DELETE' }); if (cur === id) cur = ''; draw(); }) }, '×') : null);
+      put(bar, chip('', 'All', null), chip('none', 'Unfiled', null), fl.map((f) => chip(String(f.id), f.name, f.n, true)),
+        h('button', { type: 'button', class: 'btn ghost small', onclick: safe(async () => { const name = prompt('Name the new folder:'); if (!name) return; const r = await api('/bookmark-folders', { method: 'POST', body: { name } }); cur = String(r.folder.id); draw(); }) }, '+ Folder'));
+      const f = feed('/bookmarks', cur ? { folder: cur } : {}, { empty: cur ? 'Nothing in here yet! Use “Move to a folder” in a saved post’s menu.' : 'Nothing saved yet. Tap the ribbon on a post to keep it here!', onUnsave: true });
+      put(holder, f);
+      await f.ready;
+    };
+    show(h('h1', null, 'Saved posts'), bar, holder);
+    await draw();
   }
 
   function authPage(mode) {
@@ -988,7 +1060,10 @@
       h('h2', null, 'How Beta looks'),
       h('label', { for: 'thm' }, 'Theme'), themeSel,
       h('label', { for: 'dns' }, 'Spacing'), densSel,
+      h('h2', null, 'Muted words'), wordsBox(),
+      h('h2', null, 'Profile fields'), fieldsBox(cur.username),
       h('h2', null, 'Muted and blocked'), muted,
+      h('h2', null, 'Where you are signed in'), sessionsBox(),
       h('h2', null, 'Change your password'),
       h('label', { for: 'op' }, 'Current password'), oldPw, h('label', { for: 'np' }, 'New password (8 or more characters)'), newPw,
       h('p', null, h('button', { class: 'btn', onclick: guard(err2, async () => { await api('/me/password', { method: 'POST', body: { old: oldPw.value, new: newPw.value } }); oldPw.value = newPw.value = ''; toast('Password changed! You were signed out everywhere else.'); }) }, 'Change password')), err2,
@@ -1072,8 +1147,14 @@
   async function explorePage() {
     setTitle('Explore');
     drawSide();
-    const tab = ['media', 'topics', 'people'].includes(params().get('tab')) ? params().get('tab') : 'top';
-    const tabs = h('div', { class: 'tabs' }, [['top', 'Top posts'], ['media', 'Pictures'], ['topics', 'Topics'], ['people', 'People']].map(([k, l]) => h('a', { href: '/explore' + (k === 'top' ? '' : '?tab=' + k), 'data-link': true, class: tab === k ? 'on' : '' }, l)));
+    const tab = ['trending', 'media', 'topics', 'people'].includes(params().get('tab')) ? params().get('tab') : 'top';
+    const tabs = h('div', { class: 'tabs' }, [['top', 'Top posts'], ['trending', 'Trending'], ['media', 'Pictures'], ['topics', 'Topics'], ['people', 'People']].map(([k, l]) => h('a', { href: '/explore' + (k === 'top' ? '' : '?tab=' + k), 'data-link': true, class: tab === k ? 'on' : '' }, l)));
+    if (tab === 'trending') {
+      const t = await api('/trending');
+      return show(h('h1', null, 'Explore'), tabs, h('div', { class: 'card side' }, h('h2', null, 'Trending Topics, last 24 hours'),
+        t.topics.length ? h('ol', { class: 'trend' }, t.topics.map((x, i) => h('li', null, h('span', { class: 'rank' }, i + 1), h('a', { href: '/topic/' + enc(x.topic), 'data-link': true }, '#' + x.topic), h('span', { class: 'muted small' }, x.people + (x.people === 1 ? ' person' : ' people') + ', ' + x.n + (x.n === 1 ? ' post' : ' posts'))))) : h('div', { class: 'empty' }, 'Nothing is trending yet. Start a Topic!')),
+        h('h2', { class: 'gap' }, 'Hot right now'), h('div', { class: 'card feed' }, t.posts.length ? t.posts.map((p) => postCard(p)) : h('div', { class: 'empty' }, 'No hot posts yet!')));
+    }
     if (tab === 'topics') {
       const t = await api('/topics');
       return show(h('h1', null, 'Explore'), tabs, h('div', { class: 'card side' }, t.topics.length ? h('div', null, t.topics.map((x) => h('a', { class: 'chip', href: '/topic/' + enc(x.topic), 'data-link': true }, '#' + x.topic + ' · ' + x.n))) : h('p', { class: 'muted' }, 'No Topics yet!')));
@@ -1167,7 +1248,8 @@
     setTitle('Admin');
     side.replaceChildren();
     const [rep, bans] = await Promise.all([api('/admin/reports'), api('/admin/bans')]);
-    show(h('h1', null, 'Reports'), h('div', { class: 'card' }, rep.items.length ? rep.items.map((it) => {
+    const tools = await adminTools();
+    show(tools, h('h1', null, 'Reports'), h('div', { class: 'card' }, rep.items.length ? rep.items.map((it) => {
       const row = h('div', { class: 'report' },
         h('div', { class: 'muted small' }, 'Reported by @' + it.reporter + ' ' + ago(it.created) + ': ', h('b', null, it.reason)),
         it.post ? postCard(it.post, { noReplyLink: true }) : h('p', { class: 'muted' }, 'This post is gone.'),
@@ -1178,6 +1260,114 @@
       return row;
     }) : h('div', { class: 'empty' }, 'No reports. All calm!')),
       h('h2', { class: 'gap' }, 'Suspended people'), h('div', { class: 'card' }, bans.bans.length ? bans.bans.map((b) => h('div', { class: 'urow pad16' }, h('div', { class: 'ut' }, link('/u/' + enc(b.username), '@' + b.username), h('span', { class: 'muted small' }, ' ' + (b.reason || ''))), h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/admin/users/' + enc(b.username) + '/unban', { method: 'POST' }); render(); }) }, 'Unsuspend'))) : h('div', { class: 'empty' }, 'Nobody is suspended.')));
+  }
+
+  // ---------- version 5 extras ----------
+  function historyDialog(versions) {
+    modal('Edit history', versions.map((v, i) => h('div', { class: 'ver' }, h('div', { class: 'muted small' }, (v.current ? 'Now' : 'Version ' + (i + 1)) + ' · ' + new Date(v.created).toLocaleString()), h('div', { class: 'vbody' }, v.body || '(no text)'))));
+  }
+  async function folderPicker(x, redraw) {
+    const { folders } = await api('/bookmark-folders');
+    const box = modal('Move to a folder');
+    const pick = (fid, name) => safe(async () => { await api('/posts/' + x.id + '/folder', { method: 'POST', body: { folder: fid } }); box.remove(); toast(fid ? 'Moved to ' + name + '!' : 'Moved out of folders!'); if (location.pathname === '/bookmarks') render(); });
+    box.querySelector('.sheet').append(h('div', { class: 'folderlist' }, h('button', { type: 'button', class: 'btn ghost', onclick: pick(null) }, 'No folder'), folders.map((f) => h('button', { type: 'button', class: 'btn ghost', onclick: pick(f.id, f.name) }, f.name)),
+      h('button', { type: 'button', class: 'btn small', onclick: safe(async () => { const name = prompt('Name the new folder:'); if (!name) return; const r = await api('/bookmark-folders', { method: 'POST', body: { name } }); await pick(r.folder.id, r.folder.name)(); }) }, '+ New folder')));
+  }
+  function noteDialog(user) {
+    return api('/users/' + enc(user.username) + '/note').then((r) => {
+      const ta = h('textarea', { maxlength: 500, 'aria-label': 'Private note', value: r.note, placeholder: 'Only you can see this' });
+      const err = errBox();
+      const box = modal('Note about @' + user.username, h('p', { class: 'muted small' }, 'A private note. Only you can see it!'), ta, err,
+        h('p', null, h('button', { class: 'btn', type: 'button', onclick: guard(err, async () => { await api('/users/' + enc(user.username) + '/note', { method: 'POST', body: { note: ta.value } }); user.hasNote = !!ta.value.trim(); box.remove(); toast('Saved!'); render(); }) }, 'Save')));
+      ta.focus();
+    });
+  }
+  function wordsBox() {
+    const box = h('div');
+    const inp = h('input', { maxlength: 40, placeholder: 'A word or phrase to hide', 'aria-label': 'Word to mute' });
+    const err = errBox();
+    const draw = async () => {
+      const r = await api('/me/filters');
+      me.filters = r.filters;
+      put(box, h('p', { class: 'muted small' }, 'Posts with these words are hidden behind a button. You can still look!'),
+        r.filters.length ? h('div', { class: 'chips' }, r.filters.map((w) => h('button', { type: 'button', class: 'chip', title: 'Remove', onclick: safe(async () => { await api('/me/filters/' + enc(w), { method: 'DELETE' }); draw(); }) }, w + ' ×'))) : null,
+        h('div', { class: 'row2' }, inp, h('button', { class: 'btn small', type: 'button', onclick: guard(err, async () => { await api('/me/filters', { method: 'POST', body: { word: inp.value } }); inp.value = ''; draw(); }) }, 'Mute')), err);
+    };
+    draw().catch(() => {});
+    return box;
+  }
+  function fieldsBox(username) {
+    const box = h('div');
+    const err = errBox();
+    api('/users/' + enc(username)).then(({ user }) => {
+      const rows = [0, 1, 2, 3].map((i) => { const f = (user.fields || [])[i] || { label: '', value: '' }; return { l: h('input', { maxlength: 20, value: f.label, placeholder: 'Label', 'aria-label': 'Field ' + (i + 1) + ' label' }), v: h('input', { maxlength: 100, value: f.value, placeholder: 'Value or link', 'aria-label': 'Field ' + (i + 1) + ' value' }) }; });
+      put(box, h('p', { class: 'muted small' }, 'Up to 4 little facts on your profile, like Pronouns or Site!'), rows.map((r) => h('div', { class: 'frow' }, r.l, r.v)),
+        h('p', null, h('button', { class: 'btn', type: 'button', onclick: guard(err, async () => { await api('/me/fields', { method: 'POST', body: { fields: rows.map((r) => ({ label: r.l.value, value: r.v.value })) } }); toast('Saved!'); }) }, 'Save fields')), err);
+    }).catch(() => {});
+    return box;
+  }
+  function sessionsBox() {
+    const box = h('div');
+    const draw = async () => {
+      const r = await api('/me/sessions');
+      put(box, h('ul', { class: 'ulist' }, r.sessions.map((s) => h('li', { class: 'urow' }, h('span', { class: 'ut' }, h('b', null, s.kind === 'api' ? 'App token' + (s.name ? ': ' + s.name : '') : 'Web browser'), s.current ? h('span', { class: 'chip small' }, 'This one') : null, h('div', { class: 'muted small' }, 'Signed in ' + ago(s.created))),
+        s.current ? null : h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/me/sessions/' + s.id, { method: 'DELETE' }); draw(); }) }, 'Sign out')))),
+        r.sessions.length > 1 ? h('p', null, h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/me/sessions/others', { method: 'POST' }); toast('Signed out everywhere else!'); draw(); }) }, 'Sign out everywhere else')) : null);
+    };
+    draw().catch(() => {});
+    return box;
+  }
+  async function scheduledPage() {
+    if (!me) return go('/login', true);
+    setTitle('Scheduled posts');
+    drawSide();
+    const r = await api('/scheduled');
+    const list = h('div', { class: 'card' });
+    const draw = (items) => put(list, items.length ? items.map((it) => h('div', { class: 'urow pad16' }, h('div', { class: 'ut' }, h('b', null, new Date(it.at).toLocaleString()), h('div', null, it.body || '(a picture or poll)'), h('div', { class: 'muted small' }, (it.cw ? 'Content warning · ' : '') + (it.files ? it.files + ' file(s) · ' : '') + (it.poll ? 'Poll · ' : '') + (it.outlet ? 'In an Outlet' : ''))),
+      h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/scheduled/' + it.id, { method: 'DELETE' }); items = items.filter((x) => x.id !== it.id); draw(items); toast('Cancelled!'); }) }, 'Cancel'))) : h('div', { class: 'empty' }, 'Nothing scheduled. Press Later in the composer to pick a time!'));
+    let items = r.items;
+    draw(items);
+    show(h('h1', null, 'Scheduled posts'), h('p', { class: 'muted' }, 'These go out by themselves at the time you picked!'), list);
+  }
+  async function statsPage() {
+    if (!me) return go('/login', true);
+    setTitle('Your stats');
+    drawSide();
+    const s = await api('/me/stats');
+    const days = [];
+    for (let i = 13; i >= 0; i--) { const d = new Date(Date.now() - i * 864e5); const k = d.toISOString().slice(0, 10); days.push({ k, n: (s.days.find((x) => x.d === k) || {}).n || 0 }); }
+    const max = Math.max(1, ...days.map((d) => d.n));
+    const tile = (n, l) => h('div', { class: 'tile' }, h('b', null, n), h('span', null, l));
+    show(h('h1', null, 'Your stats'),
+      h('div', { class: 'tiles' }, tile(s.posts, 'posts'), tile(s.replies, 'replies'), tile(s.likesGot, 'likes got'), tile(s.reactionsGot, 'reactions got'), tile(s.repostsGot, 'reposts got'), tile(s.repliesGot, 'replies got'), tile(s.followers, 'followers'), tile(s.following, 'following')),
+      h('div', { class: 'card pad16' }, h('h2', null, 'Posts in the last 14 days'), h('div', { class: 'bars', role: 'img', 'aria-label': 'Posts per day for 14 days' }, days.map((d) => h('div', { class: 'bar', title: d.k + ': ' + d.n }, h('i', { style: 'height:' + Math.round((d.n / max) * 100) + '%' }), h('span', null, d.k.slice(8)))))),
+      h('h2', { class: 'gap' }, 'Your top posts'), h('div', { class: 'card feed' }, s.top.length ? s.top.map((p) => postCard(p)) : h('div', { class: 'empty' }, 'Posts that get likes and reactions show up here!')));
+  }
+  async function adminTools() {
+    const err1 = errBox(), err2 = errBox();
+    const un = h('input', { placeholder: 'username', 'aria-label': 'Username', maxlength: 30 });
+    const kind = h('select', { 'aria-label': 'Badge' }, [['verified', 'Verified'], ['staff', 'Beta staff'], ['supporter', 'Supporter'], ['', 'Remove badge']].map(([v, l]) => h('option', { value: v }, l)));
+    const text = h('input', { placeholder: 'Announcement for everyone', maxlength: 280, 'aria-label': 'Announcement' });
+    const days = h('select', { 'aria-label': 'How long' }, [['1', '1 day'], ['7', '7 days'], ['30', '30 days'], ['0', 'Until removed']].map(([v, l]) => h('option', { value: v }, l)));
+    const list = h('div');
+    const draw = async () => {
+      const r = await api('/admin/announcements');
+      put(list, r.items.map((a) => h('div', { class: 'urow' }, h('span', { class: 'ut' }, a.text, h('div', { class: 'muted small' }, ago(a.created) + (a.ends ? ', ends ' + new Date(a.ends).toLocaleDateString() : ''))), h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/admin/announcements/' + a.id, { method: 'DELETE' }); draw(); }) }, 'Remove'))));
+    };
+    await draw();
+    return h('div', { class: 'card pad16 admintools' }, h('h2', null, 'Badges'), h('div', { class: 'row2' }, un, kind, h('button', { class: 'btn small', type: 'button', onclick: guard(err1, async () => { await api('/admin/badges', { method: 'POST', body: { username: un.value.trim(), kind: kind.value || null } }); toast('Done!'); un.value = ''; }) }, 'Apply')), err1,
+      h('h2', null, 'Announcements'), h('div', { class: 'row2' }, text, days, h('button', { class: 'btn small', type: 'button', onclick: guard(err2, async () => { await api('/admin/announcements', { method: 'POST', body: { text: text.value, days: parseInt(days.value, 10) } }); text.value = ''; draw(); toast('Posted!'); }) }, 'Post')), err2, list);
+  }
+  async function showAnnouncements() {
+    try {
+      const { items } = await api('/announcements');
+      let seen = [];
+      try { seen = (store.get('beta_ann_seen') || '').split(',').filter(Boolean); } catch (e) {}
+      const fresh = items.filter((a) => !seen.includes(String(a.id)));
+      let bar = document.getElementById('banner');
+      if (!bar) { bar = h('div', { id: 'banner' }); app.parentNode.insertBefore(bar, app); }
+      put(bar, fresh.map((a) => h('div', { class: 'announce', role: 'status' }, h('span', null, a.text), h('button', { type: 'button', class: 'btn ghost small', onclick: () => { seen.push(String(a.id)); try { store.set('beta_ann_seen', seen.slice(-30).join(',')); } catch (e) {} showAnnouncements(); } }, 'Got it'))));
+    } catch (e) {}
   }
 
   // ---------- looks: light or dark, and how roomy ----------
@@ -1220,6 +1410,8 @@
       else if (a === 'notifications' && !b) await notificationsPage();
       else if (a === 'bookmarks' && !b) await bookmarksPage();
       else if (a === 'explore' && !b) await explorePage();
+      else if (a === 'scheduled' && !b) await scheduledPage();
+      else if (a === 'stats' && !b) await statsPage();
       else if (a === 'outlets' && !b) await outletsPage();
       else if (a === 'outlets' && b === 'new') newOutletPage();
       else if (a === 'o' && b) await outletPage(b, c, d);
@@ -1256,6 +1448,7 @@
   api('/me').then((r) => { me = r.user; }).catch(() => {}).then(() => {
     drawNav();
     render();
+    showAnnouncements();
     setInterval(refreshUnread, 60000);
   });
 })();

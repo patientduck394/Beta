@@ -100,3 +100,19 @@ CREATE TABLE IF NOT EXISTS outlet_posts (post_id INTEGER PRIMARY KEY, outlet_id 
 CREATE INDEX IF NOT EXISTS outlet_posts_outlet ON outlet_posts(outlet_id, post_id);
 CREATE INDEX IF NOT EXISTS outlet_posts_subject ON outlet_posts(subject_id, post_id);
 CREATE TABLE IF NOT EXISTS outlet_bans (outlet_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY (outlet_id, user_id));
+-- version 5
+CREATE TABLE IF NOT EXISTS reactions (post_id INTEGER NOT NULL, user_id INTEGER NOT NULL, emoji TEXT NOT NULL, PRIMARY KEY (post_id, user_id));
+CREATE TABLE IF NOT EXISTS scheduled (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, payload TEXT NOT NULL, at INTEGER NOT NULL, created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS scheduled_at ON scheduled(at);
+CREATE INDEX IF NOT EXISTS scheduled_user ON scheduled(user_id);
+CREATE TABLE IF NOT EXISTS word_filters (user_id INTEGER NOT NULL, word TEXT NOT NULL, PRIMARY KEY (user_id, word));
+CREATE TABLE IF NOT EXISTS bookmark_folders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS bookmark_folders_user ON bookmark_folders(user_id);
+CREATE TABLE IF NOT EXISTS bookmark_folder_items (user_id INTEGER NOT NULL, post_id INTEGER NOT NULL, folder_id INTEGER NOT NULL, PRIMARY KEY (user_id, post_id));
+CREATE INDEX IF NOT EXISTS bookmark_folder_items_folder ON bookmark_folder_items(folder_id);
+CREATE TABLE IF NOT EXISTS badges (user_id INTEGER PRIMARY KEY, kind TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS announcements (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, created INTEGER NOT NULL, ends INTEGER);
+CREATE TABLE IF NOT EXISTS profile_fields (user_id INTEGER NOT NULL, idx INTEGER NOT NULL, label TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (user_id, idx));
+CREATE TABLE IF NOT EXISTS user_notes (user_id INTEGER NOT NULL, target_id INTEGER NOT NULL, note TEXT NOT NULL, PRIMARY KEY (user_id, target_id));
+CREATE TABLE IF NOT EXISTS post_versions (post_id INTEGER NOT NULL, v INTEGER NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (post_id, v));
+CREATE TABLE IF NOT EXISTS reply_policy (post_id INTEGER PRIMARY KEY, policy TEXT NOT NULL);

@@ -18,3 +18,7 @@ run_worker_first = ["/api/*", "/rss/*"]
 binding = "DB"
 database_name = "beta-db"
 database_id = "fb23137a-a135-4688-b1ba-3b6770ed670e"
+
+# Runs every minute so scheduled posts go out on time
+[triggers]
+crons = ["* * * * *"]

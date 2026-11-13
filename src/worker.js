@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -140,6 +140,22 @@ const DDL = [
   'CREATE INDEX IF NOT EXISTS outlet_posts_outlet ON outlet_posts(outlet_id, post_id)',
   'CREATE INDEX IF NOT EXISTS outlet_posts_subject ON outlet_posts(subject_id, post_id)',
   'CREATE TABLE IF NOT EXISTS outlet_bans (outlet_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY (outlet_id, user_id))',
+  // version 5: reactions, scheduled posts, muted words, bookmark folders, badges, announcements, profile fields, notes, edit history, reply controls
+  "CREATE TABLE IF NOT EXISTS reactions (post_id INTEGER NOT NULL, user_id INTEGER NOT NULL, emoji TEXT NOT NULL, PRIMARY KEY (post_id, user_id))",
+  "CREATE TABLE IF NOT EXISTS scheduled (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, payload TEXT NOT NULL, at INTEGER NOT NULL, created INTEGER NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS scheduled_at ON scheduled(at)",
+  "CREATE INDEX IF NOT EXISTS scheduled_user ON scheduled(user_id)",
+  "CREATE TABLE IF NOT EXISTS word_filters (user_id INTEGER NOT NULL, word TEXT NOT NULL, PRIMARY KEY (user_id, word))",
+  "CREATE TABLE IF NOT EXISTS bookmark_folders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS bookmark_folders_user ON bookmark_folders(user_id)",
+  "CREATE TABLE IF NOT EXISTS bookmark_folder_items (user_id INTEGER NOT NULL, post_id INTEGER NOT NULL, folder_id INTEGER NOT NULL, PRIMARY KEY (user_id, post_id))",
+  "CREATE INDEX IF NOT EXISTS bookmark_folder_items_folder ON bookmark_folder_items(folder_id)",
+  "CREATE TABLE IF NOT EXISTS badges (user_id INTEGER PRIMARY KEY, kind TEXT NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS announcements (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, created INTEGER NOT NULL, ends INTEGER)",
+  "CREATE TABLE IF NOT EXISTS profile_fields (user_id INTEGER NOT NULL, idx INTEGER NOT NULL, label TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (user_id, idx))",
+  "CREATE TABLE IF NOT EXISTS user_notes (user_id INTEGER NOT NULL, target_id INTEGER NOT NULL, note TEXT NOT NULL, PRIMARY KEY (user_id, target_id))",
+  "CREATE TABLE IF NOT EXISTS post_versions (post_id INTEGER NOT NULL, v INTEGER NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (post_id, v))",
+  "CREATE TABLE IF NOT EXISTS reply_policy (post_id INTEGER PRIMARY KEY, policy TEXT NOT NULL)",
 ];
 let schemaReady = null;
 function ensureSchema(env) {
@@ -165,6 +181,7 @@ function ensureSchema(env) {
 
 // ---------- small helpers ----------
 const MAX_POST = 300;
+const REACTIONS = ['😂', '🔥', '👏', '😮', '😢', '🎉'];
 const MAX_IMAGE = 2 * 1024 * 1024;
 const MAX_FILE = 4 * 1024 * 1024;
 const QUOTA = 40 * 1024 * 1024; // per person
@@ -234,12 +251,12 @@ const unnotify = (D, userId, actorId, kind, postId) => D.run('DELETE FROM notifi
 const AV = (col) => `(SELECT file_id FROM avatars WHERE user_id=${col}) AS avatar`;
 const BASE = `SELECT p.id, p.body, p.created, p.parent_id, p.user_id, u.username,
   COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, ${AV('p.user_id')},
-  (SELECT text FROM post_cw WHERE post_id=p.id) AS cw, r.target_id, r.kind AS rkind
+  (SELECT text FROM post_cw WHERE post_id=p.id) AS cw, (SELECT kind FROM badges WHERE user_id=p.user_id) AS badge, r.target_id, r.kind AS rkind
   FROM posts p JOIN users u ON u.id=p.user_id LEFT JOIN profiles pr ON pr.user_id=p.user_id LEFT JOIN refs r ON r.post_id=p.id`;
 
 async function metrics(env, viewerId, ids) {
   const M = {};
-  ids.forEach((id) => (M[id] = { likes: 0, liked: false, replies: 0, reposts: 0, quotes: 0, reposted: false, bookmarked: false, edited: null, poll: null, files: [], outlet: null }));
+  ids.forEach((id) => (M[id] = { likes: 0, liked: false, replies: 0, reposts: 0, quotes: 0, reposted: false, bookmarked: false, edited: null, poll: null, files: [], outlet: null, reactions: {}, myReaction: null, replyPolicy: null }));
   if (!ids.length) return M;
   const P = ph(ids.length);
   const v = viewerId || 0;
@@ -260,6 +277,9 @@ async function metrics(env, viewerId, ids) {
       q(`SELECT post_id k, id, name, mime, size, alt FROM attachments WHERE post_id IN (${P}) ORDER BY id`),
       q(`SELECT op.post_id k, op.outlet_id, op.pinned, op.locked, o.slug, o.name, o.color, s.slug AS subject, s.name AS subject_name FROM outlet_posts op JOIN outlets o ON o.id=op.outlet_id LEFT JOIN subjects s ON s.id=op.subject_id WHERE op.post_id IN (${P})`),
       env.DB.prepare("SELECT outlet_id FROM outlet_members WHERE user_id=? AND role IN ('owner','mod')").bind(v),
+      q(`SELECT post_id k, emoji, COUNT(*) n FROM reactions WHERE post_id IN (${P}) GROUP BY post_id, emoji`),
+      q(`SELECT post_id k, emoji FROM reactions WHERE user_id=? AND post_id IN (${P})`, v),
+      q(`SELECT post_id k, policy FROM reply_policy WHERE post_id IN (${P})`),
     ])
   ).map((x) => x.results);
   res[0].forEach((r) => (M[r.k].likes = r.n));
@@ -283,6 +303,9 @@ async function metrics(env, viewerId, ids) {
   Object.keys(polls).forEach((k) => (M[k].poll = polls[k]));
   const modOf = new Set(res[13].map((r) => r.outlet_id));
   res[12].forEach((r) => (M[r.k].outlet = { slug: r.slug, name: r.name, color: r.color, subject: r.subject, subject_name: r.subject_name, pinned: !!r.pinned, locked: !!r.locked, canMod: modOf.has(r.outlet_id) }));
+  res[14].forEach((r) => (M[r.k].reactions[r.emoji] = r.n));
+  res[15].forEach((r) => (M[r.k].myReaction = r.emoji));
+  res[16].forEach((r) => (M[r.k].replyPolicy = r.policy));
   res[11].forEach((r) => M[r.k].files.push({ id: r.id, name: r.name, mime: r.mime, size: r.size, alt: r.alt, image: r.mime.startsWith('image/') }));
   return M;
 }
@@ -295,17 +318,17 @@ async function hydrate(env, D, user, rows) {
   const all = [...rows, ...extra];
   const ids = [...new Set(all.map((r) => r.id))];
   const M = await metrics(env, user && user.id, ids);
-  const shape = (r) => ({ id: r.id, body: r.body, created: r.created, parent_id: r.parent_id, username: r.username, display_name: r.display_name, color: r.color, avatar: r.avatar, cw: r.cw, ...M[r.id] });
+  const shape = (r) => ({ id: r.id, body: r.body, created: r.created, parent_id: r.parent_id, username: r.username, display_name: r.display_name, color: r.color, avatar: r.avatar, cw: r.cw, badge: r.badge, ...M[r.id] });
   const by = {};
   all.forEach((r) => (by[r.id] = shape(r)));
   const out = [];
   for (const r of rows) {
     if (r.rkind === 'repost') {
       const t = by[r.target_id];
-      if (t) out.push({ id: r.id, kind: 'repost', created: r.created, username: r.username, display_name: r.display_name, color: r.color, avatar: r.avatar, target: t });
+      if (t) out.push({ id: r.id, kind: 'repost', created: r.created, username: r.username, display_name: r.display_name, color: r.color, avatar: r.avatar, badge: r.badge, target: t });
     } else if (r.rkind === 'quote') {
       const t = by[r.target_id];
-      out.push({ ...by[r.id], quote: t ? { id: t.id, body: t.body, created: t.created, username: t.username, display_name: t.display_name, color: t.color, avatar: t.avatar, cw: t.cw, files: t.files } : null, quoteGone: !t });
+      out.push({ ...by[r.id], quote: t ? { id: t.id, body: t.body, created: t.created, username: t.username, display_name: t.display_name, color: t.color, avatar: t.avatar, badge: t.badge, cw: t.cw, files: t.files } : null, quoteGone: !t });
     } else out.push(by[r.id]);
   }
   return out;
@@ -333,7 +356,7 @@ async function purgePosts(D, startIds) {
     const del = (t, col = 'post_id') => D.stmt(`DELETE FROM ${t} WHERE ${col} IN (${P})`, ...part);
     await D.batch([
       D.stmt(`DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE post_id IN (${P}))`, ...part),
-      del('attachments'), del('post_cw'), del('outlet_posts'), del('likes'), del('post_topics'), del('edits'), del('polls'), del('poll_options'), del('poll_votes'), del('bookmarks'), del('notifications'), del('reports'), del('refs'),
+      del('attachments'), del('post_cw'), del('outlet_posts'), del('likes'), del('post_topics'), del('edits'), del('polls'), del('poll_options'), del('poll_votes'), del('bookmarks'), del('reactions'), del('reply_policy'), del('post_versions'), del('bookmark_folder_items'), del('notifications'), del('reports'), del('refs'),
       D.stmt(`UPDATE profiles SET pinned=NULL WHERE pinned IN (${P})`, ...part),
       del('posts', 'id'),
     ]);
@@ -349,6 +372,124 @@ async function rssFeed(env, D, url, title, link, where, params) {
 }
 
 // ---------- the routes ----------
+async function createPost(env, D, user, b) {
+    const body = cleanBody(b.body);
+    if ([...body].length > MAX_POST) bad('Posts are up to ' + MAX_POST + ' characters!');
+    const cw = cleanLine(b.cw, 80);
+    const files = Array.isArray(b.files) ? b.files.slice(0, 4) : [];
+    const pollIn = b.poll && typeof b.poll === 'object' ? b.poll : null;
+    if (!body && !files.length && !pollIn) bad('Write something first!');
+    let parent = null, quote = null, parentAuthor = null, quoteAuthor = null;
+    if (b.parent != null) {
+      const pid = intParam(b.parent);
+      const p = pid && (await D.first('SELECT id, user_id, parent_id FROM posts WHERE id=?', pid));
+      if (!p) bad('We could not find the post you are replying to!', 404);
+      parent = p.parent_id || p.id;
+      const lk = await D.first('SELECT op.locked, op.outlet_id FROM outlet_posts op WHERE op.post_id=?', parent);
+      if (lk) {
+        if (await D.first('SELECT 1 AS x FROM outlet_bans WHERE outlet_id=? AND user_id=?', lk.outlet_id, user.id)) bad('You cannot post in this Outlet!', 403);
+        if (lk.locked && !isMod(await outletRole(D, lk.outlet_id, user.id))) bad('This thread is locked!', 403);
+      }
+      parentAuthor = p.parent_id ? (await D.first('SELECT user_id FROM posts WHERE id=?', p.parent_id)).user_id : p.user_id;
+      if (await blockedBetween(D, user.id, parentAuthor)) bad('You cannot reply to this person!', 403);
+      const pol = parentAuthor !== user.id ? await D.first('SELECT policy FROM reply_policy WHERE post_id=?', parent) : null;
+      if (pol && pol.policy === 'following' && !(await D.first('SELECT 1 AS x FROM follows WHERE follower=? AND followee=?', parentAuthor, user.id))) bad('Only people the author follows can reply to this post!', 403);
+      if (pol && pol.policy === 'mentioned') {
+        const top = await D.first('SELECT body FROM posts WHERE id=?', parent);
+        if (!mentionsIn(top ? top.body : '').includes(user.username.toLowerCase())) bad('Only people mentioned in this post can reply to it!', 403);
+      }
+    }
+    if (b.quote != null) {
+      if (parent) bad('A reply cannot also be a quote!');
+      const qid = intParam(b.quote);
+      const t = qid && (await D.first('SELECT p.id, p.user_id, r.kind FROM posts p LEFT JOIN refs r ON r.post_id=p.id WHERE p.id=?', qid));
+      if (!t || t.kind === 'repost') bad('We could not find the post you are quoting!', 404);
+      if (!body) bad('Add a few words to your quote!');
+      if (await blockedBetween(D, user.id, t.user_id)) bad('You cannot quote this person!', 403);
+      quote = t.id;
+      quoteAuthor = t.user_id;
+    }
+    let poll = null;
+    if (pollIn) {
+      if (parent) bad('Polls go in new posts, not replies!');
+      const opts = (Array.isArray(pollIn.options) ? pollIn.options : []).map((o) => cleanLine(o, 40)).filter(Boolean);
+      if (opts.length < 2 || opts.length > 4 || new Set(opts.map((o) => o.toLowerCase())).size !== opts.length) bad('A poll needs 2 to 4 different choices!');
+      const hours = [1, 6, 24, 72, 168].includes(pollIn.hours) ? pollIn.hours : 24;
+      poll = { opts, ends: Date.now() + hours * 3600000 };
+    }
+    const mine = [];
+    for (const f of files) {
+      const fid = intParam(f && f.id);
+      const a = fid && (await D.first('SELECT id FROM attachments WHERE id=? AND user_id=? AND post_id IS NULL', fid, user.id));
+      if (!a) bad('One of the files is not there any more. Add it again!');
+      mine.push({ id: fid, alt: cleanLine(f.alt, 200) });
+    }
+    // a new post can go into an Outlet (and a Subject inside it)
+    let outletRow = null, subjectId = null;
+    if (b.outlet) {
+      if (b.parent != null || b.quote != null) bad('Posts in an Outlet are new posts, not replies or quotes!');
+      outletRow = await D.first('SELECT id FROM outlets WHERE slug=?', String(b.outlet));
+      if (!outletRow) bad('We could not find that Outlet!', 404);
+      if (await D.first('SELECT 1 AS x FROM outlet_bans WHERE outlet_id=? AND user_id=?', outletRow.id, user.id)) bad('You cannot post in this Outlet!', 403);
+      if (b.subject) {
+        const sub = await D.first('SELECT id FROM subjects WHERE outlet_id=? AND slug=?', outletRow.id, String(b.subject));
+        if (!sub) bad('We could not find that Subject!', 404);
+        subjectId = sub.id;
+      }
+    }
+    const r = await D.run('INSERT INTO posts(user_id,body,parent_id,created) VALUES(?,?,?,?)', user.id, body, parent, Date.now());
+    const id = r.meta.last_row_id;
+    const stmts = topicsIn(body).map((t) => D.stmt('INSERT OR IGNORE INTO post_topics(post_id,topic) VALUES(?,?)', id, t));
+    if (quote) stmts.push(D.stmt("INSERT INTO refs(post_id,target_id,kind) VALUES(?,?,'quote')", id, quote));
+    if (!parent && ['following', 'mentioned'].includes(b.replies)) stmts.push(D.stmt('INSERT INTO reply_policy(post_id,policy) VALUES(?,?)', id, b.replies));
+    if (cw) stmts.push(D.stmt('INSERT INTO post_cw(post_id,text) VALUES(?,?)', id, cw));
+    if (outletRow) {
+      stmts.push(D.stmt('INSERT INTO outlet_posts(post_id,outlet_id,subject_id) VALUES(?,?,?)', id, outletRow.id, subjectId));
+      stmts.push(D.stmt("INSERT OR IGNORE INTO outlet_members(outlet_id,user_id,role,joined) VALUES(?,?,'member',?)", outletRow.id, user.id, Date.now()));
+    }
+    if (poll) {
+      stmts.push(D.stmt('INSERT INTO polls(post_id,ends) VALUES(?,?)', id, poll.ends));
+      poll.opts.forEach((o, i) => stmts.push(D.stmt('INSERT INTO poll_options(post_id,idx,label) VALUES(?,?,?)', id, i, o)));
+    }
+    mine.forEach((f) => stmts.push(D.stmt('UPDATE attachments SET post_id=?, alt=? WHERE id=? AND user_id=? AND post_id IS NULL', id, f.alt, f.id, user.id)));
+    if (stmts.length) await D.batch(stmts);
+    // tell the right people
+    const told = new Set([user.id]);
+    const tell = async (uid, kind) => { if (uid && !told.has(uid)) { told.add(uid); await notify(D, uid, user.id, kind, id); } };
+    await tell(parentAuthor, 'reply');
+    await tell(quoteAuthor, 'quote');
+    const names = mentionsIn(body);
+    if (names.length) {
+      const found = await D.all(`SELECT id FROM users WHERE username IN (${ph(names.length)})`, ...names);
+      for (const f of found) if (!(await blockedBetween(D, user.id, f.id))) await tell(f.id, 'mention');
+    }
+  return await onePost(env, D, user, id);
+}
+
+// the posts people scheduled go out here (a Cloudflare cron runs this every minute, and signing in checks too)
+async function runDue(env) {
+  const D = db(env);
+  const due = await D.all('SELECT id, user_id, payload FROM scheduled WHERE at<=? ORDER BY at LIMIT 20', Date.now());
+  for (const s of due) {
+    const c = await D.run('DELETE FROM scheduled WHERE id=?', s.id);
+    if (!c.meta.changes) continue;
+    try {
+      const u = await D.first('SELECT id, username FROM users WHERE id=?', s.user_id);
+      if (!u || (await D.first('SELECT 1 AS x FROM bans WHERE user_id=?', u.id))) continue;
+      await createPost(env, D, { id: u.id, username: u.username, kind: 'web' }, JSON.parse(s.payload));
+    } catch (e) {
+      console.error('scheduled post failed', e);
+    }
+  }
+}
+async function tokenHash(req) {
+  const a = req.headers.get('authorization') || '';
+  if (a.startsWith('Bearer ')) return sha256(a.slice(7).trim());
+  const m = /(?:^|;\s*)sid=([a-f0-9]{64})/.exec(req.headers.get('cookie') || '');
+  return m ? sha256(m[1]) : '';
+}
+const BADGES = ['verified', 'staff', 'supporter'];
+
 async function route(req, env, url) {
   const D = db(env);
   const method = req.method;
@@ -443,7 +584,9 @@ async function route(req, env, url) {
     const unread = (await D.first('SELECT COUNT(*) AS n FROM notifications WHERE user_id=? AND read=0', user.id)).n;
     const dmUnread = (await D.first('SELECT COUNT(*) AS n FROM dms WHERE recipient_id=? AND read=0', user.id)).n;
     const st = await settingsOf(D, user.id);
-    return json({ user: { ...row, display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, admin: isAdmin(env, user), avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
+    await runDue(env);
+    const filters = (await D.all('SELECT word FROM word_filters WHERE user_id=?', user.id)).map((r) => r.word);
+    return json({ user: { ...row, filters, display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, admin: isAdmin(env, user), avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
   }
   if (seg[0] === 'me' && !seg[1] && method === 'PATCH') {
     need();
@@ -533,90 +676,7 @@ async function route(req, env, url) {
     await rate(D, 'post:' + user.id, 10, 60);
     await rate(D, 'postday:' + user.id, 250, 86400);
     const b = await readJson(req, 12000);
-    const body = cleanBody(b.body);
-    if ([...body].length > MAX_POST) bad('Posts are up to ' + MAX_POST + ' characters!');
-    const cw = cleanLine(b.cw, 80);
-    const files = Array.isArray(b.files) ? b.files.slice(0, 4) : [];
-    const pollIn = b.poll && typeof b.poll === 'object' ? b.poll : null;
-    if (!body && !files.length && !pollIn) bad('Write something first!');
-    let parent = null, quote = null, parentAuthor = null, quoteAuthor = null;
-    if (b.parent != null) {
-      const pid = intParam(b.parent);
-      const p = pid && (await D.first('SELECT id, user_id, parent_id FROM posts WHERE id=?', pid));
-      if (!p) bad('We could not find the post you are replying to!', 404);
-      parent = p.parent_id || p.id;
-      const lk = await D.first('SELECT op.locked, op.outlet_id FROM outlet_posts op WHERE op.post_id=?', parent);
-      if (lk) {
-        if (await D.first('SELECT 1 AS x FROM outlet_bans WHERE outlet_id=? AND user_id=?', lk.outlet_id, user.id)) bad('You cannot post in this Outlet!', 403);
-        if (lk.locked && !isMod(await outletRole(D, lk.outlet_id, user.id))) bad('This thread is locked!', 403);
-      }
-      parentAuthor = p.parent_id ? (await D.first('SELECT user_id FROM posts WHERE id=?', p.parent_id)).user_id : p.user_id;
-      if (await blockedBetween(D, user.id, parentAuthor)) bad('You cannot reply to this person!', 403);
-    }
-    if (b.quote != null) {
-      if (parent) bad('A reply cannot also be a quote!');
-      const qid = intParam(b.quote);
-      const t = qid && (await D.first('SELECT p.id, p.user_id, r.kind FROM posts p LEFT JOIN refs r ON r.post_id=p.id WHERE p.id=?', qid));
-      if (!t || t.kind === 'repost') bad('We could not find the post you are quoting!', 404);
-      if (!body) bad('Add a few words to your quote!');
-      if (await blockedBetween(D, user.id, t.user_id)) bad('You cannot quote this person!', 403);
-      quote = t.id;
-      quoteAuthor = t.user_id;
-    }
-    let poll = null;
-    if (pollIn) {
-      if (parent) bad('Polls go in new posts, not replies!');
-      const opts = (Array.isArray(pollIn.options) ? pollIn.options : []).map((o) => cleanLine(o, 40)).filter(Boolean);
-      if (opts.length < 2 || opts.length > 4 || new Set(opts.map((o) => o.toLowerCase())).size !== opts.length) bad('A poll needs 2 to 4 different choices!');
-      const hours = [1, 6, 24, 72, 168].includes(pollIn.hours) ? pollIn.hours : 24;
-      poll = { opts, ends: Date.now() + hours * 3600000 };
-    }
-    const mine = [];
-    for (const f of files) {
-      const fid = intParam(f && f.id);
-      const a = fid && (await D.first('SELECT id FROM attachments WHERE id=? AND user_id=? AND post_id IS NULL', fid, user.id));
-      if (!a) bad('One of the files is not there any more. Add it again!');
-      mine.push({ id: fid, alt: cleanLine(f.alt, 200) });
-    }
-    // a new post can go into an Outlet (and a Subject inside it)
-    let outletRow = null, subjectId = null;
-    if (b.outlet) {
-      if (b.parent != null || b.quote != null) bad('Posts in an Outlet are new posts, not replies or quotes!');
-      outletRow = await D.first('SELECT id FROM outlets WHERE slug=?', String(b.outlet));
-      if (!outletRow) bad('We could not find that Outlet!', 404);
-      if (await D.first('SELECT 1 AS x FROM outlet_bans WHERE outlet_id=? AND user_id=?', outletRow.id, user.id)) bad('You cannot post in this Outlet!', 403);
-      if (b.subject) {
-        const sub = await D.first('SELECT id FROM subjects WHERE outlet_id=? AND slug=?', outletRow.id, String(b.subject));
-        if (!sub) bad('We could not find that Subject!', 404);
-        subjectId = sub.id;
-      }
-    }
-    const r = await D.run('INSERT INTO posts(user_id,body,parent_id,created) VALUES(?,?,?,?)', user.id, body, parent, Date.now());
-    const id = r.meta.last_row_id;
-    const stmts = topicsIn(body).map((t) => D.stmt('INSERT OR IGNORE INTO post_topics(post_id,topic) VALUES(?,?)', id, t));
-    if (quote) stmts.push(D.stmt("INSERT INTO refs(post_id,target_id,kind) VALUES(?,?,'quote')", id, quote));
-    if (cw) stmts.push(D.stmt('INSERT INTO post_cw(post_id,text) VALUES(?,?)', id, cw));
-    if (outletRow) {
-      stmts.push(D.stmt('INSERT INTO outlet_posts(post_id,outlet_id,subject_id) VALUES(?,?,?)', id, outletRow.id, subjectId));
-      stmts.push(D.stmt("INSERT OR IGNORE INTO outlet_members(outlet_id,user_id,role,joined) VALUES(?,?,'member',?)", outletRow.id, user.id, Date.now()));
-    }
-    if (poll) {
-      stmts.push(D.stmt('INSERT INTO polls(post_id,ends) VALUES(?,?)', id, poll.ends));
-      poll.opts.forEach((o, i) => stmts.push(D.stmt('INSERT INTO poll_options(post_id,idx,label) VALUES(?,?,?)', id, i, o)));
-    }
-    mine.forEach((f) => stmts.push(D.stmt('UPDATE attachments SET post_id=?, alt=? WHERE id=? AND user_id=? AND post_id IS NULL', id, f.alt, f.id, user.id)));
-    if (stmts.length) await D.batch(stmts);
-    // tell the right people
-    const told = new Set([user.id]);
-    const tell = async (uid, kind) => { if (uid && !told.has(uid)) { told.add(uid); await notify(D, uid, user.id, kind, id); } };
-    await tell(parentAuthor, 'reply');
-    await tell(quoteAuthor, 'quote');
-    const names = mentionsIn(body);
-    if (names.length) {
-      const found = await D.all(`SELECT id FROM users WHERE username IN (${ph(names.length)})`, ...names);
-      for (const f of found) if (!(await blockedBetween(D, user.id, f.id))) await tell(f.id, 'mention');
-    }
-    return json({ post: await onePost(env, D, user, id) });
+    return json({ post: await createPost(env, D, user, b) });
   }
   if (seg[0] === 'posts' && seg[1] && !seg[2] && method === 'GET') {
     const id = intParam(seg[1]);
@@ -649,7 +709,11 @@ async function route(req, env, url) {
     const hasFiles = (await D.first('SELECT 1 AS x FROM attachments WHERE post_id=?', id)) || (await D.first('SELECT 1 AS x FROM polls WHERE post_id=?', id));
     if (!body && !hasFiles) bad('Write something first!');
     if ([...body].length > MAX_POST) bad('Posts are up to ' + MAX_POST + ' characters!');
+    const oldRow = await D.first('SELECT body FROM posts WHERE id=?', id);
+    const prevEdit = await D.first('SELECT edited FROM edits WHERE post_id=?', id);
+    const nextV = (await D.first('SELECT COUNT(*) AS n FROM post_versions WHERE post_id=?', id)).n + 1;
     await D.batch([
+      D.stmt('INSERT INTO post_versions(post_id,v,body,created) VALUES(?,?,?,?)', id, nextV, oldRow.body, prevEdit ? prevEdit.edited : p.created),
       D.stmt('UPDATE posts SET body=? WHERE id=?', body, id),
       D.stmt('DELETE FROM post_topics WHERE post_id=?', id),
       ...topicsIn(body).map((t) => D.stmt('INSERT OR IGNORE INTO post_topics(post_id,topic) VALUES(?,?)', id, t)),
@@ -657,6 +721,13 @@ async function route(req, env, url) {
       ...(b.cw === undefined ? [] : cleanLine(b.cw, 80) ? [D.stmt('INSERT INTO post_cw(post_id,text) VALUES(?,?) ON CONFLICT(post_id) DO UPDATE SET text=excluded.text', id, cleanLine(b.cw, 80))] : [D.stmt('DELETE FROM post_cw WHERE post_id=?', id)]),
     ]);
     return json({ post: await onePost(env, D, user, id) });
+  }
+  if (seg[0] === 'posts' && seg[1] && seg[2] === 'history' && method === 'GET') {
+    const id = intParam(seg[1]);
+    const cur = id && (await D.first('SELECT p.body, p.created, (SELECT edited FROM edits WHERE post_id=p.id) AS edited FROM posts p WHERE p.id=?', id));
+    if (!cur) bad('We could not find that post!', 404);
+    const old = await D.all('SELECT body, created FROM post_versions WHERE post_id=? ORDER BY v', id);
+    return json({ versions: [...old, { body: cur.body, created: cur.edited || cur.created, current: true }] });
   }
   if (seg[0] === 'posts' && seg[1] && seg[2] === 'likes' && method === 'GET') {
     const id = intParam(seg[1]);
@@ -670,7 +741,27 @@ async function route(req, env, url) {
     const target = id && (await D.first('SELECT p.id, p.user_id, p.parent_id, r.kind FROM posts p LEFT JOIN refs r ON r.post_id=p.id WHERE p.id=?', id));
     if (!target) bad('We could not find that post!', 404);
     const act = seg[2];
-    if (['like', 'repost', 'bookmark', 'vote', 'pin', 'report'].includes(act)) await rate(D, 'act:' + user.id, 120, 60);
+    if (['like', 'repost', 'bookmark', 'vote', 'pin', 'report', 'react', 'folder'].includes(act)) await rate(D, 'act:' + user.id, 120, 60);
+    if (act === 'react') {
+      const b = await readJson(req, 300);
+      if (!REACTIONS.includes(b.emoji)) bad('Pick one of the reaction emoji!');
+      if (await blockedBetween(D, user.id, target.user_id)) bad('You cannot interact with this person!', 403);
+      const had = await D.first('SELECT emoji FROM reactions WHERE post_id=? AND user_id=?', id, user.id);
+      if (had && had.emoji === b.emoji) await D.run('DELETE FROM reactions WHERE post_id=? AND user_id=?', id, user.id);
+      else await D.run('INSERT INTO reactions(post_id,user_id,emoji) VALUES(?,?,?) ON CONFLICT(post_id,user_id) DO UPDATE SET emoji=excluded.emoji', id, user.id, b.emoji);
+      const counts = {};
+      (await D.all('SELECT emoji, COUNT(*) n FROM reactions WHERE post_id=? GROUP BY emoji', id)).forEach((r) => (counts[r.emoji] = r.n));
+      return json({ reactions: counts, myReaction: had && had.emoji === b.emoji ? null : b.emoji });
+    }
+    if (act === 'folder') {
+      const b = await readJson(req, 300);
+      const fid = b.folder === null || b.folder === undefined ? null : intParam(b.folder);
+      if (fid !== null && !(await D.first('SELECT 1 AS x FROM bookmark_folders WHERE id=? AND user_id=?', fid, user.id))) bad('We could not find that folder!', 404);
+      await D.run('INSERT OR IGNORE INTO bookmarks(user_id,post_id,created) VALUES(?,?,?)', user.id, id, Date.now());
+      if (fid === null) await D.run('DELETE FROM bookmark_folder_items WHERE user_id=? AND post_id=?', user.id, id);
+      else await D.run('INSERT INTO bookmark_folder_items(user_id,post_id,folder_id) VALUES(?,?,?) ON CONFLICT(user_id,post_id) DO UPDATE SET folder_id=excluded.folder_id', user.id, id, fid);
+      return json({ bookmarked: true, folder: fid });
+    }
     if (act === 'like') {
       if (await blockedBetween(D, user.id, target.user_id)) bad('You cannot interact with this person!', 403);
       const had = await D.first('SELECT 1 AS x FROM likes WHERE post_id=? AND user_id=?', id, user.id);
@@ -680,7 +771,7 @@ async function route(req, env, url) {
     }
     if (act === 'bookmark') {
       const had = await D.first('SELECT 1 AS x FROM bookmarks WHERE post_id=? AND user_id=?', id, user.id);
-      if (had) await D.run('DELETE FROM bookmarks WHERE post_id=? AND user_id=?', id, user.id);
+      if (had) await D.batch([D.stmt('DELETE FROM bookmarks WHERE post_id=? AND user_id=?', id, user.id), D.stmt('DELETE FROM bookmark_folder_items WHERE post_id=? AND user_id=?', id, user.id)]);
       else await D.run('INSERT INTO bookmarks(user_id,post_id,created) VALUES(?,?,?)', user.id, id, Date.now());
       return json({ bookmarked: !had });
     }
@@ -820,7 +911,11 @@ async function route(req, env, url) {
   if (seg[0] === 'bookmarks' && method === 'GET') {
     need();
     const before = intParam(url.searchParams.get('before'));
-    const rows = await D.all(`SELECT post_id, created FROM bookmarks WHERE user_id=? ${before ? 'AND created < ?' : ''} ORDER BY created DESC LIMIT 25`, user.id, ...(before ? [before] : []));
+    const folder = url.searchParams.get('folder');
+    let fcond = '', fargs = [];
+    if (folder === 'none') { fcond = 'AND post_id NOT IN (SELECT post_id FROM bookmark_folder_items WHERE user_id=?)'; fargs = [user.id]; }
+    else if (intParam(folder)) { fcond = 'AND post_id IN (SELECT post_id FROM bookmark_folder_items WHERE user_id=? AND folder_id=?)'; fargs = [user.id, intParam(folder)]; }
+    const rows = await D.all(`SELECT post_id, created FROM bookmarks WHERE user_id=? ${fcond} ${before ? 'AND created < ?' : ''} ORDER BY created DESC LIMIT 25`, user.id, ...fargs, ...(before ? [before] : []));
     if (!rows.length) return json({ posts: [], more: false, cursor: null });
     const got = await listPosts(env, D, user, `p.id IN (${ph(rows.length)})`, rows.map((r) => r.post_id), { limit: 40 });
     const order = new Map(rows.map((r, i) => [r.post_id, i]));
@@ -900,6 +995,9 @@ async function route(req, env, url) {
         isFollowing: user ? !!(await D.first('SELECT 1 AS x FROM follows WHERE follower=? AND followee=?', user.id, u.id)) : false,
         followsYou: user ? !!(await D.first('SELECT 1 AS x FROM follows WHERE follower=? AND followee=?', u.id, user.id)) : false,
         muted: !!rel && rel.kind === 'mute', blocked: !!rel && rel.kind === 'block',
+        badge: ((await D.first('SELECT kind FROM badges WHERE user_id=?', u.id)) || {}).kind || null,
+        fields: await D.all('SELECT label, value FROM profile_fields WHERE user_id=? ORDER BY idx', u.id),
+        hasNote: user ? !!(await D.first('SELECT 1 AS x FROM user_notes WHERE user_id=? AND target_id=?', user.id, u.id)) : false,
         pinned: pr && pr.pinned ? await onePost(env, D, user, pr.pinned) : null,
       },
     });
@@ -1023,6 +1121,138 @@ async function route(req, env, url) {
   }
 
   // --- direct messages
+
+  // ---------- version 5 ----------
+  if (seg[0] === 'me' && seg[1] === 'filters') {
+    need();
+    if (method === 'GET' && !seg[2]) return json({ filters: (await D.all('SELECT word FROM word_filters WHERE user_id=? ORDER BY word', user.id)).map((r) => r.word) });
+    if (method === 'POST' && !seg[2]) {
+      const b = await readJson(req, 500);
+      const w = cleanLine(b.word, 40).toLowerCase();
+      if (!w) bad('Type a word or phrase to mute!');
+      if ((await D.first('SELECT COUNT(*) AS n FROM word_filters WHERE user_id=?', user.id)).n >= 100) bad('You can mute up to 100 words!');
+      await D.run('INSERT OR IGNORE INTO word_filters(user_id,word) VALUES(?,?)', user.id, w);
+      return json({ ok: true, word: w });
+    }
+    if (method === 'DELETE' && seg[2]) { await D.run('DELETE FROM word_filters WHERE user_id=? AND word=?', user.id, seg[2].toLowerCase()); return json({ ok: true }); }
+  }
+  if (seg[0] === 'me' && seg[1] === 'fields' && method === 'POST') {
+    need();
+    const b = await readJson(req, 3000);
+    const list = (Array.isArray(b.fields) ? b.fields : []).slice(0, 4).map((f) => ({ label: cleanLine(f && f.label, 20), value: cleanLine(f && f.value, 100) })).filter((f) => f.label && f.value);
+    await D.batch([D.stmt('DELETE FROM profile_fields WHERE user_id=?', user.id), ...list.map((f, i) => D.stmt('INSERT INTO profile_fields(user_id,idx,label,value) VALUES(?,?,?,?)', user.id, i, f.label, f.value))]);
+    return json({ ok: true, fields: list });
+  }
+  if (seg[0] === 'me' && seg[1] === 'sessions') {
+    need();
+    const cur = await tokenHash(req);
+    if (method === 'GET' && !seg[2]) {
+      const rows = await D.all('SELECT hash, kind, name, created, expires FROM sessions WHERE user_id=? AND (expires IS NULL OR expires>?) ORDER BY created DESC LIMIT 50', user.id, Date.now());
+      return json({ sessions: rows.map((r) => ({ id: r.hash.slice(0, 12), kind: r.kind, name: r.name, created: r.created, expires: r.expires, current: r.hash === cur })) });
+    }
+    if (method === 'POST' && seg[2] === 'others') { await D.run('DELETE FROM sessions WHERE user_id=? AND hash != ?', user.id, cur); return json({ ok: true }); }
+    if (method === 'DELETE' && seg[2] && /^[a-f0-9]{12}$/.test(seg[2])) { await D.run('DELETE FROM sessions WHERE user_id=? AND substr(hash,1,12)=? AND hash != ?', user.id, seg[2], cur); return json({ ok: true }); }
+  }
+  if (seg[0] === 'me' && seg[1] === 'stats' && method === 'GET') {
+    need();
+    const n = async (sql, ...a) => (await D.first(sql, ...a)).n;
+    const since = Date.now() - 14 * 864e5;
+    const days = await D.all("SELECT strftime('%Y-%m-%d', created/1000, 'unixepoch') AS d, COUNT(*) AS n FROM posts WHERE user_id=? AND created>? GROUP BY d", user.id, since);
+    const topRows = await D.all('SELECT p.id, (SELECT COUNT(*) FROM likes WHERE post_id=p.id) + (SELECT COUNT(*) FROM reactions WHERE post_id=p.id) AS score FROM posts p WHERE p.user_id=? AND p.parent_id IS NULL AND p.id NOT IN (SELECT post_id FROM refs) ORDER BY score DESC, p.id DESC LIMIT 3', user.id);
+    const top = topRows.length && topRows[0].score > 0 ? (await listPosts(env, D, user, `p.id IN (${ph(topRows.length)})`, topRows.map((r) => r.id), { limit: 3 })).posts : [];
+    const rank = new Map(topRows.map((r, i) => [r.id, i]));
+    top.sort((a, b) => rank.get(a.id) - rank.get(b.id));
+    return json({
+      posts: await n('SELECT COUNT(*) AS n FROM posts WHERE user_id=? AND parent_id IS NULL AND id NOT IN (SELECT post_id FROM refs WHERE kind=\'repost\')', user.id),
+      replies: await n('SELECT COUNT(*) AS n FROM posts WHERE user_id=? AND parent_id IS NOT NULL', user.id),
+      likesGot: await n('SELECT COUNT(*) AS n FROM likes l JOIN posts p ON p.id=l.post_id WHERE p.user_id=?', user.id),
+      reactionsGot: await n('SELECT COUNT(*) AS n FROM reactions r JOIN posts p ON p.id=r.post_id WHERE p.user_id=?', user.id),
+      repostsGot: await n("SELECT COUNT(*) AS n FROM refs r JOIN posts p ON p.id=r.target_id WHERE r.kind='repost' AND p.user_id=?", user.id),
+      repliesGot: await n('SELECT COUNT(*) AS n FROM posts c JOIN posts p ON p.id=c.parent_id WHERE p.user_id=? AND c.user_id != ?', user.id, user.id),
+      followers: await n('SELECT COUNT(*) AS n FROM follows WHERE followee=?', user.id),
+      following: await n('SELECT COUNT(*) AS n FROM follows WHERE follower=?', user.id),
+      days: days, top: top,
+    });
+  }
+  if (seg[0] === 'users' && seg[1] && seg[2] === 'note') {
+    need();
+    const u = await D.first('SELECT id FROM users WHERE username=?', seg[1]);
+    if (!u) bad('We could not find that person!', 404);
+    if (method === 'GET') return json({ note: ((await D.first('SELECT note FROM user_notes WHERE user_id=? AND target_id=?', user.id, u.id)) || {}).note || '' });
+    if (method === 'POST') {
+      const b = await readJson(req, 1500);
+      const note = String(b.note || '').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, '').trim().slice(0, 500);
+      if (note) await D.run('INSERT INTO user_notes(user_id,target_id,note) VALUES(?,?,?) ON CONFLICT(user_id,target_id) DO UPDATE SET note=excluded.note', user.id, u.id, note);
+      else await D.run('DELETE FROM user_notes WHERE user_id=? AND target_id=?', user.id, u.id);
+      return json({ ok: true });
+    }
+  }
+  if (seg[0] === 'bookmark-folders') {
+    need();
+    if (method === 'GET' && !seg[1]) {
+      const rows = await D.all('SELECT f.id, f.name, (SELECT COUNT(*) FROM bookmark_folder_items i WHERE i.folder_id=f.id) AS n FROM bookmark_folders f WHERE f.user_id=? ORDER BY f.name', user.id);
+      return json({ folders: rows });
+    }
+    if (method === 'POST' && !seg[1]) {
+      const b = await readJson(req, 500);
+      const name = cleanLine(b.name, 30);
+      if (!name) bad('Give the folder a name!');
+      if ((await D.first('SELECT COUNT(*) AS n FROM bookmark_folders WHERE user_id=?', user.id)).n >= 30) bad('You can have up to 30 folders!');
+      if (await D.first('SELECT 1 AS x FROM bookmark_folders WHERE user_id=? AND name=? COLLATE NOCASE', user.id, name)) bad('You already have a folder with that name!', 409);
+      const r = await D.run('INSERT INTO bookmark_folders(user_id,name) VALUES(?,?)', user.id, name);
+      return json({ folder: { id: r.meta.last_row_id, name: name, n: 0 } });
+    }
+    if (method === 'DELETE' && seg[1]) {
+      const id = intParam(seg[1]);
+      await D.batch([D.stmt('DELETE FROM bookmark_folder_items WHERE folder_id=? AND user_id=?', id, user.id), D.stmt('DELETE FROM bookmark_folders WHERE id=? AND user_id=?', id, user.id)]);
+      return json({ ok: true });
+    }
+  }
+  if (seg[0] === 'scheduled') {
+    need();
+    await runDue(env);
+    if (method === 'GET' && !seg[1]) {
+      const rows = await D.all('SELECT id, payload, at FROM scheduled WHERE user_id=? ORDER BY at', user.id);
+      return json({ items: rows.map((r) => { let p = {}; try { p = JSON.parse(r.payload); } catch (e) {} return { id: r.id, at: r.at, body: p.body || '', cw: p.cw || '', files: (p.files || []).length, poll: !!p.poll, outlet: p.outlet || null }; }) });
+    }
+    if (method === 'POST' && !seg[1]) {
+      await rate(D, 'sched:' + user.id, 20, 3600);
+      const b = await readJson(req, 12000);
+      const at = Number(b.at);
+      if (!Number.isFinite(at) || at < Date.now() + 55000) bad('Pick a time at least a minute from now!');
+      if (at > Date.now() + 30 * 864e5) bad('You can schedule up to 30 days ahead!');
+      const body = cleanBody(b.body);
+      if ([...body].length > MAX_POST) bad('Posts are up to ' + MAX_POST + ' characters!');
+      const files = Array.isArray(b.files) ? b.files.slice(0, 4) : [];
+      if (!body && !files.length && !b.poll) bad('Write something first!');
+      if (b.parent != null || b.quote != null) bad('Only new posts can be scheduled!');
+      if ((await D.first('SELECT COUNT(*) AS n FROM scheduled WHERE user_id=?', user.id)).n >= 20) bad('You can have up to 20 scheduled posts!');
+      const payload = { body, cw: cleanLine(b.cw, 80), files: files.map((f) => ({ id: intParam(f && f.id), alt: cleanLine(f && f.alt, 200) })), poll: b.poll && typeof b.poll === 'object' ? b.poll : undefined, outlet: b.outlet ? String(b.outlet) : undefined, subject: b.subject ? String(b.subject) : undefined, replies: b.replies };
+      const r = await D.run('INSERT INTO scheduled(user_id,payload,at,created) VALUES(?,?,?,?)', user.id, JSON.stringify(payload), at, Date.now());
+      return json({ ok: true, id: r.meta.last_row_id, at: at });
+    }
+    if (method === 'DELETE' && seg[1]) { await D.run('DELETE FROM scheduled WHERE id=? AND user_id=?', intParam(seg[1]), user.id); return json({ ok: true }); }
+  }
+  if (seg[0] === 'trending' && method === 'GET') {
+    const since = Date.now() - 864e5;
+    const topics = await D.all('SELECT pt.topic AS topic, COUNT(DISTINCT p.user_id) AS people, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? AND p.id NOT IN (SELECT post_id FROM outlet_posts) GROUP BY pt.topic ORDER BY people DESC, n DESC, pt.topic LIMIT 10', since);
+    const rows = await D.all('SELECT p.id, (SELECT COUNT(*) FROM likes WHERE post_id=p.id) + (SELECT COUNT(*) FROM reactions WHERE post_id=p.id) + 2*(SELECT COUNT(*) FROM refs WHERE target_id=p.id) + (SELECT COUNT(*) FROM posts c WHERE c.parent_id=p.id) AS score FROM posts p WHERE p.parent_id IS NULL AND p.created>? AND p.id NOT IN (SELECT post_id FROM refs) AND p.id NOT IN (SELECT post_id FROM outlet_posts) ORDER BY score DESC, p.id DESC LIMIT 5', since);
+    const hot = rows.filter((r) => r.score > 0);
+    const posts = hot.length ? (await listPosts(env, D, user, `p.id IN (${ph(hot.length)})`, hot.map((r) => r.id), { limit: 5 })).posts : [];
+    const rank = new Map(hot.map((r, i) => [r.id, i]));
+    posts.sort((a, b) => rank.get(a.id) - rank.get(b.id));
+    return json({ topics: topics, posts: posts });
+  }
+  if (seg[0] === 'mention' && method === 'GET') {
+    const q = String(url.searchParams.get('q') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 30);
+    if (!q) return json({ users: [] });
+    const me2 = user ? user.id : 0;
+    const rows = await D.all(`SELECT x.username, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar FROM users x LEFT JOIN profiles pr ON pr.user_id=x.id WHERE x.username LIKE ? ESCAPE '\\' ORDER BY (x.id IN (SELECT followee FROM follows WHERE follower=?)) DESC, length(x.username), x.username LIMIT 6`, q.replace(/[%_\\]/g, '\\$&') + '%', me2);
+    return json({ users: rows });
+  }
+  if (seg[0] === 'announcements' && method === 'GET') {
+    return json({ items: await D.all('SELECT id, text, created FROM announcements WHERE ends IS NULL OR ends>? ORDER BY id DESC LIMIT 3', Date.now()) });
+  }
   if (seg[0] === 'dm') {
     need();
     const peerRow = async (name) => {
@@ -1324,6 +1554,27 @@ async function route(req, env, url) {
       return json({ ok: true });
     }
     if (seg[1] === 'users' && seg[2] && seg[3] === 'unban' && method === 'POST') { await D.run('DELETE FROM bans WHERE user_id=(SELECT id FROM users WHERE username=?)', seg[2]); return json({ ok: true }); }
+    if (seg[1] === 'badges' && method === 'POST') {
+      const b = await readJson(req, 500);
+      const u = await D.first('SELECT id FROM users WHERE username=?', String(b.username || ''));
+      if (!u) bad('We could not find that person!', 404);
+      if (!b.kind) await D.run('DELETE FROM badges WHERE user_id=?', u.id);
+      else {
+        if (!BADGES.includes(b.kind)) bad('Pick verified, staff or supporter!');
+        await D.run('INSERT INTO badges(user_id,kind) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET kind=excluded.kind', u.id, b.kind);
+      }
+      return json({ ok: true });
+    }
+    if (seg[1] === 'announcements' && method === 'GET') return json({ items: await D.all('SELECT id, text, created, ends FROM announcements ORDER BY id DESC LIMIT 20') });
+    if (seg[1] === 'announcements' && !seg[2] && method === 'POST') {
+      const b = await readJson(req, 1500);
+      const text = cleanLine(b.text, 280);
+      if (!text) bad('Write the announcement first!');
+      const days = Math.min(90, Math.max(0, parseInt(b.days, 10) || 0));
+      const r = await D.run('INSERT INTO announcements(text,created,ends) VALUES(?,?,?)', text, Date.now(), days ? Date.now() + days * 864e5 : null);
+      return json({ ok: true, id: r.meta.last_row_id });
+    }
+    if (seg[1] === 'announcements' && seg[2] && method === 'DELETE') { await D.run('DELETE FROM announcements WHERE id=?', intParam(seg[2])); return json({ ok: true }); }
     if (seg[1] === 'bans' && method === 'GET') return json({ bans: await D.all('SELECT u.username, b.reason, b.created FROM bans b JOIN users u ON u.id=b.user_id ORDER BY b.created DESC') });
   }
 
@@ -1331,6 +1582,9 @@ async function route(req, env, url) {
 }
 
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(ensureSchema(env).then(() => runDue(env)));
+  },
   async fetch(req, env) {
     const url = new URL(req.url);
     try {
