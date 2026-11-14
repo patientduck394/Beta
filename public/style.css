@@ -500,3 +500,35 @@ a.tile:hover { border-color: var(--lime-d); }
 .slugrow { display: flex; align-items: center; gap: 8px; }
 .slugrow input { flex: 1; }
 .icardside .irules { margin: 4px 0; }
+
+/* ---------- spacing rhythm: every stack of cards, paragraphs and rows gets a real gap ---------- */
+#side { display: flex; flex-direction: column; gap: 16px; }
+#side > * { margin: 0; }
+#side .foot { margin: 0 4px; }
+main .card + .card, .layout > div > .card + .card { margin-top: 16px; }
+.card > :first-child { margin-top: 0; }
+.card > :last-child { margin-bottom: 0; }
+.card p { margin: 0 0 12px; }
+.card p:last-child { margin-bottom: 0; }
+.card h2, .card h3 { margin: 0 0 12px; }
+.side { padding: 18px 20px; }
+.side p + p, .side h2 + p { margin-top: 0; }
+.icardside, .osb { display: flex; flex-direction: column; gap: 12px; }
+.icardside > *, .osb > * { margin: 0; }
+.osb ul.olist { margin: 0; }
+.irules summary { cursor: pointer; padding: 2px 0; }
+.irules .vbody { margin-top: 8px; }
+.compose { margin-bottom: 16px; padding: 14px 16px; gap: 12px; }
+.tabs { margin-bottom: 16px; gap: 8px; }
+.acts { gap: 8px; }
+.post { gap: 14px; padding: 14px 16px; }
+.layout { gap: 24px; padding: 22px 16px 56px; }
+.row2, .pbtns, .subs, .folderbar { gap: 10px; }
+.formcard > * + * { margin-top: 10px; }
+.formcard label { display: block; margin-top: 10px; }
+.side .foot kbd { margin: 0 3px; }
+.card.icardside > p, .card.osb > p, .card.icardside > h2, .card.osb > h2, .card.icardside > details { margin: 0; }
+.compose .row { flex-wrap: wrap; row-gap: 10px; }
+.compose .tools { flex-wrap: wrap; min-width: 0; }
+.compose textarea { margin: 0; display: block; width: 100%; }
+@media (max-width: 560px) { .compose .row { justify-content: flex-start; } .compose .row > .btn { margin-left: auto; } }
