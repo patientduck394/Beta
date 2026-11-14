@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -171,7 +171,7 @@ const DDL = [
   "CREATE TABLE IF NOT EXISTS saved_searches (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, q TEXT NOT NULL, created INTEGER NOT NULL)",
   "CREATE INDEX IF NOT EXISTS saved_searches_user ON saved_searches(user_id)",
   // version 9: instances (every instance is its own community at slug.beta.radii-office.com; the main one is id 1)
-  "CREATE TABLE IF NOT EXISTS instances (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', reg TEXT NOT NULL DEFAULT 'open', invite_code TEXT NOT NULL DEFAULT '', owner_id INTEGER, listed INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS instances (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', reg TEXT NOT NULL DEFAULT 'open', invite_code TEXT NOT NULL DEFAULT '', owner_id INTEGER, listed INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL, theme TEXT NOT NULL DEFAULT '')",
 ];
 let schemaReady = null;
 function ensureSchema(env) {
@@ -191,6 +191,9 @@ function ensureSchema(env) {
         try { await env.DB.prepare(`SELECT inst FROM ${t} LIMIT 1`).first(); }
         catch (e) { await env.DB.prepare(`ALTER TABLE ${t} ADD COLUMN inst INTEGER NOT NULL DEFAULT 1`).run(); }
       }
+      // version 10: an instance can have a theme (JSON: id, accent, title, icon)
+      try { await env.DB.prepare('SELECT theme FROM instances LIMIT 1').first(); }
+      catch (e) { await env.DB.prepare("ALTER TABLE instances ADD COLUMN theme TEXT NOT NULL DEFAULT ''").run(); }
       await env.DB.batch([
         env.DB.prepare('CREATE INDEX IF NOT EXISTS users_inst ON users(inst)'),
         env.DB.prepare('CREATE INDEX IF NOT EXISTS outlets_inst ON outlets(inst)'),
@@ -553,7 +556,27 @@ function instUrl(env, url, slug) {
   if (isLocalHost(host)) return slug === 'main' ? 'http://localhost' + port : 'http://' + slug + '.localhost' + port;
   return slug === 'main' ? 'https://' + baseDomain(env) : 'https://' + slug + '.' + baseDomain(env);
 }
-const instPublic = (r, env, url) => ({ id: r.id, slug: r.slug, name: r.name, description: r.description, rules: r.rules, reg: r.reg, listed: !!r.listed, isMain: r.id === 1, created: r.created, url: instUrl(env, url, r.slug) });
+const THEME_IDS = ['default', 'ocean', 'sunset', 'grape', 'rose', 'slate', 'mono', 'custom'];
+function themeOf(raw) {
+  try { const t = JSON.parse(raw || ''); if (t && THEME_IDS.includes(t.id) && t.id !== 'default') return t; } catch (e) {}
+  return { id: 'default' };
+}
+// checks a theme the admin sent: a built-in id, or custom with a #rrggbb accent, a short title and an emoji or an uploaded picture
+function cleanTheme(b, old) {
+  if (!b || typeof b !== 'object' || !THEME_IDS.includes(b.id)) bad('Pick one of the themes!');
+  if (b.id === 'default') return { id: 'default' };
+  if (b.id !== 'custom') return { id: b.id };
+  const accent = String(b.accent || '').trim().toLowerCase();
+  if (!/^#[0-9a-f]{6}$/.test(accent)) bad('Pick an accent color!');
+  const title = cleanLine(b.title, 24).replace(/[<>&"]/g, '');
+  let icon = String(b.icon || '').trim();
+  if (icon && !/^\/api\/files\/\d+$/.test(icon)) {
+    icon = [...icon].slice(0, 4).join('');
+    if (/[\u0000-\u007f]/.test(icon.replace(/[\u0000-\u001f]/g, '')) && !/\p{Extended_Pictographic}/u.test(icon)) bad('Use one emoji, or upload a picture, for the icon!');
+  }
+  return { id: 'custom', accent, title, icon };
+}
+const instPublic = (r, env, url) => ({ id: r.id, slug: r.slug, name: r.name, description: r.description, rules: r.rules, reg: r.reg, listed: !!r.listed, isMain: r.id === 1, created: r.created, theme: themeOf(r.theme), url: instUrl(env, url, r.slug) });
 
 // the posts people scheduled go out here (a Cloudflare cron runs this every minute, and signing in checks too)
 async function runDue(env) {
@@ -1280,17 +1303,37 @@ async function route(req, env, url) {
     }
     if (reg === 'invite' && (!code || b.regen_invite)) code = genCode();
     const listed = b.listed === undefined || inst.id === 1 ? inst.listed : b.listed ? 1 : 0;
-    await D.run('UPDATE instances SET name=?, description=?, rules=?, reg=?, invite_code=?, listed=? WHERE id=?', name, description, rules, reg, code, listed, inst.id);
+    const oldTheme = themeOf(inst.theme);
+    let theme = oldTheme;
+    if (b.theme !== undefined) theme = cleanTheme(b.theme, oldTheme);
+    await D.run('UPDATE instances SET name=?, description=?, rules=?, reg=?, invite_code=?, listed=?, theme=? WHERE id=?', name, description, rules, reg, code, listed, theme.id === 'default' ? '' : JSON.stringify(theme), inst.id);
+    const oldIcon = /^\/api\/files\/(\d+)$/.exec(oldTheme.icon || '');
+    if (oldIcon && theme.icon !== oldTheme.icon) await D.batch([D.stmt("DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE id=? AND name='insticon')", +oldIcon[1]), D.stmt("DELETE FROM attachments WHERE id=? AND name='insticon'", +oldIcon[1])]);
     return json({ ok: true, inviteCode: code });
+  }
+  if (seg[0] === 'instance' && seg[1] === 'icon' && method === 'POST') {
+    need();
+    if (!(isAdmin(env, user) || inst.owner_id === user.id)) bad("Only this instance's owner can change it!", 403);
+    await rate(D, 'insticon:' + user.id, 10, 3600);
+    const bytes = new Uint8Array(await req.arrayBuffer());
+    const mime = sniffImage(bytes);
+    if (!mime || mime === 'image/gif') bad('Use a PNG, JPEG or WebP picture!');
+    if (bytes.length > 300 * 1024) bad('That picture is too big. It needs to be under 300 KB!', 413);
+    const r = await D.run("INSERT INTO attachments(user_id,post_id,name,mime,size,created) VALUES(?,0,'insticon',?,?,?)", user.id, mime, bytes.length, Date.now());
+    const fid = r.meta.last_row_id;
+    const stmts = [];
+    for (let i = 0, n = 0; i < bytes.length; i += CHUNK, n++) stmts.push(D.stmt('INSERT INTO attachment_chunks(attachment_id,idx,data) VALUES(?,?,?)', fid, n, toB64(bytes.subarray(i, i + CHUNK))));
+    await D.batch(stmts);
+    return json({ icon: '/api/files/' + fid });
   }
   if (seg[0] === 'instances' && !seg[1] && method === 'GET') {
     const q = cleanLine(url.searchParams.get('q'), 40).replace(/[\\%_]/g, '\\$&');
     const like = '%' + q + '%';
-    const rows = await D.all(`SELECT i.id, i.slug, i.name, i.description, i.reg, i.created, (SELECT COUNT(*) FROM users u WHERE u.inst=i.id) AS members,
+    const rows = await D.all(`SELECT i.id, i.slug, i.name, i.description, i.reg, i.created, i.theme, (SELECT COUNT(*) FROM users u WHERE u.inst=i.id) AS members,
         (SELECT COUNT(*) FROM posts p JOIN users u ON u.id=p.user_id WHERE u.inst=i.id AND p.parent_id IS NULL) AS posts
       FROM instances i WHERE (i.listed=1 OR i.id=1)${q ? " AND (i.name LIKE ? ESCAPE '\\' OR i.slug LIKE ? ESCAPE '\\' OR i.description LIKE ? ESCAPE '\\')" : ''}
       ORDER BY (i.id=1) DESC, members DESC, i.id DESC LIMIT 100`, ...(q ? [like, like, like] : []));
-    return json({ instances: rows.map((r) => ({ slug: r.slug, name: r.name, description: r.description, reg: r.reg, members: r.members, posts: r.posts, created: r.created, isMain: r.id === 1, url: instUrl(env, url, r.slug) })), here: inst.slug, mainUrl: instUrl(env, url, 'main') });
+    return json({ instances: rows.map((r) => ({ theme: themeOf(r.theme), slug: r.slug, name: r.name, description: r.description, reg: r.reg, members: r.members, posts: r.posts, created: r.created, isMain: r.id === 1, url: instUrl(env, url, r.slug) })), here: inst.slug, mainUrl: instUrl(env, url, 'main') });
   }
   if (seg[0] === 'instances' && !seg[1] && method === 'POST') {
     await rate(D, 'inst:' + ip, 3, 86400);

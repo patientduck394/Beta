@@ -72,7 +72,14 @@
   };
   const link = (href, ...kids) => h('a', { href, 'data-link': true }, ...kids);
   const params = () => new URLSearchParams(location.search);
-  const setTitle = (t) => (document.title = (t ? t + ' · ' : '') + (inst.isMain ? 'Beta' : inst.name + ' · Beta'));
+  const setTitle = (t) => { const bt = window.BetaTheme && window.BetaTheme.title(); return (document.title = (t ? t + ' · ' : '') + (inst.isMain ? bt || 'Beta' : inst.name + ' · ' + (bt || 'Beta'))); };
+  // the instance's theme: colors, icon (favicon and top-left) and title. It is kept in this browser so the next visit paints right away.
+  function applyInstTheme() {
+    const t = inst.theme && inst.theme.id !== 'default' ? inst.theme : null;
+    try { if (t) localStorage.setItem('beta_inst_theme', JSON.stringify(t)); else localStorage.removeItem('beta_inst_theme'); } catch (e) {}
+    if (window.BetaTheme) window.BetaTheme.apply(t);
+    drawBrand();
+  }
   const errBox = () => h('div', { class: 'err', role: 'alert' });
   const guard = (box, fn) => async (e) => {
     e && e.preventDefault && e.preventDefault();
@@ -866,15 +873,15 @@
     const tabParam = params().get('tab');
     // before you log in, the main Beta is a front door: pick where to join
     if (!me && !tabParam && inst.isMain) return landingPage();
-    const tab = tabParam || (me ? 'home' : 'local');
+    const tab = ['home', 'local', 'all'].includes(tabParam) ? tabParam : 'local';
     const query = tab === 'home' && me ? { scope: 'home' } : tab === 'local' ? { scope: 'local' } : {};
     const f = feed('/feed', query, { empty: tab === 'home' ? 'Your home feed is empty. Follow people and Topics, or look at the Local and Federated timelines!' : 'No posts yet. Be the first!' });
     const banner = h('button', { class: 'btn newposts', type: 'button', hidden: true, onclick: () => render() }, 'New posts, show them!');
-    const onTab = (k, label, title) => h('a', { href: k === 'home' ? '/' : '/?tab=' + k, 'data-link': true, class: tab === k ? 'on' : '', title }, label);
+    const onTab = (k, label, title) => h('a', { href: k === 'local' ? '/' : '/?tab=' + k, 'data-link': true, class: tab === k ? 'on' : '', title }, label);
     show(
       !me ? instanceHero() : null,
       me ? composer({ onPosted: (p) => { f.add(p); toast('Posted!'); drawSide(); } }) : null,
-      h('div', { class: 'tabs' }, me ? onTab('home', 'Following', 'People and Topics you follow') : null, onTab('local', inst.isMain ? 'Local' : 'Local', 'Everyone on ' + inst.name), onTab('all', 'Federated', 'Every instance together')),
+      h('div', { class: 'tabs' }, onTab('local', 'Local', 'Everyone on ' + inst.name), me ? onTab('home', 'Following', 'People and Topics you follow') : null, onTab('all', 'Federated', 'Every instance together')),
       banner, f);
     await f.ready;
     timers.push(setInterval(async () => {
@@ -889,7 +896,7 @@
   const REG_WORDS = { open: 'Open sign-up', invite: 'Invite only', closed: 'Not accepting members' };
   function drawBrand() {
     const b = document.querySelector('.brand span');
-    if (b) put(b, 'Beta', inst.isMain ? null : h('small', { class: 'instname' }, inst.name));
+    if (b) put(b, (window.BetaTheme && window.BetaTheme.title()) || 'Beta', inst.isMain ? null : h('small', { class: 'instname' }, inst.name));
   }
   function noInstancePage() {
     setTitle('No such instance');
@@ -898,10 +905,14 @@
     return h('div', { class: 'card empty' }, h('h1', null, 'There is no Beta instance here!'), h('p', null, 'Nobody has made an instance at this address yet. It could be yours!'),
       h('p', null, h('a', { class: 'btn', href: main + '/instances/new' }, 'Make an instance'), ' ', h('a', { class: 'btn ghost', href: main + '/instances' }, 'See every instance')));
   }
+  function themeDot(i) {
+    const r = i.theme && window.BetaTheme ? window.BetaTheme.resolve(i.theme) : null;
+    return r && r.icon ? h('img', { class: 'ithemeic', src: r.icon, alt: '', width: 22, height: 22 }) : null;
+  }
   function instanceCard(i, opts = {}) {
     const here = i.slug === inst.slug;
     return h('article', { class: 'icard' + (i.isMain ? ' main' : '') + (here ? ' here' : '') },
-      h('div', { class: 'ihead' }, h('h3', null, i.name), i.isMain ? h('span', { class: 'chip small' }, 'Main') : null, here ? h('span', { class: 'chip small' }, 'You are here') : null),
+      h('div', { class: 'ihead' }, themeDot(i), h('h3', null, i.name), i.isMain ? h('span', { class: 'chip small' }, 'Main') : null, here ? h('span', { class: 'chip small' }, 'You are here') : null),
       h('p', { class: 'idesc' }, i.description || (i.isMain ? 'The original Beta instance. Everyone is welcome!' : 'A Beta community.')),
       h('div', { class: 'imeta small muted' }, i.members + (i.members === 1 ? ' member' : ' members') + ' · ' + i.posts + (i.posts === 1 ? ' post' : ' posts') + ' · ' + REG_WORDS[i.reg]),
       h('div', { class: 'row2' }, i.reg === 'closed' ? null : h('a', { class: 'btn small', href: i.url + '/register' }, 'Join'), h('a', { class: 'btn ghost small', href: i.url + '/?tab=local' }, 'Look around'),
@@ -995,19 +1006,38 @@
     const reg = h('select', { id: 'sg', disabled: i.isMain }, [['open', 'Open: anyone can join'], ['invite', 'Invite only: people need a code'], ['closed', 'Closed: nobody new for now']].map(([v, l]) => h('option', { value: v, selected: i.reg === v }, l)));
     const listed = h('input', { type: 'checkbox', id: 'sl', checked: i.listed, disabled: i.isMain });
     const code = h('div', { class: 'codebox' });
+    const BT = window.BetaTheme;
+    let th = { id: 'default', accent: '#0ea5e9', title: '', icon: '', ...(i.theme || {}) };
+    const picker = h('div', { class: 'themepick', role: 'radiogroup', 'aria-label': 'Theme' });
+    const custom = h('div', { class: 'themecustom' });
+    const preview = () => { if (BT) BT.apply(th.id === 'default' ? null : th); drawBrand(); setTitle('Instance settings'); };
+    const drawThemes = () => {
+      put(picker, [...Object.keys(BT.BUILTIN), 'custom'].map((id) => {
+        const b = BT.BUILTIN[id], r = id === 'custom' ? BT.resolve({ id: 'custom', accent: th.accent, icon: th.icon }) : id === 'default' ? null : BT.resolve({ id });
+        const sw = id === 'default' ? h('img', { src: '/logo.png', alt: '', width: 28, height: 28 }) : r && r.icon ? h('img', { src: r.icon, alt: '', width: 28, height: 28 }) : h('span', { class: 'dotc', style: 'background:' + th.accent });
+        return h('button', { type: 'button', role: 'radio', 'aria-checked': String(th.id === id), class: 'themeopt' + (th.id === id ? ' on' : ''), onclick: () => { th = { ...th, id }; drawThemes(); preview(); } }, sw, h('span', null, id === 'custom' ? 'Custom' : b.name));
+      }));
+      const accent = h('input', { type: 'color', id: 'tac', value: th.accent || '#0ea5e9', oninput: () => { th.accent = accent.value; preview(); } });
+      const title = h('input', { id: 'tti', maxlength: 24, placeholder: 'Beta', value: th.title || '', oninput: () => { th.title = title.value; preview(); } });
+      const emoji = h('input', { id: 'tem', maxlength: 8, placeholder: 'An emoji, like 🌻', value: /^\/api\//.test(th.icon || '') ? '' : th.icon || '', oninput: () => { th.icon = emoji.value.trim(); preview(); } });
+      const up = h('button', { class: 'btn ghost small', type: 'button', onclick: () => { const inp = h('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp', hidden: true, onchange: safe(async () => { const f = inp.files[0]; inp.remove(); if (!f) return; const blob = await iconBlob(f); const x = await api('/instance/icon', { method: 'POST', raw: true, body: blob, headers: { 'content-type': 'application/octet-stream' } }); th.icon = x.icon; drawThemes(); preview(); toast('Icon ready, press Save!'); }) }); document.body.append(inp); inp.click(); } }, 'Upload a picture');
+      put(custom, th.id === 'custom' ? [h('label', { for: 'tac' }, 'Accent color'), accent, h('label', { for: 'tti' }, 'Title (top-left and the tab, up to 24 letters)'), title, h('label', { for: 'tem' }, 'Icon (favicon and top-left)'), h('div', { class: 'row2' }, emoji, up, th.icon ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => { th.icon = ''; drawThemes(); preview(); } }, 'Use the Beta icon') : null)] : null);
+    };
+    drawThemes();
     const drawCode = (c) => put(code, c ? h('p', null, 'Invite code: ', h('code', null, c), ' ', h('button', { class: 'btn ghost small', type: 'button', onclick: async () => { try { await navigator.clipboard.writeText(i.url + '/register?invite=' + c); toast('Invite link copied!'); } catch (e) { prompt('Copy this invite link:', i.url + '/register?invite=' + c); } } }, 'Copy invite link'), ' ',
       h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { const x = await api('/instance', { method: 'PATCH', body: { regen_invite: true } }); drawCode(x.inviteCode); toast('New code!'); }) }, 'Make a new code')) : null);
     drawCode(i.reg === 'invite' ? i.inviteCode : '');
     show(h('form', { class: 'card formcard wide', onsubmit: guard(err, async () => {
-      const x = await api('/instance', { method: 'PATCH', body: { name: name.value, description: desc.value, rules: rules.value, ...(i.isMain ? {} : { reg: reg.value, listed: listed.checked }) } });
+      const x = await api('/instance', { method: 'PATCH', body: { name: name.value, description: desc.value, rules: rules.value, ...(i.isMain ? {} : { reg: reg.value, listed: listed.checked }), theme: th.id === 'custom' ? { id: 'custom', accent: th.accent, title: th.title, icon: th.icon } : { id: th.id } } });
       drawCode(!i.isMain && reg.value === 'invite' ? x.inviteCode : '');
-      inst = { ...inst, name: name.value, description: desc.value, rules: rules.value, reg: i.isMain ? inst.reg : reg.value };
-      drawBrand(); toast('Saved!');
+      inst = { ...inst, name: name.value, description: desc.value, rules: rules.value, reg: i.isMain ? inst.reg : reg.value, theme: th.id === 'custom' ? { id: 'custom', accent: th.accent, title: th.title, icon: th.icon } : { id: th.id } };
+      applyInstTheme(); toast('Saved!');
     }) },
       h('h1', null, 'Instance settings'), h('p', { class: 'muted' }, h('b', null, i.url.replace(/^https?:\/\//, '')), ' · ' + i.members + ' members · ' + i.posts + ' posts'),
       h('label', { for: 'sn' }, 'Name'), name, h('label', { for: 'sd' }, 'Description'), desc, h('label', { for: 'sr' }, 'House rules'), rules,
       h('label', { for: 'sg' }, 'Sign-up'), reg, i.isMain ? h('p', { class: 'muted small' }, 'The main instance follows the site-wide sign-up switches in Admin.') : null, code,
       i.isMain ? null : h('label', { class: 'checkrow', for: 'sl' }, listed, h('span', null, h('b', null, 'Show in the instance directory'), h('div', { class: 'muted small' }, 'Turn off to keep it unlisted. People with the address can still join.'))),
+      h('h2', null, 'Theme'), h('p', { class: 'muted small' }, 'Colors, icon and title for everyone who visits this instance. The default is the plain Beta look!'), picker, custom,
       err, h('p', null, h('button', { class: 'btn', type: 'submit' }, 'Save'))));
   }
   function instCard() {
@@ -1747,6 +1777,18 @@
     if (d === 'compact') document.documentElement.setAttribute('data-density', 'compact'); else document.documentElement.removeAttribute('data-density');
   }
   // a square, small copy of the picked picture for the profile picture
+  async function iconBlob(file) {
+    const url = await readDataUrl(file);
+    const img = await new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = no; i.src = url; });
+    const side2 = Math.min(img.width, img.height);
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    c.getContext('2d').drawImage(img, (img.width - side2) / 2, (img.height - side2) / 2, side2, side2, 0, 0, 128, 128);
+    const toBlob = (type, q) => new Promise((ok) => c.toBlob(ok, type, q));
+    let b = await toBlob('image/png');
+    if (!b) b = await toBlob('image/jpeg', 0.9);
+    return b;
+  }
   async function avatarBlob(file) {
     const url = await readDataUrl(file);
     const img = await new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = no; i.src = url; });
@@ -1817,7 +1859,7 @@
   });
 
   applyPrefs();
-  api('/instance').then((r) => { inst = r.instance; instInfo = r; }).catch((e) => { if (e.status === 404) noInstance = true; }).then(() => api('/me')).then((r) => { me = r.user; }).catch(() => {}).then(() => {
+  api('/instance').then((r) => { inst = r.instance; instInfo = r; applyInstTheme(); }).catch((e) => { if (e.status === 404) noInstance = true; }).then(() => api('/me')).then((r) => { me = r.user; }).catch(() => {}).then(() => {
     drawBrand();
     drawNav();
     render();
