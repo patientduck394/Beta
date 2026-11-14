@@ -640,14 +640,15 @@ function instUrl(env, url, slug) {
 }
 const THEME_IDS = ['default', 'ocean', 'sunset', 'grape', 'rose', 'slate', 'mono', 'custom'];
 function themeOf(raw) {
-  try { const t = JSON.parse(raw || ''); if (t && THEME_IDS.includes(t.id) && t.id !== 'default') return t; } catch (e) {}
+  try { const t = JSON.parse(raw || ''); if (t && THEME_IDS.includes(t.id) && (t.id !== 'default' || t.nobadge)) return t; } catch (e) {}
   return { id: 'default' };
 }
 // checks a theme the admin sent: a built-in id, or custom with a #rrggbb accent, a short title and an emoji or an uploaded picture
 function cleanTheme(b, old) {
   if (!b || typeof b !== 'object' || !THEME_IDS.includes(b.id)) bad('Pick one of the themes!');
-  if (b.id === 'default') return { id: 'default' };
-  if (b.id !== 'custom') return { id: b.id };
+  const nb = b.nobadge ? { nobadge: true } : {};
+  if (b.id === 'default') return { id: 'default', ...nb };
+  if (b.id !== 'custom') return { id: b.id, ...nb };
   const accent = String(b.accent || '').trim().toLowerCase();
   if (!/^#[0-9a-f]{6}$/.test(accent)) bad('Pick an accent color!');
   const title = cleanLine(b.title, 24).replace(/[<>&"]/g, '');
@@ -656,7 +657,7 @@ function cleanTheme(b, old) {
     icon = [...icon].slice(0, 4).join('');
     if (/[\u0000-\u007f]/.test(icon.replace(/[\u0000-\u001f]/g, '')) && !/\p{Extended_Pictographic}/u.test(icon)) bad('Use one emoji, or upload a picture, for the icon!');
   }
-  return { id: 'custom', accent, title, icon };
+  return { id: 'custom', accent, title, icon, ...nb };
 }
 const instPublic = (r, env, url) => ({ id: r.id, slug: r.slug, name: r.name, description: r.description, rules: r.rules, reg: r.reg, listed: !!r.listed, isMain: r.id === 1, created: r.created, theme: themeOf(r.theme), url: instUrl(env, url, r.slug) });
 
@@ -1504,7 +1505,7 @@ async function route(req, env, url) {
     const oldTheme = themeOf(inst.theme);
     let theme = oldTheme;
     if (b.theme !== undefined) theme = cleanTheme(b.theme, oldTheme);
-    await D.run('UPDATE instances SET name=?, description=?, rules=?, reg=?, invite_code=?, listed=?, theme=? WHERE id=?', name, description, rules, reg, code, listed, theme.id === 'default' ? '' : JSON.stringify(theme), inst.id);
+    await D.run('UPDATE instances SET name=?, description=?, rules=?, reg=?, invite_code=?, listed=?, theme=? WHERE id=?', name, description, rules, reg, code, listed, theme.id === 'default' && !theme.nobadge ? '' : JSON.stringify(theme), inst.id);
     const oldIcon = /^\/api\/files\/(\d+)$/.exec(oldTheme.icon || '');
     if (oldIcon && theme.icon !== oldTheme.icon) await D.batch([D.stmt("DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE id=? AND name='insticon')", +oldIcon[1]), D.stmt("DELETE FROM attachments WHERE id=? AND name='insticon'", +oldIcon[1])]);
     return json({ ok: true, inviteCode: code });

@@ -76,6 +76,7 @@
   // the instance's theme: colors, icon (favicon and top-left) and title. It is kept in this browser so the next visit paints right away.
   function applyInstTheme() {
     const t = inst.theme && inst.theme.id !== 'default' ? inst.theme : null;
+    document.body.classList.toggle('nobadge', !!(inst.theme && inst.theme.nobadge));
     try { if (t) localStorage.setItem('beta_inst_theme', JSON.stringify(t)); else localStorage.removeItem('beta_inst_theme'); } catch (e) {}
     if (window.BetaTheme) window.BetaTheme.apply(t);
     drawBrand();
@@ -940,7 +941,7 @@
   const REG_WORDS = { open: 'Open sign-up', invite: 'Invite only', closed: 'Not accepting members' };
   function drawBrand() {
     const b = document.querySelector('.brand span');
-    if (b) put(b, (window.BetaTheme && window.BetaTheme.title()) || 'Beta', inst.isMain ? null : h('small', { class: 'instname' }, inst.name));
+    if (b) put(b, (window.BetaTheme && window.BetaTheme.title()) || 'Beta', inst.isMain || (inst.theme && inst.theme.nobadge) ? null : h('small', { class: 'instname' }, inst.name));
   }
   function noInstancePage() {
     setTitle('No such instance');
@@ -1072,9 +1073,9 @@
       h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { const x = await api('/instance', { method: 'PATCH', body: { regen_invite: true } }); drawCode(x.inviteCode); toast('New code!'); }) }, 'Make a new code')) : null);
     drawCode(i.reg === 'invite' ? i.inviteCode : '');
     show(h('form', { class: 'card formcard wide', onsubmit: guard(err, async () => {
-      const x = await api('/instance', { method: 'PATCH', body: { name: name.value, description: desc.value, rules: rules.value, ...(i.isMain ? {} : { reg: reg.value, listed: listed.checked }), theme: th.id === 'custom' ? { id: 'custom', accent: th.accent, title: th.title, icon: th.icon } : { id: th.id } } });
+      const x = await api('/instance', { method: 'PATCH', body: { name: name.value, description: desc.value, rules: rules.value, ...(i.isMain ? {} : { reg: reg.value, listed: listed.checked }), theme: { ...(th.id === 'custom' ? { id: 'custom', accent: th.accent, title: th.title, icon: th.icon } : { id: th.id }), ...(th.nobadge ? { nobadge: true } : {}) } } });
       drawCode(!i.isMain && reg.value === 'invite' ? x.inviteCode : '');
-      inst = { ...inst, name: name.value, description: desc.value, rules: rules.value, reg: i.isMain ? inst.reg : reg.value, theme: th.id === 'custom' ? { id: 'custom', accent: th.accent, title: th.title, icon: th.icon } : { id: th.id } };
+      inst = { ...inst, name: name.value, description: desc.value, rules: rules.value, reg: i.isMain ? inst.reg : reg.value, theme: { ...(th.id === 'custom' ? { id: 'custom', accent: th.accent, title: th.title, icon: th.icon } : { id: th.id }), ...(th.nobadge ? { nobadge: true } : {}) } };
       applyInstTheme(); toast('Saved!');
     }) },
       h('h1', null, 'Instance settings'), h('p', { class: 'muted' }, h('b', null, i.url.replace(/^https?:\/\//, '')), ' · ' + i.members + ' members · ' + i.posts + ' posts'),
@@ -1082,6 +1083,7 @@
       h('label', { for: 'sg' }, 'Sign-up'), reg, i.isMain ? h('p', { class: 'muted small' }, 'The main instance follows the site-wide sign-up switches in Admin.') : null, code,
       i.isMain ? null : h('label', { class: 'checkrow', for: 'sl' }, listed, h('span', null, h('b', null, 'Show in the instance directory'), h('div', { class: 'muted small' }, 'Turn off to keep it unlisted. People with the address can still join.'))),
       h('h2', null, 'Theme'), h('p', { class: 'muted small' }, 'Colors, icon and title for everyone who visits this instance. The default is the plain Beta look!'), picker, custom,
+      i.isMain ? null : h('label', { class: 'checkrow' }, h('input', { type: 'checkbox', id: 'sbd', checked: !th.nobadge, onchange: (e) => { th.nobadge = !e.target.checked; inst = { ...inst, theme: { ...(inst.theme || { id: 'default' }), nobadge: th.nobadge } }; drawBrand(); } }), ' Show the little instance name badge next to the logo'),
       err, h('p', null, h('button', { class: 'btn', type: 'submit' }, 'Save'))));
   }
   function instCard() {
