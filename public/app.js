@@ -205,7 +205,7 @@
           h('a', { href: '/stats', 'data-link': true }, 'Your stats'),
           h('a', { href: '/lists', 'data-link': true }, 'Lists'),
           h('a', { href: '/settings', 'data-link': true }, 'Settings'),
-          me.admin || me.mod ? h('a', { href: '/admin', 'data-link': true }, me.admin ? 'Admin' : 'Moderation') : null,
+          me.admin || me.iadmin || me.mod ? h('a', { href: '/admin', 'data-link': true }, me.admin || me.iadmin ? 'Admin' : 'Moderation') : null,
           h('button', { type: 'button', onclick: () => shortcuts() }, 'Keyboard shortcuts'),
           h('button', { type: 'button', onclick: safe(async () => { await api('/logout', { method: 'POST' }); me = null; drawNav(); go('/'); }) }, 'Log out')));
       nav.append(
@@ -1543,21 +1543,27 @@
   }
 
   async function adminPage() {
-    if (!me || !(me.admin || me.mod)) return show(h('div', { class: 'card empty' }, h('h2', null, 'Admins only'), link('/', 'Back to Beta')));
-    setTitle(me.admin ? 'Admin' : 'Moderation');
+    if (!me || !(me.admin || me.iadmin || me.mod)) return show(h('div', { class: 'card empty' }, h('h2', null, 'Admins only'), link('/', 'Back to Beta')));
+    setTitle(me.admin || me.iadmin ? 'Admin' : 'Moderation');
     side.replaceChildren();
     const ALL = [['overview', 'Overview'], ['reports', 'Reports'], ['people', 'People'], ['content', 'Content'], ['outlets', 'Outlets'], ['files', 'Files'], ['invites', 'Invites'], ['instances', 'Instances'], ['site', 'Site'], ['audit', 'Activity log']];
-    const TABS = me.admin ? ALL : ALL.filter((t) => ['overview', 'reports', 'people', 'content', 'audit'].includes(t[0]));
+    const TABS = me.admin ? ALL : me.iadmin ? [['overview', 'Overview'], ['reports', 'Reports'], ['people', 'People'], ['content', 'Content'], ['instance', 'Instance'], ['audit', 'Activity log']] : ALL.filter((t) => ['overview', 'reports', 'people', 'content', 'audit'].includes(t[0]));
     const tab = TABS.some((t) => t[0] === params().get('tab')) ? params().get('tab') : 'overview';
     const tabs = h('div', { class: 'tabs' }, TABS.map(([k, l]) => h('a', { href: '/admin' + (k === 'overview' ? '' : '?tab=' + k), 'data-link': true, class: tab === k ? 'on' : '' }, l)));
     const dismissAll = h('div', { class: 'row2' }, h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { if (!confirm('Dismiss every report?')) return; await api('/admin/reports/dismiss-all', { method: 'POST' }); render(); }) }, 'Dismiss all reports'));
     const body = tab === 'reports' ? [dismissAll, ...(await adminReports())] : tab === 'people' ? [adminPeople()] : tab === 'content' ? [adminContent()] : tab === 'outlets' ? [await adminOutlets()] : tab === 'files' ? [await adminFiles()]
-      : tab === 'invites' ? [await adminInvites()] : tab === 'instances' ? [await adminInstances()] : tab === 'site' ? [await adminSite()] : tab === 'audit' ? [await adminAudit()] : [await adminOverview()];
-    show(h('h1', null, me.admin ? 'Admin' : 'Moderation'), tabs, ...body);
+      : tab === 'instance' ? [adminInstanceTab()] : tab === 'invites' ? [await adminInvites()] : tab === 'instances' ? [await adminInstances()] : tab === 'site' ? [await adminSite()] : tab === 'audit' ? [await adminAudit()] : [await adminOverview()];
+    show(h('h1', null, me.admin || me.iadmin ? 'Admin' : 'Moderation'), me.iadmin ? h('p', { class: 'muted' }, 'You run ', h('b', null, inst.name), '. Everything here is only about this instance!') : null, tabs, ...body);
+  }
+  function adminInstanceTab() {
+    const i = inst, code = instInfo && instInfo.instance ? instInfo.instance.inviteCode : '';
+    return h('div', { class: 'card pad16' }, h('h2', null, i.name), h('p', { class: 'muted' }, REG_WORDS[i.reg] || ''),
+      i.reg === 'invite' && code ? h('p', null, 'Invite code: ', h('code', null, code)) : null,
+      h('p', null, link('/instance/settings', 'Open the instance settings'), h('span', { class: 'muted small' }, ' (name, rules, sign-up, invite code, theme, badge, listing)')));
   }
   async function adminOverview() {
     const s = await api('/admin/stats');
-    const set = await api('/admin/settings');
+    const set = me.iadmin ? { reg_open: true, readonly: false } : await api('/admin/settings');
     const days = (rows) => { const out = []; for (let i = 13; i >= 0; i--) { const k = new Date(Date.now() - i * 864e5).toISOString().slice(0, 10); out.push({ k, n: (rows.find((x) => x.d === k) || {}).n || 0 }); } return out; };
     const chart = (title, rows) => { const d = days(rows); const max = Math.max(1, ...d.map((x) => x.n)); return h('div', { class: 'card pad16' }, h('h2', null, title), h('div', { class: 'bars', role: 'img', 'aria-label': title }, d.map((x) => h('div', { class: 'bar', title: x.k + ': ' + x.n }, h('i', { style: 'height:' + Math.round((x.n / max) * 100) + '%' }), h('span', null, x.k.slice(8)))))); };
     const tile = (n, l, to) => h(to ? 'a' : 'div', to ? { class: 'tile', href: to, 'data-link': true } : { class: 'tile' }, h('b', null, n), h('span', null, l));
@@ -1591,7 +1597,7 @@
         act(u.note ? 'Edit the admin note' : 'Add an admin note', async () => { const note = prompt('A private note about @' + u.username + ' (only admins and moderators see it). Empty removes it:', u.note || ''); if (note === null) return; await post('note', { note }); toast('Saved!'); load(true); }),
         act('Sign out everywhere', async () => { await post('signout'); toast('Signed out everywhere!'); }),
       ];
-      if (me.admin) items.push(
+      if (me.admin || me.iadmin) items.push(
         act('Set a new password', async () => { const pw = prompt('New password for @' + u.username + ' (8 or more characters):'); if (!pw) return; await post('password', { password: pw }); toast('Password changed, and they were signed out!'); }),
         act('Remove all their posts', async () => { if (!confirm('Remove every post by @' + u.username + '?')) return; const r = await post('purge-posts'); toast(r.removed + ' removed!'); load(true); }, 'danger'),
         act('Delete the account', async () => { if (prompt('Type ' + u.username + ' to delete the account for good:') !== u.username) return toast('Cancelled!'); await post('delete'); toast('Deleted!'); load(true); }, 'danger'));

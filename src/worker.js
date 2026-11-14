@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -200,6 +200,9 @@ function ensureSchema(env) {
       // version 10: an instance can have a theme (JSON: id, accent, title, icon)
       try { await env.DB.prepare('SELECT theme FROM instances LIMIT 1').first(); }
       catch (e) { await env.DB.prepare("ALTER TABLE instances ADD COLUMN theme TEXT NOT NULL DEFAULT ''").run(); }
+      // version 13: the activity log remembers which instance an entry belongs to (instance admins see only their own)
+      try { await env.DB.prepare('SELECT inst FROM audit LIMIT 1').first(); }
+      catch (e) { await env.DB.prepare('ALTER TABLE audit ADD COLUMN inst INTEGER NOT NULL DEFAULT 1').run(); }
       // version 12: usernames are unique on each instance (not across all of Beta): rebuild users without the site-wide UNIQUE
       const uSql = ((await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").first()) || {}).sql || '';
       if (uSql && !/UNIQUE\s*\(\s*inst\s*,\s*username/i.test(uSql)) {
@@ -692,6 +695,15 @@ const modAllowed = (seg, method) => {
   if (a === 'users') return !seg[2] ? method === 'GET' : ['ban', 'unban', 'signout', 'warn', 'note'].includes(seg[3]);
   return ['reports', 'posts', 'content'].includes(a);
 };
+// an instance owner can read and act on their own instance's reports, people and posts, nothing site-wide
+const iadminAllowed = (seg, method) => {
+  const a = seg[1];
+  if (['stats', 'audit', 'content', 'bans'].includes(a)) return method === 'GET' && !seg[2];
+  if (a === 'reports') return seg[2] === 'dismiss-all' ? method === 'POST' && !seg[3] : method === 'GET' ? !seg[2] : method === 'POST' && seg[3] === 'dismiss' && !seg[4];
+  if (a === 'posts') return !!seg[2] && ((method === 'GET' && !seg[3]) || (method === 'POST' && seg[3] === 'remove' && !seg[4]));
+  if (a === 'users') return !seg[2] ? method === 'GET' : method === 'POST' && ['ban', 'unban', 'signout', 'password', 'delete', 'purge-posts', 'warn', 'note'].includes(seg[3]) && !seg[4];
+  return false;
+};
 const csvCell = (v) => {
   let t = String(v == null ? '' : v);
   if (/^[=+\-@\t\r]/.test(t)) t = "'" + t;
@@ -805,7 +817,7 @@ async function route(req, env, url) {
     }
     const token = await newSession(D, row.id, 'web');
     const t = await theme(row.id);
-    return json({ user: { username: row.username, bio: row.bio, display_name: t.display_name, color: t.color, unread: 0 } }, 200, { 'set-cookie': cookie(req, token, 2592000) });
+    return json({ user: { username: row.username, bio: row.bio, display_name: t.display_name, color: t.color, unread: 0, admin: isAdmin(env, row), iadmin: inst.id !== 1 && inst.owner_id === row.id } }, 200, { 'set-cookie': cookie(req, token, 2592000) });
   }
   if (seg[0] === 'logout' && method === 'POST') {
     const m = /(?:^|;\s*)sid=([a-f0-9]{64})/.exec(req.headers.get('cookie') || '');
@@ -824,7 +836,7 @@ async function route(req, env, url) {
     const isModer = !!(await D.first('SELECT 1 AS x FROM site_mods WHERE user_id=?', user.id));
     const warnings = await D.all('SELECT id, text, created FROM warnings WHERE user_id=? AND seen=0 ORDER BY id LIMIT 3', user.id);
     const homeInst = await D.first('SELECT slug, name FROM instances WHERE id=(SELECT inst FROM users WHERE id=?)', user.id);
-    return json({ user: { ...row, filters, mod: isModer, warnings, instance: instPublic(inst, env, url), homeSlug: homeInst ? homeInst.slug : 'main', display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, friendsPrivacy: st.friends_privacy, admin: isAdmin(env, user), avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
+    return json({ user: { ...row, filters, mod: isModer, warnings, instance: instPublic(inst, env, url), homeSlug: homeInst ? homeInst.slug : 'main', display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, friendsPrivacy: st.friends_privacy, admin: isAdmin(env, user), iadmin: !isAdmin(env, user) && inst.id !== 1 && inst.owner_id === user.id && user.inst === inst.id, avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
   }
   if (seg[0] === 'me' && !seg[1] && method === 'PATCH') {
     need();
@@ -1990,21 +2002,42 @@ async function route(req, env, url) {
   // --- for the people who run the site: set ADMINS in wrangler.toml
   if (seg[0] === 'admin') {
     need();
-    const role = isAdmin(env, user) ? 'admin' : (await D.first('SELECT 1 AS x FROM site_mods WHERE user_id=?', user.id)) ? 'mod' : null;
+    // an instance owner runs their own instance only (role 'iadmin'): every route below is limited to people and posts of this instance
+    const role = isAdmin(env, user) ? 'admin' : (inst.id !== 1 && inst.owner_id === user.id && user.inst === inst.id) ? 'iadmin' : (await D.first('SELECT 1 AS x FROM site_mods WHERE user_id=?', user.id)) ? 'mod' : null;
     if (!role) bad('Admins only!', 403);
+    const scoped = role === 'iadmin';
+    let ownerName = '';
+    if (scoped) {
+      if (!iadminAllowed(seg, method)) bad('That one is for the site admins only!', 403);
+      // people are named plainly (they live on this instance); name@other points elsewhere, and the owner cannot be touched
+      if (seg[1] === 'users' && seg[2]) {
+        if (String(seg[2]).includes('@')) bad('We could not find that person!', 404);
+        ownerName = ((await D.first('SELECT username FROM users WHERE id=?', inst.owner_id)) || {}).username || '';
+        if (ownerName.toLowerCase() === String(seg[2]).toLowerCase()) bad('That is the instance owner!', 403);
+      }
+    }
+    // does a post belong to someone on this instance?
+    const postHere = async (id) => !scoped || !!(await D.first('SELECT 1 AS x FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=? AND u.inst=?', id, inst.id));
     if (role === 'mod' && !modAllowed(seg, method)) bad('That one is for admins only!', 403);
     // every change an admin makes is written down
-    if (method !== 'GET') await D.run('INSERT INTO audit(admin,action,created) VALUES(?,?,?)', user.username, method + ' ' + seg.slice(1).join('/'), Date.now());
+    if (method !== 'GET') await D.run('INSERT INTO audit(admin,action,created,inst) VALUES(?,?,?,?)', user.username, method + ' ' + seg.slice(1).join('/'), Date.now(), scoped ? inst.id : 1);
     if (seg[1] === 'reports' && !seg[2] && method === 'GET') {
-      const reps = await D.all('SELECT r.id, r.post_id, r.reason, r.created, u.username AS reporter FROM reports r JOIN users u ON u.id=r.reporter_id ORDER BY r.id DESC LIMIT 50');
+      const reps = await D.all(`SELECT r.id, r.post_id, r.reason, r.created, u.username AS reporter FROM reports r JOIN users u ON u.id=r.reporter_id${scoped ? ' JOIN posts rp ON rp.id=r.post_id JOIN users ru ON ru.id=rp.user_id WHERE ru.inst=?' : ''} ORDER BY r.id DESC LIMIT 50`, ...(scoped ? [inst.id] : []));
       if (!reps.length) return json({ items: [] });
       const ids = [...new Set(reps.map((r) => r.post_id))];
       const got = await listPosts(env, D, user, `p.id IN (${ph(ids.length)})`, ids, { limit: 50 });
       const byId = new Map(got.posts.map((p) => [p.kind === 'repost' ? p.target.id : p.id, p]));
       return json({ items: reps.map((r) => ({ ...r, post: byId.get(r.post_id) || null })) });
     }
-    if (seg[1] === 'reports' && seg[2] && seg[3] === 'dismiss' && method === 'POST') { await D.run('DELETE FROM reports WHERE id=?', intParam(seg[2])); return json({ ok: true }); }
-    if (seg[1] === 'posts' && seg[2] && seg[3] === 'remove' && method === 'POST') { await purgePosts(D, [intParam(seg[2])]); return json({ ok: true }); }
+    if (seg[1] === 'reports' && seg[2] && seg[3] === 'dismiss' && method === 'POST') {
+      const rp = scoped && (await D.first('SELECT post_id FROM reports WHERE id=?', intParam(seg[2])));
+      if (scoped && (!rp || !(await postHere(rp.post_id)))) bad('We could not find that report!', 404);
+      await D.run('DELETE FROM reports WHERE id=?', intParam(seg[2])); return json({ ok: true });
+    }
+    if (seg[1] === 'posts' && seg[2] && seg[3] === 'remove' && method === 'POST') {
+      if (!(await postHere(intParam(seg[2])))) bad('We could not find that post!', 404);
+      await purgePosts(D, [intParam(seg[2])]); return json({ ok: true });
+    }
     if (seg[1] === 'users' && seg[2] && seg[3] === 'ban' && method === 'POST') {
       const b = await readJson(req, 1000);
       const u = await userBy(D, inst, seg[2], 'id, username, inst');
@@ -2018,6 +2051,25 @@ async function route(req, env, url) {
       return json({ ok: true });
     }
     if (seg[1] === 'users' && seg[2] && seg[3] === 'unban' && method === 'POST') { await D.batch([D.stmt('DELETE FROM ban_until WHERE user_id=?', ((await userBy(D, inst, seg[2], 'id')) || { id: 0 }).id), D.stmt('DELETE FROM bans WHERE user_id=?', ((await userBy(D, inst, seg[2], 'id')) || { id: 0 }).id)]); return json({ ok: true }); }
+    if (seg[1] === 'stats' && method === 'GET' && scoped) {
+      const n = async (sql, ...a) => (await D.first(sql, ...a)).n;
+      const since = Date.now() - 14 * 864e5, I = inst.id;
+      const day = "strftime('%Y-%m-%d', created/1000, 'unixepoch')";
+      const mine = 'user_id IN (SELECT id FROM users WHERE inst=?)';
+      return json({
+        users: await n('SELECT COUNT(*) AS n FROM users WHERE inst=?', I),
+        posts: await n(`SELECT COUNT(*) AS n FROM posts WHERE parent_id IS NULL AND id NOT IN (SELECT post_id FROM refs WHERE kind='repost') AND ${mine}`, I),
+        replies: await n(`SELECT COUNT(*) AS n FROM posts WHERE parent_id IS NOT NULL AND ${mine}`, I),
+        outlets: await n('SELECT COUNT(*) AS n FROM outlets WHERE inst=?', I),
+        files: 0, bytes: 0,
+        reports: await n('SELECT COUNT(*) AS n FROM reports WHERE post_id IN (SELECT p.id FROM posts p JOIN users u ON u.id=p.user_id WHERE u.inst=?)', I),
+        bans: await n('SELECT COUNT(*) AS n FROM bans WHERE user_id IN (SELECT id FROM users WHERE inst=?)', I),
+        activeToday: await n(`SELECT COUNT(DISTINCT user_id) AS n FROM posts WHERE created>? AND ${mine}`, Date.now() - 864e5, I),
+        signupDays: await D.all(`SELECT ${day} AS d, COUNT(*) AS n FROM users WHERE created>? AND inst=? GROUP BY d`, since, I),
+        postDays: await D.all(`SELECT ${day} AS d, COUNT(*) AS n FROM posts WHERE created>? AND ${mine} GROUP BY d`, since, I),
+        newest: await D.all('SELECT username, created FROM users WHERE inst=? ORDER BY id DESC LIMIT 6', I),
+      });
+    }
     if (seg[1] === 'stats' && method === 'GET') {
       const n = async (sql, ...a) => (await D.first(sql, ...a)).n;
       const since = Date.now() - 14 * 864e5;
@@ -2042,7 +2094,7 @@ async function route(req, env, url) {
       const before = intParam(url.searchParams.get('before'));
       const rows = await D.all(`SELECT u.id, u.username, u.inst, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, u.created, (SELECT COUNT(*) FROM posts WHERE user_id=u.id) AS posts, (SELECT COUNT(*) FROM follows WHERE followee=u.id) AS followers,
         (SELECT kind FROM badges WHERE user_id=u.id) AS badge, (SELECT note FROM admin_notes WHERE user_id=u.id) AS note, (SELECT COUNT(*) FROM site_mods WHERE user_id=u.id) AS is_mod, (SELECT until FROM ban_until WHERE user_id=u.id) AS banned_until, (SELECT reason FROM bans WHERE user_id=u.id) AS banned_reason, (SELECT COUNT(*) FROM bans WHERE user_id=u.id) AS banned,
-        (SELECT MAX(created) FROM sessions WHERE user_id=u.id) AS last_login FROM users u WHERE u.username LIKE ? ESCAPE '\\' ${before ? 'AND u.id < ?' : ''} ORDER BY u.id DESC LIMIT 30`, '%' + q.replace(/[%_\\]/g, '\\$&') + '%', ...(before ? [before] : []));
+        (SELECT MAX(created) FROM sessions WHERE user_id=u.id) AS last_login FROM users u WHERE u.username LIKE ? ESCAPE '\\' ${scoped ? 'AND u.inst=?' : ''} ${before ? 'AND u.id < ?' : ''} ORDER BY u.id DESC LIMIT 30`, '%' + q.replace(/[%_\\]/g, '\\$&') + '%', ...(scoped ? [inst.id] : []), ...(before ? [before] : []));
       return json({ users: rows.map((r) => ({ ...r, banned: !!r.banned, mod: !!r.is_mod, admin: isAdmin(env, r) })), cursor: rows.length === 30 ? rows[rows.length - 1].id : null });
     }
     if (seg[1] === 'users' && seg[2] && ['signout', 'password', 'delete', 'purge-posts'].includes(seg[3]) && method === 'POST') {
@@ -2079,7 +2131,7 @@ async function route(req, env, url) {
       if (list.length) await D.batch(list);
       return json({ ok: true });
     }
-    if (seg[1] === 'audit' && method === 'GET') return json({ items: await D.all('SELECT admin, action, created FROM audit ORDER BY id DESC LIMIT 100') });
+    if (seg[1] === 'audit' && method === 'GET') return json({ items: scoped ? await D.all('SELECT admin, action, created FROM audit WHERE inst=? ORDER BY id DESC LIMIT 100', inst.id) : await D.all('SELECT admin, action, created FROM audit ORDER BY id DESC LIMIT 100') });
     if (seg[1] === 'outlets' && !seg[2] && method === 'GET') {
       return json({ outlets: await D.all('SELECT o.slug, o.name, o.created, (SELECT COUNT(*) FROM outlet_members m WHERE m.outlet_id=o.id) AS members, (SELECT COUNT(*) FROM outlet_posts p WHERE p.outlet_id=o.id) AS posts, (SELECT u.username FROM outlet_members m JOIN users u ON u.id=m.user_id WHERE m.outlet_id=o.id AND m.role=\'owner\' LIMIT 1) AS owner FROM outlets o ORDER BY o.id DESC LIMIT 100') });
     }
@@ -2092,7 +2144,7 @@ async function route(req, env, url) {
     }
     if (seg[1] === 'posts' && seg[2] && !seg[3] && method === 'GET') {
       const id = intParam(seg[2]);
-      const post = id && (await onePost(env, D, user, id));
+      const post = id && (await postHere(id)) && (await onePost(env, D, user, id));
       if (!post) bad('We could not find that post!', 404);
       return json({ post });
     }
@@ -2114,11 +2166,15 @@ async function route(req, env, url) {
       else await D.run('DELETE FROM admin_notes WHERE user_id=?', u.id);
       return json({ ok: true });
     }
-    if (seg[1] === 'reports' && seg[2] === 'dismiss-all' && method === 'POST') { await D.run('DELETE FROM reports'); return json({ ok: true }); }
+    if (seg[1] === 'reports' && seg[2] === 'dismiss-all' && method === 'POST') {
+      if (scoped) await D.run('DELETE FROM reports WHERE post_id IN (SELECT p.id FROM posts p JOIN users u ON u.id=p.user_id WHERE u.inst=?)', inst.id);
+      else await D.run('DELETE FROM reports');
+      return json({ ok: true });
+    }
     if (seg[1] === 'content' && method === 'GET') {
       const q = String(url.searchParams.get('q') || '').trim().slice(0, 60).replace(/[\\%_]/g, '\\$&');
       const before = intParam(url.searchParams.get('before'));
-      const got = await listPosts(env, D, user, "p.id NOT IN (SELECT post_id FROM refs WHERE kind='repost')" + (q ? " AND p.body LIKE ? ESCAPE '\\'" : ''), q ? ['%' + q + '%'] : [], { before, limit: 20 });
+      const got = await listPosts(env, D, user, "p.id NOT IN (SELECT post_id FROM refs WHERE kind='repost')" + (scoped ? ' AND p.user_id IN (SELECT id FROM users WHERE inst=?)' : '') + (q ? " AND p.body LIKE ? ESCAPE '\\'" : ''), [...(scoped ? [inst.id] : []), ...(q ? ['%' + q + '%'] : [])], { before, limit: 20 });
       return json({ posts: got.posts, cursor: got.cursor, more: got.count === 20 });
     }
     if (seg[1] === 'files' && !seg[2] && method === 'GET') {
@@ -2215,7 +2271,7 @@ async function route(req, env, url) {
       return json({ ok: true, id: r.meta.last_row_id });
     }
     if (seg[1] === 'announcements' && seg[2] && method === 'DELETE') { await D.run('DELETE FROM announcements WHERE id=?', intParam(seg[2])); return json({ ok: true }); }
-    if (seg[1] === 'bans' && method === 'GET') return json({ bans: await D.all('SELECT u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, b.reason, b.created FROM bans b JOIN users u ON u.id=b.user_id ORDER BY b.created DESC') });
+    if (seg[1] === 'bans' && method === 'GET') return json({ bans: await D.all(`SELECT u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, b.reason, b.created FROM bans b JOIN users u ON u.id=b.user_id${scoped ? ' WHERE u.inst=?' : ''} ORDER BY b.created DESC`, ...(scoped ? [inst.id] : [])) });
   }
 
   return json({ error: 'There is nothing at that address!' }, 404);
