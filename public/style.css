@@ -543,3 +543,16 @@ main .card + .card, .layout > div > .card + .card { margin-top: 16px; }
 .themecustom { margin-bottom: 14px; }
 .themecustom input[type="color"] { width: 64px; height: 40px; padding: 2px; border-radius: 10px; }
 .ihead .ithemeic { border-radius: 6px; flex: none; }
+
+/* ---- Friends ---- */
+.fbtns { display: inline-flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.fbtns [hidden] { display: none; }
+.urow .fbtns { margin-left: 4px; }
+.friendsonly { padding: 1px 8px; border-radius: 99px; background: var(--lime-l); border: 1px solid var(--lime); color: var(--lime-dd); }
+.friendsonly .ic { width: 13px; height: 13px; }
+.frnote { align-items: flex-start; }
+.frnote .fract { margin-top: 8px; }
+.profile .stats .muted { color: var(--muted); }
+.subpair { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; }
+@media (max-width: 480px) { .tabs { flex-wrap: wrap; } .tabs a { padding: 6px 12px; } }
+.subitem { display: inline-flex; align-items: center; gap: 6px; }

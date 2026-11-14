@@ -1,10 +1,12 @@
 -- Beta database. Safe to run again (every line says IF NOT EXISTS).
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  username TEXT NOT NULL COLLATE NOCASE,
   pw TEXT NOT NULL,
   bio TEXT NOT NULL DEFAULT '',
-  created INTEGER NOT NULL
+  created INTEGER NOT NULL,
+  inst INTEGER NOT NULL DEFAULT 1,
+  UNIQUE (inst, username) -- usernames are unique on each instance (version 12)
 );
 CREATE TABLE IF NOT EXISTS sessions (
   hash TEXT PRIMARY KEY,
@@ -134,3 +136,9 @@ CREATE INDEX IF NOT EXISTS saved_searches_user ON saved_searches(user_id);
 CREATE TABLE IF NOT EXISTS instances (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', reg TEXT NOT NULL DEFAULT 'open', invite_code TEXT NOT NULL DEFAULT '', owner_id INTEGER, listed INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL, theme TEXT NOT NULL DEFAULT '');
 -- version 9 (the Worker also adds users.inst and outlets.inst and the main instance by itself)
 CREATE TABLE IF NOT EXISTS instances (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', reg TEXT NOT NULL DEFAULT 'open', invite_code TEXT NOT NULL DEFAULT '', owner_id INTEGER, listed INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL, theme TEXT NOT NULL DEFAULT '');
+-- version 11 (Friends: mutual friends on top of following, requests, and friends-only posts)
+CREATE TABLE IF NOT EXISTS friends (user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (user_id, friend_id));
+CREATE INDEX IF NOT EXISTS friends_friend ON friends(friend_id);
+CREATE TABLE IF NOT EXISTS friend_requests (from_id INTEGER NOT NULL, to_id INTEGER NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (from_id, to_id));
+CREATE INDEX IF NOT EXISTS friend_requests_to ON friend_requests(to_id, created);
+CREATE TABLE IF NOT EXISTS post_vis (post_id INTEGER PRIMARY KEY, vis TEXT NOT NULL);

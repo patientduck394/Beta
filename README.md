@@ -76,7 +76,7 @@ Profile pictures can be changed from Settings or straight from your profile page
 Beta is made of **instances**: communities that each have their own people, house rules, sign-up policy, Outlets and Local timeline. The main instance is `beta.radii-office.com` (the original Beta, nothing about it changed). Anyone can start another one at **`name.beta.radii-office.com`** from the front page (Start your own instance), and every instance is part of one network:
 
 * **Local** shows only the people on this instance. **Federated** shows every instance together, with a small tag on people from elsewhere. You can follow, like and reply across instances.
-* Usernames are unique across all of Beta. An account lives on the instance where it was made and logs in there.
+* Usernames are unique on each instance, so the same name can exist on two instances. An account lives on the instance where it was made and logs in there. People from another instance show as name@instance.
 * The instance admin (the person who made it) edits the name, description, house rules and sign-up (open, invite-only with a code, or closed) in **Instance settings**, and can unlist it from the directory. Site admins can unlist or delete any instance on the Admin page, Instances tab.
 * The front page of the main instance (before you log in) is a picker: the main instance plus a searchable directory of every listed instance.
 * Instances share one D1 database: `users.inst` and `outlets.inst` say where they belong, and the Worker adds those columns and the main instance by itself the first time it runs.

@@ -76,8 +76,8 @@ async function authUser(D, req) {
     }
   }
   if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
-  const row = await D.first('SELECT u.id, u.username FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.hash=? AND s.kind=? AND (s.expires IS NULL OR s.expires>?)', await sha256(token), kind, Date.now());
-  return row ? { id: row.id, username: row.username, kind } : null;
+  const row = await D.first('SELECT u.id, u.username, u.inst FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.hash=? AND s.kind=? AND (s.expires IS NULL OR s.expires>?)', await sha256(token), kind, Date.now());
+  return row ? { id: row.id, username: row.username, inst: row.inst, kind } : null;
 }
 const cookie = (req, token, maxAge) => `sid=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}` + (new URL(req.url).protocol === 'https:' ? '; Secure' : '');
 
@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 12;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -172,6 +172,12 @@ const DDL = [
   "CREATE INDEX IF NOT EXISTS saved_searches_user ON saved_searches(user_id)",
   // version 9: instances (every instance is its own community at slug.beta.radii-office.com; the main one is id 1)
   "CREATE TABLE IF NOT EXISTS instances (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', reg TEXT NOT NULL DEFAULT 'open', invite_code TEXT NOT NULL DEFAULT '', owner_id INTEGER, listed INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL, theme TEXT NOT NULL DEFAULT '')",
+  // version 11: Friends (mutual, on top of following), and friends-only posts
+  "CREATE TABLE IF NOT EXISTS friends (user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (user_id, friend_id))",
+  "CREATE INDEX IF NOT EXISTS friends_friend ON friends(friend_id)",
+  "CREATE TABLE IF NOT EXISTS friend_requests (from_id INTEGER NOT NULL, to_id INTEGER NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (from_id, to_id))",
+  "CREATE INDEX IF NOT EXISTS friend_requests_to ON friend_requests(to_id, created)",
+  "CREATE TABLE IF NOT EXISTS post_vis (post_id INTEGER PRIMARY KEY, vis TEXT NOT NULL)",
 ];
 let schemaReady = null;
 function ensureSchema(env) {
@@ -194,6 +200,20 @@ function ensureSchema(env) {
       // version 10: an instance can have a theme (JSON: id, accent, title, icon)
       try { await env.DB.prepare('SELECT theme FROM instances LIMIT 1').first(); }
       catch (e) { await env.DB.prepare("ALTER TABLE instances ADD COLUMN theme TEXT NOT NULL DEFAULT ''").run(); }
+      // version 12: usernames are unique on each instance (not across all of Beta): rebuild users without the site-wide UNIQUE
+      const uSql = ((await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").first()) || {}).sql || '';
+      if (uSql && !/UNIQUE\s*\(\s*inst\s*,\s*username/i.test(uSql)) {
+        await env.DB.batch([
+          env.DB.prepare('DROP TABLE IF EXISTS users_new'),
+          env.DB.prepare("CREATE TABLE users_new (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL COLLATE NOCASE, pw TEXT NOT NULL, bio TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, inst INTEGER NOT NULL DEFAULT 1, UNIQUE (inst, username))"),
+          env.DB.prepare('INSERT INTO users_new(id,username,pw,bio,created,inst) SELECT id,username,pw,bio,created,inst FROM users'),
+          // keep the id counter, so a removed person's id is never handed to someone new
+          env.DB.prepare("DELETE FROM sqlite_sequence WHERE name='users_new'"),
+          env.DB.prepare("INSERT INTO sqlite_sequence(name,seq) SELECT 'users_new', seq FROM sqlite_sequence WHERE name='users'"),
+          env.DB.prepare('DROP TABLE users'),
+          env.DB.prepare('ALTER TABLE users_new RENAME TO users'),
+        ]);
+      }
       await env.DB.batch([
         env.DB.prepare('CREATE INDEX IF NOT EXISTS users_inst ON users(inst)'),
         env.DB.prepare('CREATE INDEX IF NOT EXISTS outlets_inst ON outlets(inst)'),
@@ -248,9 +268,9 @@ function sniffImage(b) {
   return null;
 }
 
-const isAdmin = (env, user) => !!user && String(env.ADMINS || '').toLowerCase().split(/[\s,]+/).filter(Boolean).includes(user.username.toLowerCase());
+const isAdmin = (env, user) => !!user && user.inst === 1 && String(env.ADMINS || '').toLowerCase().split(/[\s,]+/).filter(Boolean).includes(user.username.toLowerCase());
 async function settingsOf(D, uid) {
-  const out = { dm: 'all' };
+  const out = { dm: 'all', friends_privacy: 'everyone' };
   (await D.all('SELECT k, v FROM settings WHERE user_id=?', uid)).forEach((r) => (out[r.k] = r.v));
   return out;
 }
@@ -265,6 +285,27 @@ async function outletRole(D, outletId, userId) {
 const isMod = (role) => role === 'owner' || role === 'mod';
 async function blockedBetween(D, a, b) {
   return !!(await D.first("SELECT 1 AS x FROM mutes WHERE kind='block' AND ((user_id=? AND target_id=?) OR (user_id=? AND target_id=?))", a, b, b, a));
+}
+// ---------- Friends: mutual, on top of following. Friends-only posts are seen by the author and their friends ----------
+const isFriends = async (D, a, b) => !!(await D.first('SELECT 1 AS x FROM friends WHERE user_id=? AND friend_id=?', a, b));
+// SQL that keeps friends-only posts away from people who are not the author or one of the author's friends: [clause, params]
+function visSql(user, col = 'p') {
+  const open = `NOT EXISTS (SELECT 1 FROM post_vis pv WHERE pv.post_id=${col}.id)`;
+  if (!user) return [open, []];
+  return [`(${open} OR ${col}.user_id=? OR EXISTS (SELECT 1 FROM friends fr WHERE fr.user_id=? AND fr.friend_id=${col}.user_id))`, [user.id, user.id]];
+}
+async function canSee(D, user, postId) {
+  const [c, a] = visSql(user);
+  return !!(await D.first(`SELECT 1 AS x FROM posts p WHERE p.id=? AND ${c}`, postId, ...a));
+}
+// who may see a person's Friends list: everyone, only their friends, or only them
+async function friendsVisible(D, viewer, ownerId) {
+  if (viewer && viewer.id === ownerId) return true;
+  const st = await D.first("SELECT v FROM settings WHERE user_id=? AND k='friends_privacy'", ownerId);
+  const v = st ? st.v : 'everyone';
+  if (v === 'everyone') return true;
+  if (v === 'friends') return !!viewer && (await isFriends(D, viewer.id, ownerId));
+  return false;
 }
 async function notify(D, userId, actorId, kind, postId) {
   if (!userId || userId === actorId) return;
@@ -284,7 +325,7 @@ const unnotify = (D, userId, actorId, kind, postId) => D.run('DELETE FROM notifi
 const AV = (col) => `(SELECT file_id FROM avatars WHERE user_id=${col}) AS avatar`;
 const BASE = `SELECT p.id, p.body, p.created, p.parent_id, p.user_id, u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug,
   COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, ${AV('p.user_id')},
-  (SELECT text FROM post_cw WHERE post_id=p.id) AS cw, (SELECT kind FROM badges WHERE user_id=p.user_id) AS badge, r.target_id, r.kind AS rkind
+  (SELECT text FROM post_cw WHERE post_id=p.id) AS cw, (SELECT vis FROM post_vis WHERE post_id=p.id) AS vis, (SELECT kind FROM badges WHERE user_id=p.user_id) AS badge, r.target_id, r.kind AS rkind
   FROM posts p JOIN users u ON u.id=p.user_id LEFT JOIN profiles pr ON pr.user_id=p.user_id LEFT JOIN refs r ON r.post_id=p.id`;
 
 async function metrics(env, viewerId, ids) {
@@ -349,11 +390,12 @@ async function hydrate(env, D, user, rows) {
   if (!rows.length) return [];
   const have = new Set(rows.map((r) => r.id));
   const need = [...new Set(rows.filter((r) => r.target_id && !have.has(r.target_id)).map((r) => r.target_id))];
-  const extra = need.length ? await D.all(`${BASE} WHERE p.id IN (${ph(need.length)})`, ...need) : [];
+  const [vc0, va0] = visSql(user);
+  const extra = need.length ? await D.all(`${BASE} WHERE p.id IN (${ph(need.length)}) AND ${vc0}`, ...need, ...va0) : [];
   const all = [...rows, ...extra];
   const ids = [...new Set(all.map((r) => r.id))];
   const M = await metrics(env, user && user.id, ids);
-  const shape = (r) => ({ id: r.id, body: r.body, created: r.created, parent_id: r.parent_id, username: r.username, display_name: r.display_name, color: r.color, avatar: r.avatar, cw: r.cw, badge: r.badge, inst_slug: r.inst_slug, ...M[r.id] });
+  const shape = (r) => ({ id: r.id, body: r.body, created: r.created, parent_id: r.parent_id, username: r.username, display_name: r.display_name, color: r.color, avatar: r.avatar, cw: r.cw, badge: r.badge, inst_slug: r.inst_slug, vis: r.vis || null, ...M[r.id] });
   const by = {};
   all.forEach((r) => (by[r.id] = shape(r)));
   const out = [];
@@ -370,7 +412,8 @@ async function hydrate(env, D, user, rows) {
 }
 
 async function listPosts(env, D, user, where, params, { before, limit = 25, order = 'p.id DESC' } = {}) {
-  const rows = await D.all(`${BASE} WHERE ${where}${before ? ' AND p.id < ?' : ''} ORDER BY ${order} LIMIT ?`, ...params, ...(before ? [before] : []), limit);
+  const [vc, va] = visSql(user);
+  const rows = await D.all(`${BASE} WHERE (${where}) AND ${vc}${before ? ' AND p.id < ?' : ''} ORDER BY ${order} LIMIT ?`, ...params, ...va, ...(before ? [before] : []), limit);
   return { posts: await hydrate(env, D, user, rows), cursor: rows.length ? rows[rows.length - 1].id : null, count: rows.length };
 }
 const onePost = async (env, D, user, id) => (await listPosts(env, D, user, 'p.id=?', [id], { limit: 1 })).posts[0];
@@ -391,7 +434,7 @@ async function purgePosts(D, startIds) {
     const del = (t, col = 'post_id') => D.stmt(`DELETE FROM ${t} WHERE ${col} IN (${P})`, ...part);
     await D.batch([
       D.stmt(`DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE post_id IN (${P}))`, ...part),
-      del('attachments'), del('post_cw'), del('outlet_posts'), del('likes'), del('post_topics'), del('edits'), del('polls'), del('poll_options'), del('poll_votes'), del('bookmarks'), del('muted_threads'), del('reactions'), del('reply_policy'), del('post_versions'), del('bookmark_folder_items'), del('notifications'), del('reports'), del('refs'),
+      del('attachments'), del('post_cw'), del('post_vis'), del('outlet_posts'), del('likes'), del('post_topics'), del('edits'), del('polls'), del('poll_options'), del('poll_votes'), del('bookmarks'), del('muted_threads'), del('reactions'), del('reply_policy'), del('post_versions'), del('bookmark_folder_items'), del('notifications'), del('reports'), del('refs'),
       D.stmt(`UPDATE profiles SET pinned=NULL WHERE pinned IN (${P})`, ...part),
       del('posts', 'id'),
     ]);
@@ -416,11 +459,14 @@ async function createPost(env, D, user, b) {
     const pollIn = b.poll && typeof b.poll === 'object' ? b.poll : null;
     if (!body && !files.length && !pollIn) bad('Write something first!');
     let parent = null, quote = null, parentAuthor = null, quoteAuthor = null;
+    let vis = b.vis === 'friends' ? 'friends' : null;
     if (b.parent != null) {
       const pid = intParam(b.parent);
       const p = pid && (await D.first('SELECT id, user_id, parent_id FROM posts WHERE id=?', pid));
       if (!p) bad('We could not find the post you are replying to!', 404);
       parent = p.parent_id || p.id;
+      if (!(await canSee(D, user, parent))) bad('We could not find the post you are replying to!', 404);
+      if (await D.first('SELECT 1 AS x FROM post_vis WHERE post_id=?', parent)) vis = 'friends'; // replies to a friends-only post stay friends-only
       const lk = await D.first('SELECT op.locked, op.outlet_id FROM outlet_posts op WHERE op.post_id=?', parent);
       if (lk) {
         if (await D.first('SELECT 1 AS x FROM outlet_bans WHERE outlet_id=? AND user_id=?', lk.outlet_id, user.id)) bad('You cannot post in this Outlet!', 403);
@@ -442,6 +488,8 @@ async function createPost(env, D, user, b) {
       if (!t || t.kind === 'repost') bad('We could not find the post you are quoting!', 404);
       if (!body) bad('Add a few words to your quote!');
       if (await blockedBetween(D, user.id, t.user_id)) bad('You cannot quote this person!', 403);
+      if (!(await canSee(D, user, t.id))) bad('We could not find the post you are quoting!', 404);
+      if (await D.first('SELECT 1 AS x FROM post_vis WHERE post_id=?', t.id)) vis = 'friends'; // a quote of a friends-only post stays friends-only
       quote = t.id;
       quoteAuthor = t.user_id;
     }
@@ -463,6 +511,7 @@ async function createPost(env, D, user, b) {
     // a new post can go into an Outlet (and a Subject inside it)
     let outletRow = null, subjectId = null;
     if (b.outlet) {
+      if (vis) bad('Friends-only posts cannot go in an Outlet!');
       if (b.parent != null || b.quote != null) bad('Posts in an Outlet are new posts, not replies or quotes!');
       outletRow = await D.first('SELECT id FROM outlets WHERE slug=?', String(b.outlet));
       if (!outletRow) bad('We could not find that Outlet!', 404);
@@ -479,6 +528,7 @@ async function createPost(env, D, user, b) {
     if (quote) stmts.push(D.stmt("INSERT INTO refs(post_id,target_id,kind) VALUES(?,?,'quote')", id, quote));
     if (!parent && ['following', 'mentioned'].includes(b.replies)) stmts.push(D.stmt('INSERT INTO reply_policy(post_id,policy) VALUES(?,?)', id, b.replies));
     if (cw) stmts.push(D.stmt('INSERT INTO post_cw(post_id,text) VALUES(?,?)', id, cw));
+    if (vis) stmts.push(D.stmt('INSERT INTO post_vis(post_id,vis) VALUES(?,?)', id, vis));
     if (outletRow) {
       stmts.push(D.stmt('INSERT INTO outlet_posts(post_id,outlet_id,subject_id) VALUES(?,?,?)', id, outletRow.id, subjectId));
       stmts.push(D.stmt("INSERT OR IGNORE INTO outlet_members(outlet_id,user_id,role,joined) VALUES(?,?,'member',?)", outletRow.id, user.id, Date.now()));
@@ -491,12 +541,17 @@ async function createPost(env, D, user, b) {
     if (stmts.length) await D.batch(stmts);
     // tell the right people
     const told = new Set([user.id]);
-    const tell = async (uid, kind) => { if (uid && !told.has(uid)) { told.add(uid); await notify(D, uid, user.id, kind, id); } };
+    const tell = async (uid, kind) => {
+      if (!uid || told.has(uid)) return;
+      told.add(uid);
+      if (vis && !(await isFriends(D, user.id, uid))) return; // a friends-only post only tells friends
+      await notify(D, uid, user.id, kind, id);
+    };
     await tell(parentAuthor, 'reply');
     await tell(quoteAuthor, 'quote');
     const names = mentionsIn(body);
     if (names.length) {
-      const found = await D.all(`SELECT id FROM users WHERE username IN (${ph(names.length)})`, ...names);
+      const found = await D.all(`SELECT id FROM users WHERE username IN (${ph(names.length)}) AND inst=(SELECT inst FROM users WHERE id=?)`, ...names, user.id);
       for (const f of found) if (!(await blockedBetween(D, user.id, f.id))) await tell(f.id, 'mention');
     }
   return await onePost(env, D, user, id);
@@ -507,7 +562,7 @@ async function purgeUser(D, u) {
   const mine = (await D.all('SELECT id FROM posts WHERE user_id=?', u)).map((r) => r.id);
   await purgePosts(D, mine);
   await D.batch([
-    D.stmt('DELETE FROM likes WHERE user_id=?', u), D.stmt('DELETE FROM follows WHERE follower=? OR followee=?', u, u), D.stmt('DELETE FROM topic_follows WHERE user_id=?', u),
+    D.stmt('DELETE FROM likes WHERE user_id=?', u), D.stmt('DELETE FROM follows WHERE follower=? OR followee=?', u, u), D.stmt('DELETE FROM friends WHERE user_id=? OR friend_id=?', u, u), D.stmt('DELETE FROM friend_requests WHERE from_id=? OR to_id=?', u, u), D.stmt('DELETE FROM topic_follows WHERE user_id=?', u),
     D.stmt('DELETE FROM bookmarks WHERE user_id=?', u), D.stmt('DELETE FROM mutes WHERE user_id=? OR target_id=?', u, u), D.stmt('DELETE FROM topic_mutes WHERE user_id=?', u),
     D.stmt('DELETE FROM notifications WHERE user_id=? OR actor_id=?', u, u), D.stmt('DELETE FROM poll_votes WHERE user_id=?', u), D.stmt('DELETE FROM reports WHERE reporter_id=?', u),
     D.stmt('DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE user_id=?)', u), D.stmt('DELETE FROM attachments WHERE user_id=?', u),
@@ -550,6 +605,33 @@ async function instanceOf(env, D, url, req) {
   if (!slug || slug === 'main') return D.first('SELECT * FROM instances WHERE id=1');
   if (!/^[a-z0-9][a-z0-9-]{0,29}$/.test(slug)) return null;
   return D.first('SELECT * FROM instances WHERE slug=?', slug);
+}
+// people from another instance show (and link) as name@instance, because the same username can exist on every instance
+async function handlesFor(req, env, url, res) {
+  if (!url.pathname.startsWith('/api/') || res.status !== 200 || !/json/.test(res.headers.get('content-type') || '') || res.headers.get('content-disposition')) return res;
+  const host = url.hostname.toLowerCase(), base = baseDomain(env);
+  let here = 'main';
+  if (host.endsWith('.' + base)) here = host.slice(0, -base.length - 1);
+  else if (host.endsWith('.localhost')) here = host.slice(0, -'.localhost'.length);
+  if (env.ALLOW_INSTANCE_HEADER === '1' && req.headers.get('x-beta-instance')) here = String(req.headers.get('x-beta-instance')).toLowerCase();
+  const text = await res.text();
+  if (!text.includes('"inst_slug"')) return new Response(text, res);
+  let data;
+  try { data = JSON.parse(text); } catch (e) { return new Response(text, res); }
+  const walk = (o) => {
+    if (Array.isArray(o)) { o.forEach(walk); return; }
+    if (!o || typeof o !== 'object') return;
+    if (typeof o.username === 'string' && typeof o.inst_slug === 'string' && o.inst_slug && o.inst_slug !== here && !o.username.includes('@')) o.username += '@' + o.inst_slug;
+    for (const k in o) walk(o[k]);
+  };
+  walk(data);
+  return new Response(JSON.stringify(data), res);
+}
+// finds a person by name: plain names live on this instance; name@slug points at another instance (usernames are unique per instance)
+function userBy(D, inst, ident, cols) {
+  const t = String(ident == null ? '' : ident), at = t.lastIndexOf('@');
+  if (at > 0) return D.first(`SELECT ${cols || 'id'} FROM users WHERE username=? AND inst=(SELECT id FROM instances WHERE slug=?)`, t.slice(0, at), t.slice(at + 1).toLowerCase());
+  return D.first(`SELECT ${cols || 'id'} FROM users WHERE username=? AND inst=?`, t, inst.id);
 }
 function instUrl(env, url, slug) {
   const host = url.hostname.toLowerCase(), port = url.port ? ':' + url.port : '';
@@ -630,7 +712,9 @@ async function route(req, env, url) {
     }
     if (kind === 'user' && name) {
       const n = decodeURIComponent(name);
-      return rssFeed(env, D, url, n, '/u/' + n, 'p.parent_id IS NULL AND u.username=?', [n]);
+      const ri = await instanceOf(env, D, url, req), ru = ri && (await userBy(D, ri, n, 'id'));
+      if (!ru) return json({ error: 'There is nothing at that address!' }, 404);
+      return rssFeed(env, D, url, n, '/u/' + n, 'p.parent_id IS NULL AND u.id=?', [ru.id]);
     }
     return json({ error: 'There is nothing at that address!' }, 404);
   }
@@ -683,7 +767,7 @@ async function route(req, env, url) {
     if (RESERVED.has(name.toLowerCase())) bad('That name is saved for the site. Pick another!');
     const pw = String(b.password || '');
     if (pw.length < 8 || pw.length > 200) bad('Passwords need at least 8 characters!');
-    if (await D.first('SELECT 1 AS x FROM users WHERE username=?', name)) bad('That username is taken!', 409);
+    if (await D.first('SELECT 1 AS x FROM users WHERE username=? AND inst=?', name, inst.id)) bad('That username is taken!', 409);
     if ((await siteGet(D, 'reserved_names', '')).split('\n').map((w) => w.trim().toLowerCase()).filter(Boolean).includes(name.toLowerCase())) bad('That name is saved for the site. Pick another!');
     // an instance decides who may join it (the main Beta follows the site-wide switches)
     if (inst.id !== 1) {
@@ -704,8 +788,8 @@ async function route(req, env, url) {
     await rate(D, 'login:' + ip, 20, 600);
     const b = await readJson(req, 10000);
     const name = String(b.username || '').trim();
-    await rate(D, 'loginu:' + name.toLowerCase(), 10, 600);
-    const row = await D.first('SELECT id, username, bio, pw, inst FROM users WHERE username=?', name);
+    await rate(D, 'loginu:' + inst.id + ':' + name.toLowerCase(), 10, 600);
+    const row = await userBy(D, inst, name, 'id, username, bio, pw, inst');
     const ok = row ? await checkPw(String(b.password || ''), row.pw) : (await hashPw('x'), false);
     if (!ok) bad('That username or password is not right!', 401);
     if (row.inst !== inst.id) {
@@ -739,7 +823,7 @@ async function route(req, env, url) {
     const isModer = !!(await D.first('SELECT 1 AS x FROM site_mods WHERE user_id=?', user.id));
     const warnings = await D.all('SELECT id, text, created FROM warnings WHERE user_id=? AND seen=0 ORDER BY id LIMIT 3', user.id);
     const homeInst = await D.first('SELECT slug, name FROM instances WHERE id=(SELECT inst FROM users WHERE id=?)', user.id);
-    return json({ user: { ...row, filters, mod: isModer, warnings, instance: instPublic(inst, env, url), homeSlug: homeInst ? homeInst.slug : 'main', display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, admin: isAdmin(env, user), avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
+    return json({ user: { ...row, filters, mod: isModer, warnings, instance: instPublic(inst, env, url), homeSlug: homeInst ? homeInst.slug : 'main', display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, friendsPrivacy: st.friends_privacy, admin: isAdmin(env, user), avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
   }
   if (seg[0] === 'me' && !seg[1] && method === 'PATCH') {
     need();
@@ -868,14 +952,14 @@ async function route(req, env, url) {
   if (seg[0] === 'posts' && seg[1] && seg[2] === 'history' && method === 'GET') {
     const id = intParam(seg[1]);
     const cur = id && (await D.first('SELECT p.body, p.created, (SELECT edited FROM edits WHERE post_id=p.id) AS edited FROM posts p WHERE p.id=?', id));
-    if (!cur) bad('We could not find that post!', 404);
+    if (!cur || !(await canSee(D, user, id))) bad('We could not find that post!', 404);
     const old = await D.all('SELECT body, created FROM post_versions WHERE post_id=? ORDER BY v', id);
     return json({ versions: [...old, { body: cur.body, created: cur.edited || cur.created, current: true }] });
   }
   if (seg[0] === 'posts' && seg[1] && seg[2] === 'likes' && method === 'GET') {
     const id = intParam(seg[1]);
-    if (!id) bad('We could not find that post!', 404);
-    const rows = await D.all(`SELECT x.username, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar FROM likes l JOIN users x ON x.id=l.user_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE l.post_id=? ORDER BY l.rowid DESC LIMIT 60`, id);
+    if (!id || !(await canSee(D, user, id))) bad('We could not find that post!', 404);
+    const rows = await D.all(`SELECT x.username, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar FROM likes l JOIN users x ON x.id=l.user_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE l.post_id=? ORDER BY l.rowid DESC LIMIT 60`, id);
     return json({ users: rows });
   }
   if (seg[0] === 'posts' && seg[1] && seg[2] && method === 'POST') {
@@ -883,6 +967,7 @@ async function route(req, env, url) {
     const id = intParam(seg[1]);
     const target = id && (await D.first('SELECT p.id, p.user_id, p.parent_id, r.kind FROM posts p LEFT JOIN refs r ON r.post_id=p.id WHERE p.id=?', id));
     if (!target) bad('We could not find that post!', 404);
+    if (!(await canSee(D, user, id))) bad('We could not find that post!', 404);
     const act = seg[2];
     if (['like', 'repost', 'bookmark', 'vote', 'pin', 'report', 'react', 'folder', 'mutethread'].includes(act)) await rate(D, 'act:' + user.id, 120, 60);
     if (act === 'react') {
@@ -927,6 +1012,7 @@ async function route(req, env, url) {
     }
     if (act === 'repost') {
       if (target.parent_id || target.kind === 'repost') bad('Only new posts can be reposted!');
+      if (await D.first('SELECT 1 AS x FROM post_vis WHERE post_id=?', id)) bad('Friends-only posts cannot be reposted!');
       if (await blockedBetween(D, user.id, target.user_id)) bad('You cannot interact with this person!', 403);
       const had = await D.first("SELECT p.id FROM refs r JOIN posts p ON p.id=r.post_id WHERE r.kind='repost' AND r.target_id=? AND p.user_id=?", id, user.id);
       if (had) { await purgePosts(D, [had.id]); await unnotify(D, target.user_id, user.id, 'repost', id); }
@@ -1002,10 +1088,15 @@ async function route(req, env, url) {
       hide = false;
       noOutlets = false;
       const tab = sp.get('tab') || 'posts';
-      if (tab === 'replies') { where = 'p.parent_id IS NOT NULL AND u.username=?'; params = [sp.get('user')]; }
-      else if (tab === 'likes') { where = 'p.id IN (SELECT post_id FROM likes WHERE user_id=(SELECT id FROM users WHERE username=?))'; params = [sp.get('user')]; }
-      else if (tab === 'media') { where += ' AND u.username=? AND p.id IN (SELECT post_id FROM attachments WHERE post_id IS NOT NULL)'; params = [sp.get('user')]; }
-      else { where += ' AND u.username=?'; params = [sp.get('user')]; }
+      const fu = ((await userBy(D, inst, sp.get('user'), 'id')) || { id: 0 }).id;
+      if (tab === 'replies') { where = 'p.parent_id IS NOT NULL AND u.id=?'; params = [fu]; }
+      else if (tab === 'likes') { where = 'p.id IN (SELECT post_id FROM likes WHERE user_id=?)'; params = [fu]; }
+      else if (tab === 'media') { where += ' AND u.id=? AND p.id IN (SELECT post_id FROM attachments WHERE post_id IS NOT NULL)'; params = [fu]; }
+      else { where += ' AND u.id=?'; params = [fu]; }
+    } else if (sp.get('scope') === 'friends') {
+      need();
+      where += ' AND (p.user_id=? OR p.user_id IN (SELECT friend_id FROM friends WHERE user_id=?))';
+      params = [user.id, user.id];
     } else if (sp.get('scope') === 'home') {
       need();
       noOutlets = false;
@@ -1036,7 +1127,7 @@ async function route(req, env, url) {
         else if (tok) words.push(tok);
       }
       if (!from && !topic && !has.length && words.join(' ').length < 2) return json({ posts: [], more: false, cursor: null });
-      if (from) { where += ' AND u.username=?'; params.push(from); }
+      if (from) { where += ' AND u.username=? AND u.inst=?'; params.push(from, inst.id); }
       if (topic) { where += ' AND p.id IN (SELECT post_id FROM post_topics WHERE topic=?)'; params.push(topic); }
       for (const h of has) {
         if (h === 'image') where += " AND p.id IN (SELECT post_id FROM attachments WHERE mime LIKE 'image/%' AND post_id IS NOT NULL)";
@@ -1080,16 +1171,18 @@ async function route(req, env, url) {
     need();
     const before = intParam(url.searchParams.get('before'));
     const rows = await D.all(
-      `SELECT n.id, n.kind, n.post_id, n.created, n.read, u.username, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=n.actor_id) AS avatar
+      `SELECT n.id, n.kind, n.post_id, n.created, n.read, u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=n.actor_id) AS avatar,
+         EXISTS(SELECT 1 FROM friend_requests fq WHERE fq.from_id=n.actor_id AND fq.to_id=n.user_id) AS fpending
        FROM notifications n JOIN users u ON u.id=n.actor_id LEFT JOIN profiles pr ON pr.user_id=n.actor_id
        WHERE n.user_id=? ${before ? 'AND n.id < ?' : ''} ORDER BY n.id DESC LIMIT 30`,
       user.id, ...(before ? [before] : [])
     );
     const pids = [...new Set(rows.map((r) => r.post_id).filter(Boolean))];
     const snip = {};
-    if (pids.length) (await D.all(`SELECT id, body FROM posts WHERE id IN (${ph(pids.length)})`, ...pids)).forEach((p) => (snip[p.id] = p.body.slice(0, 120)));
+    const [nvc, nva] = visSql(user);
+    if (pids.length) (await D.all(`SELECT p.id, p.body FROM posts p WHERE p.id IN (${ph(pids.length)}) AND ${nvc}`, ...pids, ...nva)).forEach((p) => (snip[p.id] = p.body.slice(0, 120)));
     if (Math.random() < 0.02) await D.run('DELETE FROM notifications WHERE created < ?', Date.now() - 60 * 864e5);
-    return json({ items: rows.map((r) => ({ ...r, read: !!r.read, snippet: snip[r.post_id] ?? null })), more: rows.length === 30, cursor: rows.length ? rows[rows.length - 1].id : null });
+    return json({ items: rows.map((r) => ({ ...r, read: !!r.read, fpending: !!r.fpending, snippet: snip[r.post_id] ?? null })), more: rows.length === 30, cursor: rows.length ? rows[rows.length - 1].id : null });
   }
   if (seg[0] === 'notifications' && seg[1] === 'count' && method === 'GET') {
     if (!user) return json({ unread: 0 });
@@ -1104,17 +1197,17 @@ async function route(req, env, url) {
   // --- topics
   if (seg[0] === 'topics' && !seg[1] && method === 'GET') {
     if (url.searchParams.get('local') === '1') {
-      const hot = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id JOIN users u ON u.id=p.user_id WHERE u.inst=? AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY SUM(CASE WHEN p.created>? THEN 1 ELSE 0 END) DESC, n DESC, MAX(p.id) DESC LIMIT 10', inst.id, Date.now() - 3 * 864e5);
+      const hot = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id JOIN users u ON u.id=p.user_id WHERE u.inst=? AND p.id NOT IN (SELECT post_id FROM post_vis) AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY SUM(CASE WHEN p.created>? THEN 1 ELSE 0 END) DESC, n DESC, MAX(p.id) DESC LIMIT 10', inst.id, Date.now() - 3 * 864e5);
       return json({ topics: hot });
     }
     const since = Date.now() - 3 * 864e5;
-    let rows = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY n DESC, MAX(p.id) DESC LIMIT 10', since);
+    let rows = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? AND p.id NOT IN (SELECT post_id FROM post_vis) AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY n DESC, MAX(p.id) DESC LIMIT 10', since);
     if (!rows.length) rows = await D.all('SELECT pt.topic, COUNT(*) AS n FROM post_topics pt WHERE pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY n DESC, MAX(pt.post_id) DESC LIMIT 10');
     return json({ topics: rows });
   }
   if (seg[0] === 'topics' && seg[1] && !seg[2] && method === 'GET') {
     const t = cleanTopic(seg[1]);
-    const posts = (await D.first('SELECT COUNT(*) AS n FROM post_topics WHERE topic=?', t)).n;
+    const posts = (await D.first('SELECT COUNT(*) AS n FROM post_topics WHERE topic=? AND post_id NOT IN (SELECT post_id FROM post_vis)', t)).n;
     const followers = (await D.first('SELECT COUNT(*) AS n FROM topic_follows WHERE topic=?', t)).n;
     const following = user ? !!(await D.first('SELECT 1 AS x FROM topic_follows WHERE topic=? AND user_id=?', t, user.id)) : false;
     const muted = user ? !!(await D.first('SELECT 1 AS x FROM topic_mutes WHERE topic=? AND user_id=?', t, user.id)) : false;
@@ -1136,16 +1229,33 @@ async function route(req, env, url) {
 
   // --- people
   if (seg[0] === 'users' && seg[1] && !seg[2] && method === 'GET') {
-    const u = await D.first('SELECT id, username, bio, created FROM users WHERE username=?', seg[1]);
+    const u = await userBy(D, inst, seg[1], 'id, username, bio, created, inst');
     if (!u) bad('We could not find that person!', 404);
     const count = async (sql) => (await D.first(sql, u.id)).n;
+    const [pvc, pva] = visSql(user);
+    const postCount = (await D.first(`SELECT COUNT(*) AS n FROM posts p WHERE p.user_id=? AND p.parent_id IS NULL AND ${pvc}`, u.id, ...pva)).n;
+    // Friends: how you stand with this person, how many they have, and how many you share
+    let friendState = null, friendCount = null, mutual = null;
+    if (user) {
+      if (user.id === u.id) friendState = 'self';
+      else if (await blockedBetween(D, user.id, u.id)) friendState = 'blocked';
+      else if (((await D.first('SELECT inst FROM users WHERE id=?', user.id)) || {}).inst !== u.inst) friendState = 'unavailable';
+      else if (await isFriends(D, user.id, u.id)) friendState = 'friends';
+      else if (await D.first('SELECT 1 AS x FROM friend_requests WHERE from_id=? AND to_id=?', user.id, u.id)) friendState = 'outgoing';
+      else if (await D.first('SELECT 1 AS x FROM friend_requests WHERE from_id=? AND to_id=?', u.id, user.id)) friendState = 'incoming';
+      else friendState = 'none';
+    }
+    if (await friendsVisible(D, user, u.id)) {
+      friendCount = (await D.first('SELECT COUNT(*) AS n FROM friends WHERE user_id=?', u.id)).n;
+      if (user && user.id !== u.id) mutual = (await D.first('SELECT COUNT(*) AS n FROM friends a JOIN friends b ON a.friend_id=b.friend_id WHERE a.user_id=? AND b.user_id=?', user.id, u.id)).n;
+    }
     const t = await theme(u.id);
     const pr = await D.first('SELECT pinned FROM profiles WHERE user_id=?', u.id);
     const rel = user ? await D.first('SELECT kind FROM mutes WHERE user_id=? AND target_id=?', user.id, u.id) : null;
     return json({
       user: {
         username: u.username, bio: u.bio, created: u.created, display_name: t.display_name, website: t.website, color: t.color, avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', u.id) || {}).file_id || null,
-        posts: await count('SELECT COUNT(*) AS n FROM posts WHERE user_id=? AND parent_id IS NULL'),
+        posts: postCount, friendState, friends: friendCount, mutualFriends: mutual,
         followers: await count('SELECT COUNT(*) AS n FROM follows WHERE followee=?'),
         following: await count('SELECT COUNT(*) AS n FROM follows WHERE follower=?'),
         isFollowing: user ? !!(await D.first('SELECT 1 AS x FROM follows WHERE follower=? AND followee=?', user.id, u.id)) : false,
@@ -1160,21 +1270,100 @@ async function route(req, env, url) {
     });
   }
   if (seg[0] === 'users' && seg[1] && (seg[2] === 'followers' || seg[2] === 'following') && method === 'GET') {
-    const u = await D.first('SELECT id FROM users WHERE username=?', seg[1]);
+    const u = await userBy(D, inst, seg[1], 'id');
     if (!u) bad('We could not find that person!', 404);
     const [me, other] = seg[2] === 'followers' ? ['followee', 'follower'] : ['follower', 'followee'];
     const rows = await D.all(
-      `SELECT x.username, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar,
+      `SELECT x.username, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug,
         EXISTS(SELECT 1 FROM follows f2 WHERE f2.follower=? AND f2.followee=x.id) AS isFollowing
        FROM follows f JOIN users x ON x.id=f.${other} LEFT JOIN profiles pr ON pr.user_id=x.id WHERE f.${me}=? ORDER BY x.username LIMIT 200`,
       user ? user.id : 0, u.id
     );
     return json({ users: rows.map((r) => ({ ...r, isFollowing: !!r.isFollowing })) });
   }
+  // --- friends
+  if (seg[0] === 'users' && seg[1] && seg[2] === 'friends' && method === 'GET') {
+    const u = await userBy(D, inst, seg[1], 'id');
+    if (!u) bad('We could not find that person!', 404);
+    if (!(await friendsVisible(D, user, u.id))) return json({ hidden: true, users: [] });
+    const rows = await D.all(
+      `SELECT x.username, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug,
+        EXISTS(SELECT 1 FROM follows f2 WHERE f2.follower=? AND f2.followee=x.id) AS isFollowing
+       FROM friends f JOIN users x ON x.id=f.friend_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE f.user_id=? ORDER BY x.username LIMIT 300`,
+      user ? user.id : 0, u.id
+    );
+    return json({ hidden: false, users: rows.map((r) => ({ ...r, isFollowing: !!r.isFollowing })) });
+  }
+  if (seg[0] === 'friends' && !seg[1] && method === 'GET') {
+    need();
+    const card = `x.username, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar`;
+    const incoming = await D.all(`SELECT ${card} FROM friend_requests q JOIN users x ON x.id=q.from_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE q.to_id=? ORDER BY q.created DESC LIMIT 100`, user.id);
+    const outgoing = await D.all(`SELECT ${card} FROM friend_requests q JOIN users x ON x.id=q.to_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE q.from_id=? ORDER BY q.created DESC LIMIT 100`, user.id);
+    const friends = (await D.all('SELECT x.username FROM friends f JOIN users x ON x.id=f.friend_id WHERE f.user_id=? LIMIT 2000', user.id)).map((r) => r.username);
+    return json({ incoming, outgoing, friends });
+  }
+  if (seg[0] === 'users' && seg[1] && seg[2] === 'friend' && method === 'POST') {
+    need();
+    await rate(D, 'friendact:' + user.id, 60, 3600);
+    const b = await readJson(req, 300);
+    const action = b.action;
+    if (!['request', 'accept', 'decline', 'cancel', 'unfriend'].includes(action)) bad('Pick request, accept, decline, cancel or unfriend!');
+    const u = await userBy(D, inst, seg[1], 'id, inst');
+    if (!u) bad('We could not find that person!', 404);
+    if (u.id === user.id) bad('You cannot be your own friend, but you are a great one!');
+    if (await blockedBetween(D, user.id, u.id)) bad('You cannot be friends with this person!', 403);
+    const mine = await D.first('SELECT inst FROM users WHERE id=?', user.id);
+    if (!mine || mine.inst !== u.inst) bad('Friends are for people on the same instance!', 400);
+    const friends = await isFriends(D, user.id, u.id);
+    const out = await D.first('SELECT 1 AS x FROM friend_requests WHERE from_id=? AND to_id=?', user.id, u.id);
+    const inc = await D.first('SELECT 1 AS x FROM friend_requests WHERE from_id=? AND to_id=?', u.id, user.id);
+    const makeFriends = async () => {
+      await D.batch([
+        D.stmt('DELETE FROM friend_requests WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?)', user.id, u.id, u.id, user.id),
+        D.stmt('INSERT OR IGNORE INTO friends(user_id,friend_id,created) VALUES(?,?,?)', user.id, u.id, Date.now()),
+        D.stmt('INSERT OR IGNORE INTO friends(user_id,friend_id,created) VALUES(?,?,?)', u.id, user.id, Date.now()),
+      ]);
+      await unnotify(D, user.id, u.id, 'friend_request', null);
+      await notify(D, u.id, user.id, 'friend_accept', null);
+    };
+    let state;
+    if (action === 'request') {
+      if (friends) bad('You are already friends!');
+      if (inc) { await makeFriends(); state = 'friends'; }
+      else if (out) state = 'outgoing';
+      else {
+        await rate(D, 'friendreq:' + user.id, 20, 3600);
+        if ((await D.first('SELECT COUNT(*) AS n FROM friend_requests WHERE from_id=?', user.id)).n >= 100) bad('You have 100 requests waiting, which is the limit! Cancel a few first!');
+        await D.run('INSERT OR IGNORE INTO friend_requests(from_id,to_id,created) VALUES(?,?,?)', user.id, u.id, Date.now());
+        await notify(D, u.id, user.id, 'friend_request', null);
+        state = 'outgoing';
+      }
+    } else if (action === 'accept') {
+      if (!inc) bad('There is no request from this person to accept!', 404);
+      await makeFriends();
+      state = 'friends';
+    } else if (action === 'decline') {
+      await D.run('DELETE FROM friend_requests WHERE from_id=? AND to_id=?', u.id, user.id);
+      await unnotify(D, user.id, u.id, 'friend_request', null);
+      state = 'none';
+    } else if (action === 'cancel') {
+      await D.run('DELETE FROM friend_requests WHERE from_id=? AND to_id=?', user.id, u.id);
+      await unnotify(D, u.id, user.id, 'friend_request', null);
+      state = 'none';
+    } else {
+      await D.batch([
+        D.stmt('DELETE FROM friends WHERE (user_id=? AND friend_id=?) OR (user_id=? AND friend_id=?)', user.id, u.id, u.id, user.id),
+        D.stmt('DELETE FROM friend_requests WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?)', user.id, u.id, u.id, user.id),
+      ]);
+      state = 'none';
+    }
+    const total = (await D.first('SELECT COUNT(*) AS n FROM friends WHERE user_id=?', u.id)).n;
+    return json({ state, friends: total });
+  }
   if (seg[0] === 'users' && seg[1] && seg[2] === 'follow' && method === 'POST') {
     need();
     await rate(D, 'follow:' + user.id, 60, 60);
-    const u = await D.first('SELECT id FROM users WHERE username=?', seg[1]);
+    const u = await userBy(D, inst, seg[1], 'id');
     if (!u) bad('We could not find that person!', 404);
     if (u.id === user.id) bad('You cannot follow yourself!');
     if (await blockedBetween(D, user.id, u.id)) bad('You cannot follow this person!', 403);
@@ -1185,7 +1374,7 @@ async function route(req, env, url) {
   }
   if (seg[0] === 'users' && seg[1] && (seg[2] === 'mute' || seg[2] === 'block') && method === 'POST') {
     need();
-    const u = await D.first('SELECT id FROM users WHERE username=?', seg[1]);
+    const u = await userBy(D, inst, seg[1], 'id');
     if (!u) bad('We could not find that person!', 404);
     if (u.id === user.id) bad('That would be a little odd!');
     const kind = seg[2];
@@ -1193,21 +1382,26 @@ async function route(req, env, url) {
     if (had && had.kind === kind) await D.run('DELETE FROM mutes WHERE user_id=? AND target_id=?', user.id, u.id);
     else {
       await D.run('INSERT INTO mutes(user_id,target_id,kind) VALUES(?,?,?) ON CONFLICT(user_id,target_id) DO UPDATE SET kind=excluded.kind', user.id, u.id, kind);
-      if (kind === 'block') await D.run('DELETE FROM follows WHERE (follower=? AND followee=?) OR (follower=? AND followee=?)', user.id, u.id, u.id, user.id);
+      if (kind === 'block') {
+        await D.run('DELETE FROM follows WHERE (follower=? AND followee=?) OR (follower=? AND followee=?)', user.id, u.id, u.id, user.id);
+        await D.run('DELETE FROM friends WHERE (user_id=? AND friend_id=?) OR (user_id=? AND friend_id=?)', user.id, u.id, u.id, user.id);
+        await D.run('DELETE FROM friend_requests WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?)', user.id, u.id, u.id, user.id);
+        await D.run("DELETE FROM notifications WHERE kind='friend_request' AND ((user_id=? AND actor_id=?) OR (user_id=? AND actor_id=?))", user.id, u.id, u.id, user.id);
+      }
     }
     return json({ [kind === 'mute' ? 'muted' : 'blocked']: !(had && had.kind === kind) });
   }
   if (seg[0] === 'mutes' && method === 'GET') {
     need();
     return json({
-      users: await D.all('SELECT u.username, m.kind FROM mutes m JOIN users u ON u.id=m.target_id WHERE m.user_id=? ORDER BY u.username', user.id),
+      users: await D.all('SELECT u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, m.kind FROM mutes m JOIN users u ON u.id=m.target_id WHERE m.user_id=? ORDER BY u.username', user.id),
       topics: (await D.all('SELECT topic FROM topic_mutes WHERE user_id=? ORDER BY topic', user.id)).map((r) => r.topic),
     });
   }
   if (seg[0] === 'suggest' && method === 'GET') {
     const me = user ? user.id : 0;
     const rows = await D.all(
-      `SELECT x.username, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar,
+      `SELECT x.username, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar,
         (SELECT COUNT(*) FROM follows f WHERE f.followee=x.id) AS fans
        FROM users x LEFT JOIN profiles pr ON pr.user_id=x.id
        WHERE x.id != ? AND x.id NOT IN (SELECT followee FROM follows WHERE follower=?) AND x.id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)
@@ -1222,7 +1416,7 @@ async function route(req, env, url) {
     const raw = cleanLine(url.searchParams.get('q'), 30).replace(/^[#@]+/, '');
     const like = raw.replace(/[\\%_]/g, '\\$&') + '%';
     if (!raw) return json({ users: [], topics: [] });
-    const users = await D.all("SELECT x.username, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar FROM users x LEFT JOIN profiles pr ON pr.user_id=x.id WHERE x.username LIKE ? ESCAPE '\\' OR pr.display_name LIKE ? ESCAPE '\\' ORDER BY x.username LIMIT 8", like, like);
+    const users = await D.all("SELECT x.username, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug FROM users x LEFT JOIN profiles pr ON pr.user_id=x.id WHERE x.username LIKE ? ESCAPE '\\' OR pr.display_name LIKE ? ESCAPE '\\' ORDER BY x.username LIMIT 8", like, like);
     const topics = await D.all("SELECT topic, COUNT(*) AS n FROM post_topics WHERE topic LIKE ? ESCAPE '\\' GROUP BY topic ORDER BY n DESC LIMIT 10", like.toLowerCase());
     return json({ users, topics });
   }
@@ -1257,6 +1451,10 @@ async function route(req, env, url) {
     if (b.dm !== undefined) {
       if (!['all', 'following', 'none'].includes(b.dm)) bad('Pick everyone, people I follow, or nobody!');
       await D.run('INSERT INTO settings(user_id,k,v) VALUES(?,?,?) ON CONFLICT(user_id,k) DO UPDATE SET v=excluded.v', user.id, 'dm', b.dm);
+    }
+    if (b.friendsPrivacy !== undefined) {
+      if (!['everyone', 'friends', 'me'].includes(b.friendsPrivacy)) bad('Pick everyone, only my friends, or only me!');
+      await D.run('INSERT INTO settings(user_id,k,v) VALUES(?,?,?) ON CONFLICT(user_id,k) DO UPDATE SET v=excluded.v', user.id, 'friends_privacy', b.friendsPrivacy);
     }
     return json({ ok: true });
   }
@@ -1348,7 +1546,7 @@ async function route(req, env, url) {
     const uname = String(b.username || '').trim();
     if (!/^[a-z0-9][a-z0-9_-]{2,19}$/i.test(uname)) bad('Usernames are 3 to 20 letters, numbers, - or _!');
     if (RESERVED.has(uname.toLowerCase())) bad('That name is saved for the site. Pick another!');
-    if (await D.first('SELECT 1 AS x FROM users WHERE username=?', uname)) bad('That username is taken!', 409);
+    // (a brand new instance has nobody yet, so any name is free: usernames are unique on each instance)
     const pw = String(b.password || '');
     if (pw.length < 8 || pw.length > 200) bad('Passwords need at least 8 characters!');
     const reg = ['open', 'invite', 'closed'].includes(b.reg) ? b.reg : 'open';
@@ -1431,7 +1629,7 @@ async function route(req, env, url) {
   }
   if (seg[0] === 'users' && seg[1] && seg[2] === 'note') {
     need();
-    const u = await D.first('SELECT id FROM users WHERE username=?', seg[1]);
+    const u = await userBy(D, inst, seg[1], 'id');
     if (!u) bad('We could not find that person!', 404);
     if (method === 'GET') return json({ note: ((await D.first('SELECT note FROM user_notes WHERE user_id=? AND target_id=?', user.id, u.id)) || {}).note || '' });
     if (method === 'POST') {
@@ -1482,7 +1680,7 @@ async function route(req, env, url) {
       if (!body && !files.length && !b.poll) bad('Write something first!');
       if (b.parent != null || b.quote != null) bad('Only new posts can be scheduled!');
       if ((await D.first('SELECT COUNT(*) AS n FROM scheduled WHERE user_id=?', user.id)).n >= 20) bad('You can have up to 20 scheduled posts!');
-      const payload = { body, cw: cleanLine(b.cw, 80), files: files.map((f) => ({ id: intParam(f && f.id), alt: cleanLine(f && f.alt, 200) })), poll: b.poll && typeof b.poll === 'object' ? b.poll : undefined, outlet: b.outlet ? String(b.outlet) : undefined, subject: b.subject ? String(b.subject) : undefined, replies: b.replies };
+      const payload = { body, cw: cleanLine(b.cw, 80), files: files.map((f) => ({ id: intParam(f && f.id), alt: cleanLine(f && f.alt, 200) })), poll: b.poll && typeof b.poll === 'object' ? b.poll : undefined, outlet: b.outlet ? String(b.outlet) : undefined, subject: b.subject ? String(b.subject) : undefined, replies: b.replies, vis: b.vis === 'friends' ? 'friends' : undefined };
       const r = await D.run('INSERT INTO scheduled(user_id,payload,at,created) VALUES(?,?,?,?)', user.id, JSON.stringify(payload), at, Date.now());
       return json({ ok: true, id: r.meta.last_row_id, at: at });
     }
@@ -1491,8 +1689,8 @@ async function route(req, env, url) {
   if (seg[0] === 'trending' && method === 'GET') {
     const since = Date.now() - 864e5;
     const loc = url.searchParams.get('local') === '1';
-    const topics = await D.all('SELECT pt.topic AS topic, COUNT(DISTINCT p.user_id) AS people, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? ' + (loc ? 'AND p.user_id IN (SELECT id FROM users WHERE inst=?) ' : '') + 'AND p.id NOT IN (SELECT post_id FROM outlet_posts) AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY people DESC, n DESC, pt.topic LIMIT 10', since, ...(loc ? [inst.id] : []));
-    const rows = await D.all('SELECT p.id, (SELECT COUNT(*) FROM likes WHERE post_id=p.id) + (SELECT COUNT(*) FROM reactions WHERE post_id=p.id) + 2*(SELECT COUNT(*) FROM refs WHERE target_id=p.id) + (SELECT COUNT(*) FROM posts c WHERE c.parent_id=p.id) AS score FROM posts p WHERE p.parent_id IS NULL AND p.created>? ' + (loc ? 'AND p.user_id IN (SELECT id FROM users WHERE inst=?) ' : '') + 'AND p.id NOT IN (SELECT post_id FROM refs) AND p.id NOT IN (SELECT post_id FROM outlet_posts) AND p.id NOT IN (SELECT post_id FROM post_topics WHERE topic IN (SELECT topic FROM hidden_topics)) ORDER BY score DESC, p.id DESC LIMIT 5', since, ...(loc ? [inst.id] : []));
+    const topics = await D.all('SELECT pt.topic AS topic, COUNT(DISTINCT p.user_id) AS people, COUNT(*) AS n FROM post_topics pt JOIN posts p ON p.id=pt.post_id WHERE p.created>? ' + (loc ? 'AND p.user_id IN (SELECT id FROM users WHERE inst=?) ' : '') + 'AND p.id NOT IN (SELECT post_id FROM outlet_posts) AND p.id NOT IN (SELECT post_id FROM post_vis) AND pt.topic NOT IN (SELECT topic FROM hidden_topics) GROUP BY pt.topic ORDER BY people DESC, n DESC, pt.topic LIMIT 10', since, ...(loc ? [inst.id] : []));
+    const rows = await D.all('SELECT p.id, (SELECT COUNT(*) FROM likes WHERE post_id=p.id) + (SELECT COUNT(*) FROM reactions WHERE post_id=p.id) + 2*(SELECT COUNT(*) FROM refs WHERE target_id=p.id) + (SELECT COUNT(*) FROM posts c WHERE c.parent_id=p.id) AS score FROM posts p WHERE p.parent_id IS NULL AND p.created>? ' + (loc ? 'AND p.user_id IN (SELECT id FROM users WHERE inst=?) ' : '') + 'AND p.id NOT IN (SELECT post_id FROM refs) AND p.id NOT IN (SELECT post_id FROM outlet_posts) AND p.id NOT IN (SELECT post_id FROM post_vis) AND p.id NOT IN (SELECT post_id FROM post_topics WHERE topic IN (SELECT topic FROM hidden_topics)) ORDER BY score DESC, p.id DESC LIMIT 5', since, ...(loc ? [inst.id] : []));
     const hot = rows.filter((r) => r.score > 0);
     const posts = hot.length ? (await listPosts(env, D, user, `p.id IN (${ph(hot.length)})`, hot.map((r) => r.id), { limit: 5 })).posts : [];
     const rank = new Map(hot.map((r, i) => [r.id, i]));
@@ -1503,7 +1701,7 @@ async function route(req, env, url) {
     const q = String(url.searchParams.get('q') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 30);
     if (!q) return json({ users: [] });
     const me2 = user ? user.id : 0;
-    const rows = await D.all(`SELECT x.username, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar FROM users x LEFT JOIN profiles pr ON pr.user_id=x.id WHERE x.username LIKE ? ESCAPE '\\' ORDER BY (x.id IN (SELECT followee FROM follows WHERE follower=?)) DESC, length(x.username), x.username LIMIT 6`, q.replace(/[%_\\]/g, '\\$&') + '%', me2);
+    const rows = await D.all(`SELECT x.username, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar FROM users x LEFT JOIN profiles pr ON pr.user_id=x.id WHERE x.username LIKE ? ESCAPE '\\' ORDER BY (x.id IN (SELECT followee FROM follows WHERE follower=?)) DESC, length(x.username), x.username LIMIT 6`, q.replace(/[%_\\]/g, '\\$&') + '%', me2);
     return json({ users: rows });
   }
   if (seg[0] === 'announcements' && method === 'GET') {
@@ -1512,7 +1710,8 @@ async function route(req, env, url) {
   if (seg[0] === 'dm') {
     need();
     const peerRow = async (name) => {
-      const p = await D.first(`SELECT u.id, u.username, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=u.id) AS avatar FROM users u LEFT JOIN profiles pr ON pr.user_id=u.id WHERE u.username=?`, name);
+      const pu = await userBy(D, inst, name, 'id');
+      const p = pu && (await D.first(`SELECT u.id, u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=u.id) AS avatar FROM users u LEFT JOIN profiles pr ON pr.user_id=u.id WHERE u.id=?`, pu.id));
       if (!p) bad('We could not find that person!', 404);
       return p;
     };
@@ -1523,10 +1722,10 @@ async function route(req, env, url) {
            UNION ALL SELECT id, sender_id AS peer, recipient_id, read FROM dms WHERE recipient_id=?
          ) GROUP BY peer ORDER BY last_id DESC LIMIT 50`, user.id, user.id, user.id);
       if (!rows.length) return json({ conversations: [] });
-      const peers = await D.all(`SELECT u.id, u.username, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=u.id) AS avatar FROM users u LEFT JOIN profiles pr ON pr.user_id=u.id WHERE u.id IN (${ph(rows.length)})`, ...rows.map((r) => r.peer));
+      const peers = await D.all(`SELECT u.id, u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=u.id) AS avatar FROM users u LEFT JOIN profiles pr ON pr.user_id=u.id WHERE u.id IN (${ph(rows.length)})`, ...rows.map((r) => r.peer));
       const lasts = await D.all(`SELECT id, sender_id, body, created FROM dms WHERE id IN (${ph(rows.length)})`, ...rows.map((r) => r.last_id));
       const pb = new Map(peers.map((p) => [p.id, p])), lb = new Map(lasts.map((m) => [m.id, m]));
-      return json({ conversations: rows.filter((r) => pb.has(r.peer)).map((r) => { const p = pb.get(r.peer), m = lb.get(r.last_id); return { username: p.username, display_name: p.display_name, color: p.color, avatar: p.avatar, unread: r.unread, last: { body: m.body, created: m.created, mine: m.sender_id === user.id } }; }) });
+      return json({ conversations: rows.filter((r) => pb.has(r.peer)).map((r) => { const p = pb.get(r.peer), m = lb.get(r.last_id); return { username: p.username, inst_slug: p.inst_slug, display_name: p.display_name, color: p.color, avatar: p.avatar, unread: r.unread, last: { body: m.body, created: m.created, mine: m.sender_id === user.id } }; }) });
     }
     if (seg[1] === 'msg' && seg[2] && method === 'DELETE') {
       const id = intParam(seg[2]);
@@ -1547,7 +1746,7 @@ async function route(req, env, url) {
           if (st.dm === 'none') { canSend = false; why = 'This person is not taking messages.'; }
           else if (st.dm === 'following' && !(await D.first('SELECT 1 AS x FROM follows WHERE follower=? AND followee=?', peer.id, user.id))) { canSend = false; why = 'This person only takes messages from people they follow.'; }
         }
-        return json({ peer: { username: peer.username, display_name: peer.display_name, color: peer.color, avatar: peer.avatar }, messages: rows.reverse().map((m) => ({ id: m.id, mine: m.sender_id === user.id, body: m.body, created: m.created, read: !!m.read })), more: rows.length === 40, canSend, why });
+        return json({ peer: { username: peer.username, inst_slug: peer.inst_slug, display_name: peer.display_name, color: peer.color, avatar: peer.avatar }, messages: rows.reverse().map((m) => ({ id: m.id, mine: m.sender_id === user.id, body: m.body, created: m.created, read: !!m.read })), more: rows.length === 40, canSend, why });
       }
       if (method === 'POST') {
         await rate(D, 'dm:' + user.id, 30, 60);
@@ -1574,10 +1773,10 @@ async function route(req, env, url) {
     };
     if (!seg[1] && method === 'GET') {
       const who = url.searchParams.get('user');
-      const u = who ? await D.first('SELECT id FROM users WHERE username=?', who) : user && { id: user.id };
+      const u = who ? await userBy(D, inst, who, 'id') : user && { id: user.id };
       if (!u) bad(who ? 'We could not find that person!' : 'Log in first!', who ? 404 : 401);
       const has = url.searchParams.get('has');
-      const rows = await D.all(`SELECT l.id, l.name, l.description, (SELECT COUNT(*) FROM list_members m WHERE m.list_id=l.id) AS members ${has ? ', EXISTS(SELECT 1 FROM list_members m2 WHERE m2.list_id=l.id AND m2.user_id=(SELECT id FROM users WHERE username=?)) AS has' : ''} FROM lists l WHERE l.user_id=? ORDER BY l.id DESC`, ...(has ? [has] : []), u.id);
+      const rows = await D.all(`SELECT l.id, l.name, l.description, (SELECT COUNT(*) FROM list_members m WHERE m.list_id=l.id) AS members ${has ? ', EXISTS(SELECT 1 FROM list_members m2 WHERE m2.list_id=l.id AND m2.user_id=?) AS has' : ''} FROM lists l WHERE l.user_id=? ORDER BY l.id DESC`, ...(has ? [((await userBy(D, inst, has, 'id')) || { id: 0 }).id] : []), u.id);
       return json({ lists: rows.map((r) => ({ ...r, has: !!r.has })) });
     }
     if (!seg[1] && method === 'POST') {
@@ -1593,7 +1792,7 @@ async function route(req, env, url) {
     const id = intParam(seg[1]);
     if (id && !seg[2] && method === 'GET') {
       const l = await owner(id);
-      const members = await D.all(`SELECT x.username, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar FROM list_members m JOIN users x ON x.id=m.user_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE m.list_id=? ORDER BY x.username`, id);
+      const members = await D.all(`SELECT x.username, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar FROM list_members m JOIN users x ON x.id=m.user_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE m.list_id=? ORDER BY x.username`, id);
       return json({ list: { id: l.id, name: l.name, description: l.description, owner: l.username, isOwner: !!user && user.id === l.user_id }, members });
     }
     if (id && !seg[2] && (method === 'PATCH' || method === 'DELETE')) {
@@ -1611,14 +1810,14 @@ async function route(req, env, url) {
       if (l.user_id !== user.id) bad('Only the owner can change this list!', 403);
       if (method === 'POST') {
         const b = await readJson(req, 1000);
-        const u = await D.first('SELECT id FROM users WHERE username=?', String(b.username || ''));
+        const u = await userBy(D, inst, String(b.username || ''), 'id');
         if (!u) bad('We could not find that person!', 404);
         if ((await D.first('SELECT COUNT(*) AS n FROM list_members WHERE list_id=?', id)).n >= 200) bad('A list can hold 200 people!');
         await D.run('INSERT OR IGNORE INTO list_members(list_id,user_id) VALUES(?,?)', id, u.id);
         return json({ ok: true });
       }
       if (method === 'DELETE' && seg[3]) {
-        await D.run('DELETE FROM list_members WHERE list_id=? AND user_id=(SELECT id FROM users WHERE username=?)', id, seg[3]);
+        await D.run('DELETE FROM list_members WHERE list_id=? AND user_id=(SELECT id FROM users WHERE username=? AND inst=?)', id, seg[3], inst.id);
         return json({ ok: true });
       }
     }
@@ -1675,7 +1874,7 @@ async function route(req, env, url) {
         const uncat = (await D.first('SELECT COUNT(*) AS n FROM outlet_posts WHERE outlet_id=? AND subject_id IS NULL', o.id)).n;
         const members = (await D.first('SELECT COUNT(*) AS n FROM outlet_members WHERE outlet_id=?', o.id)).n;
         const postCount = (await D.first('SELECT COUNT(*) AS n FROM outlet_posts WHERE outlet_id=?', o.id)).n;
-        const mods = await D.all("SELECT u.username, m.role FROM outlet_members m JOIN users u ON u.id=m.user_id WHERE m.outlet_id=? AND m.role IN ('owner','mod') ORDER BY m.role DESC, u.username", o.id);
+        const mods = await D.all("SELECT u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, m.role FROM outlet_members m JOIN users u ON u.id=m.user_id WHERE m.outlet_id=? AND m.role IN ('owner','mod') ORDER BY m.role DESC, u.username", o.id);
         const pinIds = (await D.all('SELECT post_id FROM outlet_posts WHERE outlet_id=? AND pinned=1 ORDER BY post_id DESC LIMIT 5', o.id)).map((r) => r.post_id);
         const pinned = pinIds.length ? (await listPosts(env, D, user, `p.id IN (${ph(pinIds.length)})`, pinIds, { limit: 5 })).posts : [];
         const banned = user ? !!(await D.first('SELECT 1 AS x FROM outlet_bans WHERE outlet_id=? AND user_id=?', o.id, user.id)) : false;
@@ -1708,12 +1907,12 @@ async function route(req, env, url) {
         return json({ joined: false });
       }
       if (seg[2] === 'members' && method === 'GET') {
-        return json({ users: await D.all(`SELECT x.username, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar, m.role FROM outlet_members m JOIN users x ON x.id=m.user_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE m.outlet_id=? ORDER BY m.role DESC, m.joined LIMIT 200`, o.id) });
+        return json({ users: await D.all(`SELECT x.username, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar, m.role FROM outlet_members m JOIN users x ON x.id=m.user_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE m.outlet_id=? ORDER BY m.role DESC, m.joined LIMIT 200`, o.id) });
       }
       if (seg[2] === 'mods' && method === 'POST') {
         needOwner();
         const b = await readJson(req, 1000);
-        const u = await D.first('SELECT id FROM users WHERE username=?', String(b.username || '').trim());
+        const u = await userBy(D, inst, String(b.username || '').trim(), 'id');
         if (!u) bad('We could not find that person!', 404);
         if (u.id === o.owner_id) bad('That is you, the owner!');
         if ((await D.first("SELECT COUNT(*) AS n FROM outlet_members WHERE outlet_id=? AND role='mod'", o.id)).n >= 10) bad('An Outlet can have 10 moderators!');
@@ -1722,16 +1921,16 @@ async function route(req, env, url) {
       }
       if (seg[2] === 'mods' && seg[3] && method === 'DELETE') {
         needOwner();
-        await D.run("UPDATE outlet_members SET role='member' WHERE outlet_id=? AND role='mod' AND user_id=(SELECT id FROM users WHERE username=?)", o.id, seg[3]);
+        await D.run("UPDATE outlet_members SET role='member' WHERE outlet_id=? AND role='mod' AND user_id=(SELECT id FROM users WHERE username=? AND inst=?)", o.id, seg[3], inst.id);
         return json({ ok: true });
       }
       if (seg[2] === 'bans' && method === 'GET') {
         needMod();
-        return json({ users: await D.all('SELECT x.username FROM outlet_bans b JOIN users x ON x.id=b.user_id WHERE b.outlet_id=? ORDER BY x.username', o.id) });
+        return json({ users: await D.all('SELECT x.username, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug FROM outlet_bans b JOIN users x ON x.id=b.user_id WHERE b.outlet_id=? ORDER BY x.username', o.id) });
       }
       if (seg[2] === 'bans' && seg[3] && (method === 'POST' || method === 'DELETE')) {
         needMod();
-        const u = await D.first('SELECT id FROM users WHERE username=?', seg[3]);
+        const u = await userBy(D, inst, seg[3], 'id');
         if (!u) bad('We could not find that person!', 404);
         if (method === 'DELETE') { await D.run('DELETE FROM outlet_bans WHERE outlet_id=? AND user_id=?', o.id, u.id); return json({ ok: true }); }
         const target = await outletRole(D, o.id, u.id);
@@ -1807,7 +2006,7 @@ async function route(req, env, url) {
     if (seg[1] === 'posts' && seg[2] && seg[3] === 'remove' && method === 'POST') { await purgePosts(D, [intParam(seg[2])]); return json({ ok: true }); }
     if (seg[1] === 'users' && seg[2] && seg[3] === 'ban' && method === 'POST') {
       const b = await readJson(req, 1000);
-      const u = await D.first('SELECT id, username FROM users WHERE username=?', seg[2]);
+      const u = await userBy(D, inst, seg[2], 'id, username, inst');
       if (!u) bad('We could not find that person!', 404);
       if (isAdmin(env, u)) bad('You cannot suspend an admin!');
       if (role === 'mod' && (await D.first('SELECT 1 AS x FROM site_mods WHERE user_id=?', u.id))) bad('Moderators cannot suspend each other!', 403);
@@ -1817,7 +2016,7 @@ async function route(req, env, url) {
       await D.batch([D.stmt('INSERT INTO bans(user_id,reason,created) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason', u.id, cleanLine(b.reason, 100), Date.now()), D.stmt('DELETE FROM sessions WHERE user_id=?', u.id)]);
       return json({ ok: true });
     }
-    if (seg[1] === 'users' && seg[2] && seg[3] === 'unban' && method === 'POST') { await D.batch([D.stmt('DELETE FROM ban_until WHERE user_id=(SELECT id FROM users WHERE username=?)', seg[2]), D.stmt('DELETE FROM bans WHERE user_id=(SELECT id FROM users WHERE username=?)', seg[2])]); return json({ ok: true }); }
+    if (seg[1] === 'users' && seg[2] && seg[3] === 'unban' && method === 'POST') { await D.batch([D.stmt('DELETE FROM ban_until WHERE user_id=?', ((await userBy(D, inst, seg[2], 'id')) || { id: 0 }).id), D.stmt('DELETE FROM bans WHERE user_id=?', ((await userBy(D, inst, seg[2], 'id')) || { id: 0 }).id)]); return json({ ok: true }); }
     if (seg[1] === 'stats' && method === 'GET') {
       const n = async (sql, ...a) => (await D.first(sql, ...a)).n;
       const since = Date.now() - 14 * 864e5;
@@ -1834,19 +2033,19 @@ async function route(req, env, url) {
         activeToday: await n('SELECT COUNT(DISTINCT user_id) AS n FROM posts WHERE created>?', Date.now() - 864e5),
         signupDays: await D.all(`SELECT ${day} AS d, COUNT(*) AS n FROM users WHERE created>? GROUP BY d`, since),
         postDays: await D.all(`SELECT ${day} AS d, COUNT(*) AS n FROM posts WHERE created>? GROUP BY d`, since),
-        newest: await D.all('SELECT username, created FROM users ORDER BY id DESC LIMIT 6'),
+        newest: await D.all('SELECT username, (SELECT slug FROM instances WHERE id=users.inst) AS inst_slug, created FROM users ORDER BY id DESC LIMIT 6'),
       });
     }
     if (seg[1] === 'users' && !seg[2] && method === 'GET') {
       const q = String(url.searchParams.get('q') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 30);
       const before = intParam(url.searchParams.get('before'));
-      const rows = await D.all(`SELECT u.id, u.username, u.created, (SELECT COUNT(*) FROM posts WHERE user_id=u.id) AS posts, (SELECT COUNT(*) FROM follows WHERE followee=u.id) AS followers,
+      const rows = await D.all(`SELECT u.id, u.username, u.inst, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, u.created, (SELECT COUNT(*) FROM posts WHERE user_id=u.id) AS posts, (SELECT COUNT(*) FROM follows WHERE followee=u.id) AS followers,
         (SELECT kind FROM badges WHERE user_id=u.id) AS badge, (SELECT note FROM admin_notes WHERE user_id=u.id) AS note, (SELECT COUNT(*) FROM site_mods WHERE user_id=u.id) AS is_mod, (SELECT until FROM ban_until WHERE user_id=u.id) AS banned_until, (SELECT reason FROM bans WHERE user_id=u.id) AS banned_reason, (SELECT COUNT(*) FROM bans WHERE user_id=u.id) AS banned,
         (SELECT MAX(created) FROM sessions WHERE user_id=u.id) AS last_login FROM users u WHERE u.username LIKE ? ESCAPE '\\' ${before ? 'AND u.id < ?' : ''} ORDER BY u.id DESC LIMIT 30`, '%' + q.replace(/[%_\\]/g, '\\$&') + '%', ...(before ? [before] : []));
       return json({ users: rows.map((r) => ({ ...r, banned: !!r.banned, mod: !!r.is_mod, admin: isAdmin(env, r) })), cursor: rows.length === 30 ? rows[rows.length - 1].id : null });
     }
     if (seg[1] === 'users' && seg[2] && ['signout', 'password', 'delete', 'purge-posts'].includes(seg[3]) && method === 'POST') {
-      const u = await D.first('SELECT id, username FROM users WHERE username=?', seg[2]);
+      const u = await userBy(D, inst, seg[2], 'id, username, inst');
       if (!u) bad('We could not find that person!', 404);
       if (isAdmin(env, u)) bad('You cannot do that to an admin!', 403);
       if (seg[3] === 'signout') await D.run('DELETE FROM sessions WHERE user_id=?', u.id);
@@ -1897,7 +2096,7 @@ async function route(req, env, url) {
       return json({ post });
     }
     if (seg[1] === 'users' && seg[2] && seg[3] === 'warn' && method === 'POST') {
-      const u = await D.first('SELECT id FROM users WHERE username=?', seg[2]);
+      const u = await userBy(D, inst, seg[2], 'id');
       if (!u) bad('We could not find that person!', 404);
       const b = await readJson(req, 1500);
       const text = cleanLine(b.text, 400);
@@ -1906,7 +2105,7 @@ async function route(req, env, url) {
       return json({ ok: true });
     }
     if (seg[1] === 'users' && seg[2] && seg[3] === 'note' && method === 'POST') {
-      const u = await D.first('SELECT id FROM users WHERE username=?', seg[2]);
+      const u = await userBy(D, inst, seg[2], 'id');
       if (!u) bad('We could not find that person!', 404);
       const b = await readJson(req, 2000);
       const note = cleanLine(b.note, 500);
@@ -1940,15 +2139,15 @@ async function route(req, env, url) {
     }
     if (seg[1] === 'invites' && seg[2] && seg[3] === 'toggle' && method === 'POST') { await D.run('UPDATE invites SET disabled = 1 - disabled WHERE code=?', seg[2]); return json({ ok: true }); }
     if (seg[1] === 'invites' && seg[2] && method === 'DELETE') { await D.run('DELETE FROM invites WHERE code=?', seg[2]); return json({ ok: true }); }
-    if (seg[1] === 'mods' && method === 'GET') return json({ mods: await D.all('SELECT u.username FROM site_mods m JOIN users u ON u.id=m.user_id ORDER BY u.username') });
+    if (seg[1] === 'mods' && method === 'GET') return json({ mods: await D.all('SELECT u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug FROM site_mods m JOIN users u ON u.id=m.user_id ORDER BY u.username') });
     if (seg[1] === 'mods' && !seg[2] && method === 'POST') {
       const b = await readJson(req, 500);
-      const u = await D.first('SELECT id FROM users WHERE username=?', String(b.username || ''));
+      const u = await userBy(D, inst, String(b.username || ''), 'id');
       if (!u) bad('We could not find that person!', 404);
       await D.run('INSERT OR IGNORE INTO site_mods(user_id) VALUES(?)', u.id);
       return json({ ok: true });
     }
-    if (seg[1] === 'mods' && seg[2] && method === 'DELETE') { await D.run('DELETE FROM site_mods WHERE user_id=(SELECT id FROM users WHERE username=?)', seg[2]); return json({ ok: true }); }
+    if (seg[1] === 'mods' && seg[2] && method === 'DELETE') { await D.run('DELETE FROM site_mods WHERE user_id=?', ((await userBy(D, inst, seg[2], 'id')) || { id: 0 }).id); return json({ ok: true }); }
     if (seg[1] === 'topics' && method === 'GET') {
       return json({
         hidden: (await D.all('SELECT topic FROM hidden_topics ORDER BY topic')).map((r) => r.topic),
@@ -1996,7 +2195,7 @@ async function route(req, env, url) {
     }
     if (seg[1] === 'badges' && method === 'POST') {
       const b = await readJson(req, 500);
-      const u = await D.first('SELECT id FROM users WHERE username=?', String(b.username || ''));
+      const u = await userBy(D, inst, String(b.username || ''), 'id');
       if (!u) bad('We could not find that person!', 404);
       if (!b.kind) await D.run('DELETE FROM badges WHERE user_id=?', u.id);
       else {
@@ -2015,7 +2214,7 @@ async function route(req, env, url) {
       return json({ ok: true, id: r.meta.last_row_id });
     }
     if (seg[1] === 'announcements' && seg[2] && method === 'DELETE') { await D.run('DELETE FROM announcements WHERE id=?', intParam(seg[2])); return json({ ok: true }); }
-    if (seg[1] === 'bans' && method === 'GET') return json({ bans: await D.all('SELECT u.username, b.reason, b.created FROM bans b JOIN users u ON u.id=b.user_id ORDER BY b.created DESC') });
+    if (seg[1] === 'bans' && method === 'GET') return json({ bans: await D.all('SELECT u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, b.reason, b.created FROM bans b JOIN users u ON u.id=b.user_id ORDER BY b.created DESC') });
   }
 
   return json({ error: 'There is nothing at that address!' }, 404);
@@ -2029,7 +2228,7 @@ export default {
     const url = new URL(req.url);
     try {
       await ensureSchema(env);
-      return await route(req, env, url);
+      return await handlesFor(req, env, url, await route(req, env, url));
     } catch (e) {
       if (e instanceof HttpError) return json({ error: e.message }, e.status);
       console.error(e);

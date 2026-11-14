@@ -245,7 +245,48 @@
     paint();
     return b;
   };
-  const userRow = (u) => h('li', { class: 'urow' }, avatar(u), h('div', { class: 'ut' }, h('a', { class: 'who', href: '/u/' + enc(u.username), 'data-link': true }, nameOf(u)), h('div', { class: 'muted small' }, '@' + u.username + (u.bio ? ' · ' + u.bio : ''))), me && me.username !== u.username && u.isFollowing !== undefined ? followBtn(u, true) : null);
+  // ---------- Friends: mutual, and separate from following ----------
+  let fcache = null;
+  async function loadFriends() {
+    fcache = null;
+    if (!me) return;
+    try {
+      const r = await api('/friends');
+      const low = (a) => new Set(a.map((x) => String(x.username || x).toLowerCase()));
+      fcache = { friends: low(r.friends), incoming: low(r.incoming), outgoing: low(r.outgoing) };
+    } catch (e) { fcache = null; }
+  }
+  const friendStateOf = (name) => { if (!fcache) return null; const k = String(name).toLowerCase(); return fcache.friends.has(k) ? 'friends' : fcache.incoming.has(k) ? 'incoming' : fcache.outgoing.has(k) ? 'outgoing' : 'none'; };
+  async function friendAct(username, action) {
+    const r = await api('/users/' + enc(username) + '/friend', { method: 'POST', body: { action } });
+    if (fcache) { const k = username.toLowerCase(); ['friends', 'incoming', 'outgoing'].forEach((n) => fcache[n].delete(k)); if (r.state === 'friends') fcache.friends.add(k); else if (r.state === 'outgoing') fcache.outgoing.add(k); }
+    return r;
+  }
+  // one button that follows the state: Add friend, Requested (press to cancel), Accept, Friends (press to unfriend)
+  const friendBtn = (u, state, small, onState) => {
+    const wrap = h('span', { class: 'fbtns' });
+    const b = h('button', { class: 'btn' + (small ? ' small' : ''), type: 'button' });
+    const decline = h('button', { class: 'btn ghost' + (small ? ' small' : ''), type: 'button', hidden: true }, 'Decline');
+    const paint = () => {
+      b.textContent = { none: 'Add friend', outgoing: 'Requested', incoming: 'Accept', friends: 'Friends' }[state] || 'Add friend';
+      b.className = 'btn' + (small ? ' small' : '') + (state === 'friends' || state === 'outgoing' ? ' on' : '');
+      b.title = { none: 'Send a friend request', outgoing: 'Press to cancel your request', incoming: 'Accept their friend request', friends: 'Press to unfriend' }[state] || '';
+      decline.hidden = state !== 'incoming';
+    };
+    const run = async (action, msg) => { const r = await friendAct(u.username, action); state = r.state; if (u.friends !== undefined && u.friends !== null) u.friends = r.friends; if (u.friendState !== undefined) u.friendState = state; paint(); if (onState) onState(state); if (msg) toast(msg(state)); };
+    b.addEventListener('click', safe(async () => {
+      if (!me) return go('/login');
+      if (state === 'none') await run('request', (st) => (st === 'friends' ? 'You are friends now!' : 'Friend request sent!'));
+      else if (state === 'outgoing') await run('cancel', () => 'Request canceled!');
+      else if (state === 'incoming') await run('accept', () => 'You are friends now!');
+      else if (confirm('Unfriend @' + u.username + '? Friends-only posts will be hidden from each other.')) await run('unfriend', () => 'Unfriended!');
+    }));
+    decline.addEventListener('click', safe(() => run('decline', () => 'Request declined!')));
+    paint();
+    wrap.append(b, decline);
+    return wrap;
+  };
+  const userRow = (u, withFriend) => h('li', { class: 'urow' }, avatar(u), h('div', { class: 'ut' }, h('a', { class: 'who', href: '/u/' + enc(u.username), 'data-link': true }, nameOf(u)), h('div', { class: 'muted small' }, '@' + u.username + (u.bio ? ' · ' + u.bio : ''))), me && me.username !== u.username && u.isFollowing !== undefined ? followBtn(u, true) : null, withFriend && me && me.username !== u.username && (!u.inst_slug || u.inst_slug === inst.slug) && friendStateOf(u.username) ? friendBtn(u, friendStateOf(u.username), true) : null);
 
   async function drawSide() {
     try {
@@ -434,7 +475,7 @@
     const article = h('article', { class: 'post' + (opts.focus ? ' focus' : '') },
       avatar(x),
       h('div', { class: 'pb' },
-        h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), badgeEl(x), h('span', { class: 'muted small' }, '@' + x.username), x.inst_slug && x.inst_slug !== inst.slug ? h('span', { class: 'itag', title: 'From the ' + x.inst_slug + ' instance' }, x.inst_slug) : null, h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, opts.pinned || (ol && ol.pinned) ? h('span', { class: 'pinned' }, icon('pin', 'solid'), 'Pinned') : null, ol && ol.locked ? h('span', { class: 'pinned' }, icon('lock'), 'Locked') : null),
+        h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), badgeEl(x), h('span', { class: 'muted small' }, '@' + x.username), x.inst_slug && x.inst_slug !== inst.slug && !x.username.includes("@") ? h('span', { class: 'itag', title: 'From the ' + x.inst_slug + ' instance' }, x.inst_slug) : null, h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, x.vis === 'friends' ? h('span', { class: 'pinned friendsonly', title: 'Only friends can see this post' }, icon('users'), 'Friends only') : null, opts.pinned || (ol && ol.pinned) ? h('span', { class: 'pinned' }, icon('pin', 'solid'), 'Pinned') : null, ol && ol.locked ? h('span', { class: 'pinned' }, icon('lock'), 'Locked') : null),
         outletChip,
         x.replyPolicy ? h('div', { class: 'ptag muted small' }, icon('lock'), x.replyPolicy === 'following' ? ' Only people the author follows can reply' : ' Only mentioned people can reply') : null,
         warn,
@@ -506,6 +547,8 @@
       btn.textContent = when.hidden ? (opts.button || 'Post') : 'Schedule';
     } }, 'Later');
     const repSel = canPolicy ? h('select', { class: 'subsel', 'aria-label': 'Who can reply' }, [['everyone', 'Anyone can reply'], ['following', 'People I follow can reply'], ['mentioned', 'Only people I mention can reply']].map(([v, l]) => h('option', { value: v }, l))) : null;
+    // who can see it: everyone, or only your friends
+    const visSel = !opts.parent && !opts.outlet && me ? h('select', { class: 'subsel', 'aria-label': 'Who can see this post' }, [['', 'Everyone can see it'], ['friends', 'Friends only']].map(([v, l]) => h('option', { value: v }, l))) : null;
     // @name suggestions
     const ac = h('div', { class: 'ac card', hidden: true, role: 'listbox' });
     let acT = 0;
@@ -661,6 +704,7 @@
         const body = { body: area.value, parent: opts.parent, quote: opts.quote ? opts.quote.id : undefined, outlet: opts.outlet, subject: subSel && subSel.value ? subSel.value : undefined, cw: cwOn ? cwIn.value : undefined, files: files.filter((f) => f.id).map((f) => ({ id: f.id, alt: f.alt || '' })) };
         if (pollOn) body.poll = { options: pollInputs.map((i) => i.value).filter((v) => v.trim()), hours: parseInt(dur.value, 10) };
         if (repSel && repSel.value !== 'everyone') body.replies = repSel.value;
+        if (visSel && visSel.value) body.vis = visSel.value;
         const sched = !when.hidden && when.value && !opts.parent && !opts.quote;
         if (sched) body.at = new Date(when.value).getTime();
         const r = sched ? await api('/scheduled', { method: 'POST', body }) : await api('/posts', { method: 'POST', body });
@@ -682,7 +726,7 @@
       subSel ? h('label', { class: 'small muted subrow' }, icon('forum'), ' Post in ', subSel) : null,
       area, ac, cwIn, tray, pollBox, extraBox, preview,
       schedBtn ? h('div', { class: 'schedrow' }, when) : null,
-      repSel ? h('label', { class: 'small muted subrow' }, icon('lock'), ' ', repSel) : null,
+      repSel || visSel ? h('div', { class: 'small muted subrow subpair' }, repSel ? h('span', { class: 'subitem' }, icon('lock'), ' ', repSel) : null, visSel ? h('span', { class: 'subitem' }, icon('users'), ' ', visSel) : null) : null,
       opts.quote ? h('div', { class: 'quote small' }, h('b', null, nameOf(opts.quote)), ' ', '@' + opts.quote.username, h('div', { class: 'qbody' }, opts.quote.body.slice(0, 200))) : null,
       h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, fmtMenu, opts.parent || opts.noPoll ? null : pollBtn, cwBtn, emojiMenu, opts.parent || opts.quote ? null : threadBtn, schedBtn, count), btn),
       h('div', { class: 'muted small' }, 'Keydown works here: **bold**, *italic*, `code`, #G#chips#'), err);
@@ -873,20 +917,20 @@
     const tabParam = params().get('tab');
     // before you log in, the main Beta is a front door: pick where to join
     if (!me && !tabParam && inst.isMain) return landingPage();
-    const tab = ['home', 'local', 'all'].includes(tabParam) ? tabParam : 'local';
-    const query = tab === 'home' && me ? { scope: 'home' } : tab === 'local' ? { scope: 'local' } : {};
-    const f = feed('/feed', query, { empty: tab === 'home' ? 'Your home feed is empty. Follow people and Topics, or look at the Local and Federated timelines!' : 'No posts yet. Be the first!' });
+    const tab = ['home', 'friends', 'local', 'all'].includes(tabParam) && (tabParam !== 'friends' || me) ? tabParam : 'local';
+    const query = tab === 'home' && me ? { scope: 'home' } : tab === 'friends' ? { scope: 'friends' } : tab === 'local' ? { scope: 'local' } : {};
+    const f = feed('/feed', query, { empty: tab === 'home' ? 'Your home feed is empty. Follow people and Topics, or look at the Local and Federated timelines!' : tab === 'friends' ? 'Nothing from friends yet! Add a few friends from their profiles, and post something Friends only!' : 'No posts yet. Be the first!' });
     const banner = h('button', { class: 'btn newposts', type: 'button', hidden: true, onclick: () => render() }, 'New posts, show them!');
     const onTab = (k, label, title) => h('a', { href: k === 'local' ? '/' : '/?tab=' + k, 'data-link': true, class: tab === k ? 'on' : '', title }, label);
     show(
       !me ? instanceHero() : null,
       me ? composer({ onPosted: (p) => { f.add(p); toast('Posted!'); drawSide(); } }) : null,
-      h('div', { class: 'tabs' }, onTab('local', 'Local', 'Everyone on ' + inst.name), me ? onTab('home', 'Following', 'People and Topics you follow') : null, onTab('all', 'Federated', 'Every instance together')),
+      h('div', { class: 'tabs' }, onTab('local', 'Local', 'Everyone on ' + inst.name), me ? onTab('home', 'Following', 'People and Topics you follow') : null, me ? onTab('friends', 'Friends', 'You and your friends') : null, onTab('all', 'Federated', 'Every instance together')),
       banner, f);
     await f.ready;
     timers.push(setInterval(async () => {
       try {
-        const r = await api('/feed?limit=1' + (tab === 'home' && me ? '&scope=home' : tab === 'local' ? '&scope=local' : ''));
+        const r = await api('/feed?limit=1' + (tab === 'home' && me ? '&scope=home' : tab === 'friends' ? '&scope=friends' : tab === 'local' ? '&scope=local' : ''));
         if (r.posts[0] && f.topId && r.posts[0].id > f.topId && !(me && r.posts[0].username === me.username)) banner.hidden = false;
       } catch (e) {}
     }, 45000));
@@ -986,7 +1030,7 @@
       h('label', { for: 'id' }, 'Description'), desc,
       h('label', { for: 'ir' }, 'House rules'), rules,
       h('label', { for: 'ig' }, 'Sign-up'), reg,
-      h('h2', null, 'Your admin account'), h('p', { class: 'muted small' }, 'Accounts live on one instance, so this one is made on your new instance. Usernames are unique across all of Beta!'),
+      h('h2', null, 'Your admin account'), h('p', { class: 'muted small' }, 'Accounts live on one instance, so this one is made on your new instance. Usernames are unique on each instance!'),
       h('label', { for: 'iu' }, 'Username'), user, h('label', { for: 'ip' }, 'Password (8 or more characters)'), pw,
       err, h('p', null, h('button', { class: 'btn', type: 'submit' }, 'Create the instance')));
     show(form, done);
@@ -1077,10 +1121,20 @@
     const { user } = await api('/users/' + enc(name));
     setTitle(nameOf(user));
     drawSide();
+    if (sub === 'friends') {
+      const r = await api('/users/' + enc(user.username) + '/friends');
+      await loadFriends();
+      const mineF = me && me.username.toLowerCase() === user.username.toLowerCase();
+      show(h('div', { class: 'card' }, h('div', { class: 'row pad16' }, h('h1', null, link('/u/' + enc(user.username), nameOf(user)), ' ', h('span', { class: 'muted' }, 'Friends'))),
+        r.hidden ? h('div', { class: 'empty' }, 'This person keeps their friends list private!')
+          : r.users.length ? h('ul', { class: 'ulist big' }, r.users.map((u) => userRow(u, true))) : h('div', { class: 'empty' }, mineF ? 'No friends yet! Open a profile and press Add friend!' : 'No friends yet!')));
+      return;
+    }
     if (sub === 'followers' || sub === 'following') {
       const r = await api('/users/' + enc(user.username) + '/' + sub);
+      await loadFriends();
       show(h('div', { class: 'card' }, h('div', { class: 'row pad16' }, h('h1', null, link('/u/' + enc(user.username), nameOf(user)), ' ', h('span', { class: 'muted' }, sub === 'followers' ? 'Followers' : 'Following'))),
-        r.users.length ? h('ul', { class: 'ulist big' }, r.users.map(userRow)) : h('div', { class: 'empty' }, sub === 'followers' ? 'No followers yet!' : 'Not following anyone yet!')));
+        r.users.length ? h('ul', { class: 'ulist big' }, r.users.map((u) => userRow(u, true))) : h('div', { class: 'empty' }, sub === 'followers' ? 'No followers yet!' : 'Not following anyone yet!')));
       return;
     }
     if (sub === 'lists') return listsPage(user.username);
@@ -1088,7 +1142,8 @@
     const mineU = me && me.username.toLowerCase() === user.username.toLowerCase();
     const stats = h('div', { class: 'stats' });
     const fbtn = followBtn(user);
-    const paint = () => stats.replaceChildren(h('span', null, h('b', null, user.posts), ' posts'), link('/u/' + enc(user.username) + '/followers', h('b', null, user.followers), ' followers'), link('/u/' + enc(user.username) + '/following', h('b', null, user.following), ' following'), link('/u/' + enc(user.username) + '/lists', 'Lists'));
+    const frbtn = me && !mineU && ['none', 'outgoing', 'incoming', 'friends'].includes(user.friendState) ? friendBtn(user, user.friendState, false, (st) => { user.friendState = st; paint(); }) : null;
+    const paint = () => stats.replaceChildren(h('span', null, h('b', null, user.posts), ' posts'), link('/u/' + enc(user.username) + '/followers', h('b', null, user.followers), ' followers'), link('/u/' + enc(user.username) + '/following', h('b', null, user.following), ' following'), user.friends != null || mineU ? link('/u/' + enc(user.username) + '/friends', h('b', null, user.friends != null ? user.friends : ''), user.friends != null ? (user.friends === 1 ? ' friend' : ' friends') : 'Friends') : link('/u/' + enc(user.username) + '/friends', 'Friends'), user.mutualFriends ? h('span', { class: 'muted', title: 'Friends you both have' }, user.mutualFriends + (user.mutualFriends === 1 ? ' mutual friend' : ' mutual friends')) : '', link('/u/' + enc(user.username) + '/lists', 'Lists'));
     user.onChange = paint;
     paint();
     const relBtns = [];
@@ -1100,8 +1155,8 @@
     const path = '/u/' + enc(user.username);
     const f = feed('/feed', { user: user.username, tab }, { empty: { posts: 'No posts yet!', replies: 'No replies yet!', media: 'No pictures or files yet!', likes: 'No likes yet!' }[tab], pinnedId: user.pinned ? user.pinned.id : null });
     show(h('div', { class: 'card profile' },
-      h('div', { class: 'top2' }, avatar(user, true), h('div', { class: 'who2' }, h('h1', null, nameOf(user), badgeEl(user)), h('div', { class: 'muted' }, '@' + user.username, user.inst_slug && user.inst_slug !== inst.slug ? h('span', { class: 'itag', title: 'From the ' + user.inst_slug + ' instance' }, user.inst_slug) : null, user.followsYou ? h('span', { class: 'chip small' }, 'Follows you') : null, user.muted ? h('span', { class: 'chip small' }, 'Muted') : null, user.blocked ? h('span', { class: 'chip small' }, 'Blocked') : null)),
-        h('div', { class: 'pbtns' }, mineU ? h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Edit profile') : fbtn, mineU ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => changePicture(() => render()) }, 'Change picture') : null, me && !mineU ? h('a', { class: 'btn ghost small', href: '/messages/' + enc(user.username), 'data-link': true, title: 'Send a message' }, icon('mail')) : null, me && !mineU ? h('button', { class: 'btn ghost small', type: 'button', title: 'Add to a list', onclick: safe(() => listPicker(user.username)) }, icon('list')) : null, h('a', { class: 'btn ghost small', href: '/rss/user/' + enc(user.username), title: 'RSS feed' }, icon('rss')))),
+      h('div', { class: 'top2' }, avatar(user, true), h('div', { class: 'who2' }, h('h1', null, nameOf(user), badgeEl(user)), h('div', { class: 'muted' }, '@' + user.username, user.inst_slug && user.inst_slug !== inst.slug && !user.username.includes("@") ? h('span', { class: 'itag', title: 'From the ' + user.inst_slug + ' instance' }, user.inst_slug) : null, user.followsYou ? h('span', { class: 'chip small' }, 'Follows you') : null, user.muted ? h('span', { class: 'chip small' }, 'Muted') : null, user.blocked ? h('span', { class: 'chip small' }, 'Blocked') : null)),
+        h('div', { class: 'pbtns' }, mineU ? h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Edit profile') : [fbtn, frbtn], mineU ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => changePicture(() => render()) }, 'Change picture') : null, me && !mineU ? h('a', { class: 'btn ghost small', href: '/messages/' + enc(user.username), 'data-link': true, title: 'Send a message' }, icon('mail')) : null, me && !mineU ? h('button', { class: 'btn ghost small', type: 'button', title: 'Add to a list', onclick: safe(() => listPicker(user.username)) }, icon('list')) : null, h('a', { class: 'btn ghost small', href: '/rss/user/' + enc(user.username), title: 'RSS feed' }, icon('rss')))),
       user.bio ? h('p', null, rich(user.bio)) : null,
       user.fields && user.fields.length ? h('dl', { class: 'pfields' }, user.fields.map((f) => [h('dt', null, f.label), h('dd', null, /^https?:\/\/[^\s<>"']{3,100}$/i.test(f.value) ? h('a', { href: f.value, rel: 'noopener noreferrer nofollow ugc', target: '_blank' }, f.value.replace(/^https?:\/\//, '')) : f.value)])) : null,
       h('p', { class: 'muted small' }, user.website ? [h('a', { href: user.website, rel: 'noopener noreferrer nofollow ugc', target: '_blank' }, user.website.replace(/^https?:\/\//, '')), ' · '] : null, 'Joined ' + new Date(user.created).toLocaleDateString()),
@@ -1147,6 +1202,7 @@
       return f.ready;
     }
     const r = await api('/search?q=' + enc(qv));
+    await loadFriends();
     show(h('h1', null, 'Results for "' + qv + '"'), saveBtn, savedBox, tabs,
       tab === 'topics' ? h('div', { class: 'card side' }, r.topics.length ? h('div', null, r.topics.map((t) => h('a', { class: 'chip', href: '/topic/' + enc(t.topic), 'data-link': true }, '#' + t.topic))) : h('p', { class: 'muted' }, 'No matching Topics!'))
         : h('div', { class: 'card' }, r.users.length ? h('ul', { class: 'ulist big' }, r.users.map((u) => userRow({ ...u }))) : h('div', { class: 'empty' }, 'No matching people!')));
@@ -1159,17 +1215,26 @@
     const list = h('div', { class: 'card feed' });
     const more = h('div', { class: 'more' });
     let cursor = null;
-    const text = { like: 'liked your post', reply: 'replied to your post', repost: 'reposted your post', quote: 'quoted your post', mention: 'mentioned you', follow: 'followed you' };
+    const text = { like: 'liked your post', reply: 'replied to your post', repost: 'reposted your post', quote: 'quoted your post', mention: 'mentioned you', follow: 'followed you', friend_request: 'wants to be your friend', friend_accept: 'accepted your friend request' };
     const load = async () => {
       more.replaceChildren();
       const r = await api('/notifications' + (cursor ? '?before=' + cursor : ''));
       list.querySelectorAll('.empty').forEach((e) => e.remove());
       r.items.forEach((n) => {
-        const href = n.kind === 'follow' ? '/u/' + enc(n.username) : '/post/' + n.post_id;
+        if (n.kind === 'friend_request') {
+          const row = h('div', { class: 'note frnote' + (n.read ? '' : ' unread') }, h('a', { href: '/u/' + enc(n.username), 'data-link': true }, avatar(n)),
+            h('div', { class: 'nt' }, h('div', null, h('a', { class: 'who', href: '/u/' + enc(n.username), 'data-link': true }, nameOf(n)), ' wants to be your friend', h('span', { class: 'muted small' }, ' · ' + ago(n.created)))));
+          const answer = (action, msg) => safe(async () => { await friendAct(n.username, action); n.fpending = false; drawAnswer(); toast(msg); });
+          const drawAnswer = () => { row.querySelector('.fract')?.remove(); row.querySelector('.nt').append(n.fpending ? h('div', { class: 'row2 fract' }, h('button', { class: 'btn small', type: 'button', onclick: answer('accept', 'You are friends now!') }, 'Accept'), h('button', { class: 'btn ghost small', type: 'button', onclick: answer('decline', 'Request declined!') }, 'Decline')) : h('div', { class: 'muted small fract' }, 'Answered!')); };
+          drawAnswer();
+          list.append(row);
+          return;
+        }
+        const href = n.kind === 'follow' || n.kind === 'friend_accept' ? '/u/' + enc(n.username) : '/post/' + n.post_id;
         list.append(h('a', { class: 'note' + (n.read ? '' : ' unread'), href, 'data-link': true }, avatar(n), h('div', { class: 'nt' }, h('div', null, h('b', null, nameOf(n)), ' ' + (text[n.kind] || 'did something'), h('span', { class: 'muted small' }, ' · ' + ago(n.created))), n.snippet ? h('div', { class: 'muted snip' }, n.snippet) : null)));
       });
       cursor = r.cursor;
-      if (!list.children.length) list.append(h('div', { class: 'empty' }, 'Nothing yet. Likes, replies, reposts, mentions and new followers show up here!'));
+      if (!list.children.length) list.append(h('div', { class: 'empty' }, 'Nothing yet. Likes, replies, reposts, mentions, new followers and friend requests show up here!'));
       if (r.more) more.append(h('button', { class: 'btn ghost', type: 'button', onclick: safe(load) }, 'Load more'));
     };
     show(h('h1', null, 'Notifications'), list, more);
@@ -1245,6 +1310,7 @@
     const newPw = h('input', { id: 'np', type: 'password', autocomplete: 'new-password' });
     const delPw = h('input', { id: 'dp', type: 'password', autocomplete: 'current-password' });
     const dmSel = h('select', { id: 'dmp', onchange: safe(async () => { await api('/me/settings', { method: 'PATCH', body: { dm: dmSel.value } }); me.dm = dmSel.value; toast('Saved!'); }) }, [['all', 'Everyone'], ['following', 'People I follow'], ['none', 'Nobody']].map(([v, l]) => h('option', { value: v, selected: (cur.dm || 'all') === v }, l)));
+    const frSel = h('select', { id: 'frp', onchange: safe(async () => { await api('/me/settings', { method: 'PATCH', body: { friendsPrivacy: frSel.value } }); me.friendsPrivacy = frSel.value; toast('Saved!'); }) }, [['everyone', 'Everyone'], ['friends', 'Only my friends'], ['me', 'Only me']].map(([v, l]) => h('option', { value: v, selected: (me.friendsPrivacy || 'everyone') === v }, l)));
     const themeSel = h('select', { id: 'thm', onchange: () => setTheme(themeSel.value) }, [['auto', 'Match my device'], ['light', 'Light'], ['dark', 'Dark']].map(([v, l]) => h('option', { value: v, selected: (store.get('beta_theme') || 'auto') === v }, l)));
     const densSel = h('select', { id: 'dns', onchange: () => { store.set('beta_density', densSel.value === 'comfortable' ? '' : densSel.value); applyPrefs(); } }, [['comfortable', 'Comfortable'], ['compact', 'Compact']].map(([v, l]) => h('option', { value: v, selected: (store.get('beta_density') || 'comfortable') === v }, l)));
     const muted = h('div');
@@ -1268,6 +1334,7 @@
       h('p', null, h('button', { class: 'btn', onclick: guard(err1, async () => { await api('/me', { method: 'PATCH', body: { display_name: dn.value, bio: bio.value, website: web.value, color } }); Object.assign(me, { display_name: dn.value.trim(), bio: bio.value.trim(), color }); drawNav(); toast('Saved!'); }) }, 'Save profile')), err1,
       h('h2', null, 'Messages'),
       h('label', { for: 'dmp' }, 'Who can send you messages?'), dmSel,
+      h('label', { for: 'frp' }, 'Who can see your friends list?'), frSel,
       h('h2', null, 'How Beta looks'),
       h('label', { for: 'thm' }, 'Theme'), themeSel,
       h('label', { for: 'dns' }, 'Spacing'), densSel,
