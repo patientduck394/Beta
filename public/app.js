@@ -1078,9 +1078,9 @@
   }
   const CC0_URL = 'https://creativecommons.org/publicdomain/zero/1.0/';
   // "I give this to everyone" checkbox. It is optional; ticking it dedicates that one thing to the public domain under CC0
-  function cc0Box(id, checked, what, onchange) {
-    return h('label', { class: 'checkrow cc0row', for: id }, h('input', { type: 'checkbox', id, checked: !!checked, onchange: (e) => onchange(e.target.checked) }),
-      h('span', null, 'Dedicate ', what, ' to the public domain (', h('a', { href: CC0_URL, target: '_blank', rel: 'noopener noreferrer' }, 'CC0'), ')', h('div', { class: 'muted small' }, 'Anyone may copy, change and reuse it for any purpose, with no need to ask or give credit. Optional!')));
+  function cc0Box(id, checked, what, onchange, required) {
+    return h('label', { class: 'checkrow cc0row', for: id }, h('input', { type: 'checkbox', id, checked: !!checked, required: !!required, onchange: (e) => onchange(e.target.checked) }),
+      h('span', null, 'Dedicate ', what, ' to the public domain (', h('a', { href: CC0_URL, target: '_blank', rel: 'noopener noreferrer' }, 'CC0'), ')', h('div', { class: 'muted small' }, 'Anyone may copy, change and reuse it for any purpose, with no need to ask or give credit.' + (required ? ' Needed to make an instance!' : ' Optional!'))));
   }
   // a little note under an instance's text when its owner dedicated things to CC0
   function cc0Note(i) {
@@ -1107,6 +1107,7 @@
     const host = location.hostname.replace(/^[^.]+\.(?=.*beta\.)/, '');
     const done = h('div');
     const form = h('form', { class: 'card formcard wide', onsubmit: guard(err, async () => {
+      if (!cc0.description || !cc0.rules) throw new Error('Tick both CC0 boxes to make an instance!');
       const r = await api('/instances', { method: 'POST', body: { name: name.value, slug: slug.value, description: desc.value, rules: rules.value, cc0, reg: reg.value, username: user.value, password: pw.value } });
       form.hidden = true;
       put(done, h('div', { class: 'card formcard wide' }, h('h1', null, 'Your instance is live!'), h('p', null, h('b', null, r.url.replace(/^https?:\/\//, ''))),
@@ -1116,8 +1117,8 @@
       h('p', { class: 'muted' }, 'An instance is your own community inside Beta. You pick the name, the rules and who may join, and you are its admin!'),
       h('label', { for: 'in' }, 'Name'), name,
       h('label', { for: 'is' }, 'Address'), h('div', { class: 'slugrow' }, slug, h('span', { class: 'muted' }, '.' + host.replace(/^beta\./, 'beta.'))),
-      h('label', { for: 'id' }, 'Description'), desc, cc0Box('icd', false, 'the description', (v) => (cc0.description = v)),
-      h('label', { for: 'ir' }, 'House rules'), rules, cc0Box('icr', false, 'the rules', (v) => (cc0.rules = v)),
+      h('label', { for: 'id' }, 'Description'), desc, cc0Box('icd', false, 'the description', (v) => (cc0.description = v), true),
+      h('label', { for: 'ir' }, 'House rules'), rules, cc0Box('icr', false, 'the rules', (v) => (cc0.rules = v), true),
       h('label', { for: 'ig' }, 'Sign-up'), reg,
       h('h2', null, 'Your admin account'), h('p', { class: 'muted small' }, 'Accounts live on one instance, so this one is made on your new instance. Usernames are unique on each instance!'),
       h('label', { for: 'iu' }, 'Username'), user, h('label', { for: 'ip' }, 'Password (8 or more characters)'), pw,

@@ -1690,6 +1690,7 @@ async function route(req, env, url) {
     // (a brand new instance has nobody yet, so any name is free: usernames are unique on each instance)
     const pw = String(b.password || '');
     if (pw.length < 8 || pw.length > 200) bad('Passwords need at least 8 characters!');
+    if ((cc0Mask(b.cc0) & 6) !== 6) bad('Tick both CC0 boxes (description and rules) to make an instance!');
     const reg = ['open', 'invite', 'closed'].includes(b.reg) ? b.reg : 'open';
     const now = Date.now();
     const r = await D.run('INSERT INTO instances(slug,name,description,rules,reg,invite_code,created,cc0) VALUES(?,?,?,?,?,?,?,?)', slug, name, cleanLine(b.description, 300), cleanBody(b.rules).slice(0, 1500), reg, reg === 'invite' ? genCode() : '', now, cc0Mask(b.cc0) & 6);
