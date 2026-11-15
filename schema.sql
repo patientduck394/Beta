@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS poll_options (post_id INTEGER NOT NULL, idx INTEGER N
 CREATE TABLE IF NOT EXISTS poll_votes (post_id INTEGER NOT NULL, user_id INTEGER NOT NULL, idx INTEGER NOT NULL, PRIMARY KEY (post_id, user_id));
 CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, actor_id INTEGER NOT NULL, kind TEXT NOT NULL, post_id INTEGER, created INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, id);
-CREATE TABLE IF NOT EXISTS mutes (user_id INTEGER NOT NULL, target_id INTEGER NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (user_id, target_id));
+CREATE TABLE IF NOT EXISTS mutes (user_id INTEGER NOT NULL, target_id INTEGER NOT NULL, kind TEXT NOT NULL, until INTEGER, PRIMARY KEY (user_id, target_id));
 CREATE TABLE IF NOT EXISTS topic_mutes (user_id INTEGER NOT NULL, topic TEXT NOT NULL, PRIMARY KEY (user_id, topic));
 CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY AUTOINCREMENT, reporter_id INTEGER NOT NULL, post_id INTEGER NOT NULL, reason TEXT NOT NULL, created INTEGER NOT NULL, UNIQUE (reporter_id, post_id));
 CREATE TABLE IF NOT EXISTS attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, post_id INTEGER, name TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, alt TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL);
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS scheduled (id INTEGER PRIMARY KEY AUTOINCREMENT, user
 CREATE INDEX IF NOT EXISTS scheduled_at ON scheduled(at);
 CREATE INDEX IF NOT EXISTS scheduled_user ON scheduled(user_id);
 CREATE TABLE IF NOT EXISTS word_filters (user_id INTEGER NOT NULL, word TEXT NOT NULL, PRIMARY KEY (user_id, word));
-CREATE TABLE IF NOT EXISTS bookmark_folders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bookmark_folders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL, public INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS bookmark_folders_user ON bookmark_folders(user_id);
 CREATE TABLE IF NOT EXISTS bookmark_folder_items (user_id INTEGER NOT NULL, post_id INTEGER NOT NULL, folder_id INTEGER NOT NULL, PRIMARY KEY (user_id, post_id));
 CREATE INDEX IF NOT EXISTS bookmark_folder_items_folder ON bookmark_folder_items(folder_id);
@@ -142,3 +142,18 @@ CREATE INDEX IF NOT EXISTS friends_friend ON friends(friend_id);
 CREATE TABLE IF NOT EXISTS friend_requests (from_id INTEGER NOT NULL, to_id INTEGER NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (from_id, to_id));
 CREATE INDEX IF NOT EXISTS friend_requests_to ON friend_requests(to_id, created);
 CREATE TABLE IF NOT EXISTS post_vis (post_id INTEGER PRIMARY KEY, vis TEXT NOT NULL);
+
+-- version 14: statuses, disappearing posts, drafts, questions, events
+CREATE TABLE IF NOT EXISTS statuses (user_id INTEGER PRIMARY KEY, emoji TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '', until INTEGER);
+CREATE TABLE IF NOT EXISTS post_expiry (post_id INTEGER PRIMARY KEY, at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS post_expiry_at ON post_expiry(at);
+CREATE TABLE IF NOT EXISTS drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, body TEXT NOT NULL, cw TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS drafts_user ON drafts(user_id, updated);
+CREATE TABLE IF NOT EXISTS questions (id INTEGER PRIMARY KEY AUTOINCREMENT, to_id INTEGER NOT NULL, from_id INTEGER NOT NULL, anon INTEGER NOT NULL DEFAULT 0, body TEXT NOT NULL, created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS questions_to ON questions(to_id, created);
+CREATE TABLE IF NOT EXISTS events (post_id INTEGER PRIMARY KEY, title TEXT NOT NULL, at INTEGER NOT NULL, place TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS event_rsvps (post_id INTEGER NOT NULL, user_id INTEGER NOT NULL, status TEXT NOT NULL, PRIMARY KEY (post_id, user_id));
+
+-- version 15: reminders
+CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, post_id INTEGER NOT NULL, at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS reminders_at ON reminders(at);

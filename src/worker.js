@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 15;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -178,6 +178,19 @@ const DDL = [
   "CREATE TABLE IF NOT EXISTS friend_requests (from_id INTEGER NOT NULL, to_id INTEGER NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (from_id, to_id))",
   "CREATE INDEX IF NOT EXISTS friend_requests_to ON friend_requests(to_id, created)",
   "CREATE TABLE IF NOT EXISTS post_vis (post_id INTEGER PRIMARY KEY, vis TEXT NOT NULL)",
+  // version 14: statuses, disappearing posts, synced drafts, questions, events with RSVPs (timed mutes and public collections add a column below)
+  "CREATE TABLE IF NOT EXISTS statuses (user_id INTEGER PRIMARY KEY, emoji TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '', until INTEGER)",
+  "CREATE TABLE IF NOT EXISTS post_expiry (post_id INTEGER PRIMARY KEY, at INTEGER NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS post_expiry_at ON post_expiry(at)",
+  "CREATE TABLE IF NOT EXISTS drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, body TEXT NOT NULL, cw TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS drafts_user ON drafts(user_id, updated)",
+  "CREATE TABLE IF NOT EXISTS questions (id INTEGER PRIMARY KEY AUTOINCREMENT, to_id INTEGER NOT NULL, from_id INTEGER NOT NULL, anon INTEGER NOT NULL DEFAULT 0, body TEXT NOT NULL, created INTEGER NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS questions_to ON questions(to_id, created)",
+  "CREATE TABLE IF NOT EXISTS events (post_id INTEGER PRIMARY KEY, title TEXT NOT NULL, at INTEGER NOT NULL, place TEXT NOT NULL DEFAULT '')",
+  "CREATE TABLE IF NOT EXISTS event_rsvps (post_id INTEGER NOT NULL, user_id INTEGER NOT NULL, status TEXT NOT NULL, PRIMARY KEY (post_id, user_id))",
+  // version 15: reminders ("bring this post back to me later")
+  "CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, post_id INTEGER NOT NULL, at INTEGER NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS reminders_at ON reminders(at)",
 ];
 let schemaReady = null;
 function ensureSchema(env) {
@@ -200,6 +213,11 @@ function ensureSchema(env) {
       // version 10: an instance can have a theme (JSON: id, accent, title, icon)
       try { await env.DB.prepare('SELECT theme FROM instances LIMIT 1').first(); }
       catch (e) { await env.DB.prepare("ALTER TABLE instances ADD COLUMN theme TEXT NOT NULL DEFAULT ''").run(); }
+      // version 14: timed mutes, and public collections (a bookmark folder you share)
+      try { await env.DB.prepare('SELECT until FROM mutes LIMIT 1').first(); }
+      catch (e) { await env.DB.prepare('ALTER TABLE mutes ADD COLUMN until INTEGER').run(); }
+      try { await env.DB.prepare('SELECT public FROM bookmark_folders LIMIT 1').first(); }
+      catch (e) { await env.DB.prepare('ALTER TABLE bookmark_folders ADD COLUMN public INTEGER NOT NULL DEFAULT 0').run(); }
       // version 13: the activity log remembers which instance an entry belongs to (instance admins see only their own)
       try { await env.DB.prepare('SELECT inst FROM audit LIMIT 1').first(); }
       catch (e) { await env.DB.prepare('ALTER TABLE audit ADD COLUMN inst INTEGER NOT NULL DEFAULT 1').run(); }
@@ -294,8 +312,9 @@ const isFriends = async (D, a, b) => !!(await D.first('SELECT 1 AS x FROM friend
 // SQL that keeps friends-only posts away from people who are not the author or one of the author's friends: [clause, params]
 function visSql(user, col = 'p') {
   const open = `NOT EXISTS (SELECT 1 FROM post_vis pv WHERE pv.post_id=${col}.id)`;
-  if (!user) return [open, []];
-  return [`(${open} OR ${col}.user_id=? OR EXISTS (SELECT 1 FROM friends fr WHERE fr.user_id=? AND fr.friend_id=${col}.user_id))`, [user.id, user.id]];
+  const live = `NOT EXISTS (SELECT 1 FROM post_expiry ex WHERE ex.post_id=${col}.id AND ex.at<=?)`;
+  if (!user) return [`(${open} AND ${live})`, [Date.now()]];
+  return [`((${open} OR ${col}.user_id=? OR EXISTS (SELECT 1 FROM friends fr WHERE fr.user_id=? AND fr.friend_id=${col}.user_id)) AND ${live})`, [user.id, user.id, Date.now()]];
 }
 async function canSee(D, user, postId) {
   const [c, a] = visSql(user);
@@ -333,7 +352,7 @@ const BASE = `SELECT p.id, p.body, p.created, p.parent_id, p.user_id, u.username
 
 async function metrics(env, viewerId, ids) {
   const M = {};
-  ids.forEach((id) => (M[id] = { likes: 0, liked: false, replies: 0, reposts: 0, quotes: 0, reposted: false, bookmarked: false, edited: null, poll: null, files: [], outlet: null, reactions: {}, myReaction: null, replyPolicy: null, threadMuted: false }));
+  ids.forEach((id) => (M[id] = { likes: 0, liked: false, replies: 0, reposts: 0, quotes: 0, reposted: false, bookmarked: false, edited: null, poll: null, files: [], outlet: null, reactions: {}, myReaction: null, replyPolicy: null, threadMuted: false, event: null, expires: null }));
   if (!ids.length) return M;
   const P = ph(ids.length);
   const v = viewerId || 0;
@@ -358,6 +377,10 @@ async function metrics(env, viewerId, ids) {
       q(`SELECT post_id k, emoji FROM reactions WHERE user_id=? AND post_id IN (${P})`, v),
       q(`SELECT post_id k, policy FROM reply_policy WHERE post_id IN (${P})`),
       q(`SELECT post_id k FROM muted_threads WHERE user_id=? AND post_id IN (${P})`, v),
+      q(`SELECT post_id k, title, at, place FROM events WHERE post_id IN (${P})`),
+      q(`SELECT post_id k, status, COUNT(*) n FROM event_rsvps WHERE post_id IN (${P}) GROUP BY post_id, status`),
+      q(`SELECT post_id k, status FROM event_rsvps WHERE user_id=? AND post_id IN (${P})`, v),
+      q(`SELECT post_id k, at FROM post_expiry WHERE post_id IN (${P})`),
     ])
   ).map((x) => x.results);
   res[0].forEach((r) => (M[r.k].likes = r.n));
@@ -385,6 +408,10 @@ async function metrics(env, viewerId, ids) {
   res[15].forEach((r) => (M[r.k].myReaction = r.emoji));
   res[16].forEach((r) => (M[r.k].replyPolicy = r.policy));
   res[17].forEach((r) => (M[r.k].threadMuted = true));
+  res[18].forEach((r) => (M[r.k].event = { title: r.title, at: r.at, place: r.place, going: 0, maybe: 0, no: 0, mine: null }));
+  res[19].forEach((r) => { const e = M[r.k].event; if (e && e[r.status] !== undefined) e[r.status] = r.n; });
+  res[20].forEach((r) => { const e = M[r.k].event; if (e) e.mine = r.status; });
+  res[21].forEach((r) => (M[r.k].expires = r.at));
   res[11].forEach((r) => M[r.k].files.push({ id: r.id, name: r.name, mime: r.mime, size: r.size, alt: r.alt, image: r.mime.startsWith('image/') }));
   return M;
 }
@@ -437,7 +464,7 @@ async function purgePosts(D, startIds) {
     const del = (t, col = 'post_id') => D.stmt(`DELETE FROM ${t} WHERE ${col} IN (${P})`, ...part);
     await D.batch([
       D.stmt(`DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE post_id IN (${P}))`, ...part),
-      del('attachments'), del('post_cw'), del('post_vis'), del('outlet_posts'), del('likes'), del('post_topics'), del('edits'), del('polls'), del('poll_options'), del('poll_votes'), del('bookmarks'), del('muted_threads'), del('reactions'), del('reply_policy'), del('post_versions'), del('bookmark_folder_items'), del('notifications'), del('reports'), del('refs'),
+      del('attachments'), del('post_cw'), del('post_vis'), del('outlet_posts'), del('likes'), del('post_topics'), del('edits'), del('reminders'), del('events'), del('event_rsvps'), del('post_expiry'), del('polls'), del('poll_options'), del('poll_votes'), del('bookmarks'), del('muted_threads'), del('reactions'), del('reply_policy'), del('post_versions'), del('bookmark_folder_items'), del('notifications'), del('reports'), del('refs'),
       D.stmt(`UPDATE profiles SET pinned=NULL WHERE pinned IN (${P})`, ...part),
       del('posts', 'id'),
     ]);
@@ -460,7 +487,7 @@ async function createPost(env, D, user, b) {
     const cw = cleanLine(b.cw, 80);
     const files = Array.isArray(b.files) ? b.files.slice(0, 4) : [];
     const pollIn = b.poll && typeof b.poll === 'object' ? b.poll : null;
-    if (!body && !files.length && !pollIn) bad('Write something first!');
+    if (!body && !files.length && !pollIn && !(b.event && typeof b.event === 'object')) bad('Write something first!');
     let parent = null, quote = null, parentAuthor = null, quoteAuthor = null;
     let vis = b.vis === 'friends' ? 'friends' : null;
     if (b.parent != null) {
@@ -504,6 +531,20 @@ async function createPost(env, D, user, b) {
       const hours = [1, 6, 24, 72, 168].includes(pollIn.hours) ? pollIn.hours : 24;
       poll = { opts, ends: Date.now() + hours * 3600000 };
     }
+    let expiry = null;
+    if (b.expires != null && b.expires !== '') {
+      const hrs = Number(b.expires);
+      if (![1, 24, 168, 720].includes(hrs)) bad('Pick how long the post should stay!');
+      expiry = Date.now() + hrs * 3600000;
+    }
+    let event = null;
+    if (b.event && typeof b.event === 'object') {
+      if (parent) bad('Events go in new posts, not replies!');
+      const title = cleanLine(b.event.title, 60), at = Number(b.event.at);
+      if (!title) bad('Give the event a name!');
+      if (!Number.isFinite(at) || at < Date.now() - 3600000 || at > Date.now() + 730 * 864e5) bad('Pick a date for the event, within the next two years!');
+      event = { title, at, place: cleanLine(b.event.place, 80) };
+    }
     const mine = [];
     for (const f of files) {
       const fid = intParam(f && f.id);
@@ -540,6 +581,8 @@ async function createPost(env, D, user, b) {
       stmts.push(D.stmt('INSERT INTO polls(post_id,ends) VALUES(?,?)', id, poll.ends));
       poll.opts.forEach((o, i) => stmts.push(D.stmt('INSERT INTO poll_options(post_id,idx,label) VALUES(?,?,?)', id, i, o)));
     }
+    if (expiry) stmts.push(D.stmt('INSERT INTO post_expiry(post_id,at) VALUES(?,?)', id, expiry));
+    if (event) stmts.push(D.stmt('INSERT INTO events(post_id,title,at,place) VALUES(?,?,?,?)', id, event.title, event.at, event.place));
     mine.forEach((f) => stmts.push(D.stmt('UPDATE attachments SET post_id=?, alt=? WHERE id=? AND user_id=? AND post_id IS NULL', id, f.alt, f.id, user.id)));
     if (stmts.length) await D.batch(stmts);
     // tell the right people
@@ -577,7 +620,7 @@ async function purgeUser(D, u) {
     D.stmt('DELETE FROM bookmark_folder_items WHERE user_id=?', u), D.stmt('DELETE FROM bookmark_folders WHERE user_id=?', u), D.stmt('DELETE FROM badges WHERE user_id=?', u),
     D.stmt('DELETE FROM profile_fields WHERE user_id=?', u), D.stmt('DELETE FROM user_notes WHERE user_id=? OR target_id=?', u, u),
     D.stmt('DELETE FROM outlet_members WHERE user_id=?', u), D.stmt('DELETE FROM outlet_bans WHERE user_id=?', u),
-    D.stmt('DELETE FROM muted_threads WHERE user_id=?', u), D.stmt('DELETE FROM saved_searches WHERE user_id=?', u), D.stmt('DELETE FROM warnings WHERE user_id=?', u), D.stmt('DELETE FROM ban_until WHERE user_id=?', u), D.stmt('DELETE FROM admin_notes WHERE user_id=?', u), D.stmt('DELETE FROM site_mods WHERE user_id=?', u),
+    D.stmt('DELETE FROM muted_threads WHERE user_id=?', u), D.stmt('DELETE FROM saved_searches WHERE user_id=?', u), D.stmt('DELETE FROM warnings WHERE user_id=?', u), D.stmt('DELETE FROM ban_until WHERE user_id=?', u), D.stmt('DELETE FROM statuses WHERE user_id=?', u), D.stmt('DELETE FROM reminders WHERE user_id=?', u), D.stmt('DELETE FROM drafts WHERE user_id=?', u), D.stmt('DELETE FROM questions WHERE to_id=? OR from_id=?', u, u), D.stmt('DELETE FROM event_rsvps WHERE user_id=?', u), D.stmt('DELETE FROM admin_notes WHERE user_id=?', u), D.stmt('DELETE FROM site_mods WHERE user_id=?', u),
   ]);
 }
 
@@ -665,8 +708,26 @@ function cleanTheme(b, old) {
 const instPublic = (r, env, url) => ({ id: r.id, slug: r.slug, name: r.name, description: r.description, rules: r.rules, reg: r.reg, listed: !!r.listed, isMain: r.id === 1, created: r.created, theme: themeOf(r.theme), url: instUrl(env, url, r.slug) });
 
 // the posts people scheduled go out here (a Cloudflare cron runs this every minute, and signing in checks too)
+let lastSweep = 0;
 async function runDue(env) {
   const D = db(env);
+  // posts that were set to disappear, timed mutes and statuses that ran out
+  if (Date.now() - lastSweep > 30000) {
+    lastSweep = Date.now();
+    try {
+      const gone = await D.all('SELECT post_id FROM post_expiry WHERE at<=? LIMIT 40', Date.now());
+      if (gone.length) await purgePosts(D, gone.map((g) => g.post_id));
+      await D.run("DELETE FROM mutes WHERE kind='mute' AND until IS NOT NULL AND until<=?", Date.now());
+      await D.run('DELETE FROM statuses WHERE until IS NOT NULL AND until<=?', Date.now());
+      const due = await D.all('SELECT id, user_id, post_id FROM reminders WHERE at<=? LIMIT 40', Date.now());
+      for (const r of due) {
+        const c = await D.run('DELETE FROM reminders WHERE id=?', r.id);
+        if (c.meta.changes && (await D.first('SELECT 1 AS x FROM posts WHERE id=?', r.post_id))) await D.run('INSERT INTO notifications(user_id,actor_id,kind,post_id,created) VALUES(?,?,?,?,?)', r.user_id, r.user_id, 'remind', r.post_id, Date.now());
+      }
+    } catch (e) {
+      console.error('sweep failed', e);
+    }
+  }
   const due = await D.all('SELECT id, user_id, payload FROM scheduled WHERE at<=? ORDER BY at LIMIT 20', Date.now());
   for (const s of due) {
     const c = await D.run('DELETE FROM scheduled WHERE id=?', s.id);
@@ -687,6 +748,7 @@ async function tokenHash(req) {
   return m ? sha256(m[1]) : '';
 }
 const BADGES = ['verified', 'staff', 'supporter'];
+const BANNERS = ['sunrise', 'ocean', 'forest', 'grape', 'candy', 'ember', 'mint', 'night', 'peach', 'slate', 'aurora', 'dots'];
 const genCode = () => [...crypto.getRandomValues(new Uint8Array(8))].map((x) => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[x % 32]).join('');
 // moderators can read reports and act on posts and people, but not change the site
 const modAllowed = (seg, method) => {
@@ -832,11 +894,12 @@ async function route(req, env, url) {
     const dmUnread = (await D.first('SELECT COUNT(*) AS n FROM dms WHERE recipient_id=? AND read=0', user.id)).n;
     const st = await settingsOf(D, user.id);
     await runDue(env);
+    const qn = (await D.first('SELECT COUNT(*) AS n FROM questions WHERE to_id=?', user.id)).n;
     const filters = (await D.all('SELECT word FROM word_filters WHERE user_id=?', user.id)).map((r) => r.word);
     const isModer = !!(await D.first('SELECT 1 AS x FROM site_mods WHERE user_id=?', user.id));
     const warnings = await D.all('SELECT id, text, created FROM warnings WHERE user_id=? AND seen=0 ORDER BY id LIMIT 3', user.id);
     const homeInst = await D.first('SELECT slug, name FROM instances WHERE id=(SELECT inst FROM users WHERE id=?)', user.id);
-    return json({ user: { ...row, filters, mod: isModer, warnings, instance: instPublic(inst, env, url), homeSlug: homeInst ? homeInst.slug : 'main', display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, friendsPrivacy: st.friends_privacy, admin: isAdmin(env, user), iadmin: !isAdmin(env, user) && inst.id !== 1 && inst.owner_id === user.id && user.inst === inst.id, avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
+    return json({ user: { ...row, filters, mod: isModer, warnings, instance: instPublic(inst, env, url), homeSlug: homeInst ? homeInst.slug : 'main', display_name: t.display_name, website: t.website, color: t.color, unread, dmUnread, dm: st.dm, ask: st.ask || 'off', questions: qn, accent: st.accent || '', banner: st.banner || '', friendsPrivacy: st.friends_privacy, admin: isAdmin(env, user), iadmin: !isAdmin(env, user) && inst.id !== 1 && inst.owner_id === user.id && user.inst === inst.id, avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', user.id) || {}).file_id || null } });
   }
   if (seg[0] === 'me' && !seg[1] && method === 'PATCH') {
     need();
@@ -975,6 +1038,51 @@ async function route(req, env, url) {
     const rows = await D.all(`SELECT x.username, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar FROM likes l JOIN users x ON x.id=l.user_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE l.post_id=? ORDER BY l.rowid DESC LIMIT 60`, id);
     return json({ users: rows });
   }
+  // --- reminders: bring a post back to you later
+  if (seg[0] === 'posts' && seg[1] && seg[2] === 'remind' && method === 'POST') {
+    need();
+    await rate(D, 'remind:' + user.id, 30, 3600);
+    const id = intParam(seg[1]);
+    if (!id || !(await canSee(D, user, id))) bad('We could not find that post!', 404);
+    const b = await readJson(req, 200);
+    const hrs = Number(b.hours);
+    if (![1, 4, 24, 72, 168].includes(hrs)) bad('Pick when to remind you!');
+    if ((await D.first('SELECT COUNT(*) AS n FROM reminders WHERE user_id=?', user.id)).n >= 50) bad('You can have up to 50 reminders waiting!');
+    await D.run('DELETE FROM reminders WHERE user_id=? AND post_id=?', user.id, id);
+    await D.run('INSERT INTO reminders(user_id,post_id,at) VALUES(?,?,?)', user.id, id, Date.now() + hrs * 3600000);
+    return json({ ok: true, at: Date.now() + hrs * 3600000 });
+  }
+  // --- events: RSVPs, who is going, and a calendar file
+  if (seg[0] === 'posts' && seg[1] && seg[2] === 'rsvp' && method === 'POST') {
+    need();
+    await rate(D, 'rsvp:' + user.id, 60, 60);
+    const id = intParam(seg[1]);
+    const ev = id && (await D.first('SELECT e.post_id, p.user_id FROM events e JOIN posts p ON p.id=e.post_id WHERE e.post_id=?', id));
+    if (!ev || !(await canSee(D, user, id))) bad('We could not find that event!', 404);
+    const b = await readJson(req, 200);
+    if (!['going', 'maybe', 'no', 'none'].includes(b.status)) bad('Pick going, maybe, or cannot go!');
+    if (b.status === 'none') await D.run('DELETE FROM event_rsvps WHERE post_id=? AND user_id=?', id, user.id);
+    else await D.run('INSERT INTO event_rsvps(post_id,user_id,status) VALUES(?,?,?) ON CONFLICT(post_id,user_id) DO UPDATE SET status=excluded.status', id, user.id, b.status);
+    if (b.status === 'going' && ev.user_id !== user.id) await notify(D, ev.user_id, user.id, 'rsvp', id);
+    return json({ post: await onePost(env, D, user, id) });
+  }
+  if (seg[0] === 'posts' && seg[1] && seg[2] === 'rsvps' && method === 'GET') {
+    const id = intParam(seg[1]);
+    if (!id || !(await canSee(D, user, id))) bad('We could not find that event!', 404);
+    const st = ['going', 'maybe', 'no'].includes(url.searchParams.get('status')) ? url.searchParams.get('status') : 'going';
+    const rows = await D.all(`SELECT x.username, (SELECT slug FROM instances WHERE id=x.inst) AS inst_slug, x.bio, COALESCE(pr.display_name,'') AS display_name, COALESCE(pr.color,'lime') AS color, (SELECT file_id FROM avatars WHERE user_id=x.id) AS avatar FROM event_rsvps r JOIN users x ON x.id=r.user_id LEFT JOIN profiles pr ON pr.user_id=x.id WHERE r.post_id=? AND r.status=? ORDER BY x.username LIMIT 100`, id, st);
+    return json({ users: rows });
+  }
+  if (seg[0] === 'posts' && seg[1] && seg[2] === 'ics' && method === 'GET') {
+    const id = intParam(seg[1]);
+    const ev = id && (await D.first('SELECT title, at, place FROM events WHERE post_id=?', id));
+    if (!ev || !(await canSee(D, user, id))) bad('We could not find that event!', 404);
+    const stamp = (t) => new Date(t).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+    const ics = (v) => String(v).replace(/\\/g, '\\\\').replace(/[,;]/g, (c) => '\\' + c).replace(/\n/g, '\\n');
+    const text = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Beta//Events//EN', 'BEGIN:VEVENT', 'UID:beta-event-' + id + '@' + url.host, 'DTSTAMP:' + stamp(Date.now()), 'DTSTART:' + stamp(ev.at), 'DTEND:' + stamp(ev.at + 3600000), 'SUMMARY:' + ics(ev.title), ...(ev.place ? ['LOCATION:' + ics(ev.place)] : []), 'URL:' + url.origin + '/post/' + id, 'END:VEVENT', 'END:VCALENDAR'].join('\r\n') + '\r\n';
+    return new Response(text, { headers: { 'content-type': 'text/calendar; charset=utf-8', 'content-disposition': 'attachment; filename="event.ics"', 'x-content-type-options': 'nosniff' } });
+  }
+
   if (seg[0] === 'posts' && seg[1] && seg[2] && method === 'POST') {
     need();
     const id = intParam(seg[1]);
@@ -1265,8 +1373,14 @@ async function route(req, env, url) {
     const t = await theme(u.id);
     const pr = await D.first('SELECT pinned FROM profiles WHERE user_id=?', u.id);
     const rel = user ? await D.first('SELECT kind FROM mutes WHERE user_id=? AND target_id=?', user.id, u.id) : null;
+    const ust = await D.first('SELECT emoji, text, until FROM statuses WHERE user_id=?', u.id);
+    const ost = await settingsOf(D, u.id);
+    const [cvc, cva] = visSql(user);
     return json({
       user: {
+        status: ust && (!ust.until || ust.until > Date.now()) ? { emoji: ust.emoji, text: ust.text, until: ust.until } : null,
+        askOpen: ost.ask === 'on', accent: ost.accent || '', banner: ost.banner || '',
+        collections: await D.all('SELECT f.id, f.name, (SELECT COUNT(*) FROM bookmark_folder_items i WHERE i.folder_id=f.id) AS n FROM bookmark_folders f WHERE f.user_id=? AND f.public=1 ORDER BY f.name', u.id),
         username: u.username, bio: u.bio, created: u.created, display_name: t.display_name, website: t.website, color: t.color, avatar: (await D.first('SELECT file_id FROM avatars WHERE user_id=?', u.id) || {}).file_id || null,
         posts: postCount, friendState, friends: friendCount, mutualFriends: mutual,
         followers: await count('SELECT COUNT(*) AS n FROM follows WHERE followee=?'),
@@ -1391,10 +1505,12 @@ async function route(req, env, url) {
     if (!u) bad('We could not find that person!', 404);
     if (u.id === user.id) bad('That would be a little odd!');
     const kind = seg[2];
+    let hrs = 0;
+    if (kind === 'mute') { try { hrs = Number((await readJson(req, 200)).hours) || 0; } catch (e) { hrs = 0; } if (hrs && ![1, 8, 24, 168].includes(hrs)) bad('Pick how long to mute!'); }
     const had = await D.first('SELECT kind FROM mutes WHERE user_id=? AND target_id=?', user.id, u.id);
-    if (had && had.kind === kind) await D.run('DELETE FROM mutes WHERE user_id=? AND target_id=?', user.id, u.id);
+    if (had && had.kind === kind && !hrs) await D.run('DELETE FROM mutes WHERE user_id=? AND target_id=?', user.id, u.id);
     else {
-      await D.run('INSERT INTO mutes(user_id,target_id,kind) VALUES(?,?,?) ON CONFLICT(user_id,target_id) DO UPDATE SET kind=excluded.kind', user.id, u.id, kind);
+      await D.run('INSERT INTO mutes(user_id,target_id,kind,until) VALUES(?,?,?,?) ON CONFLICT(user_id,target_id) DO UPDATE SET kind=excluded.kind, until=excluded.until', user.id, u.id, kind, hrs ? Date.now() + hrs * 3600000 : null);
       if (kind === 'block') {
         await D.run('DELETE FROM follows WHERE (follower=? AND followee=?) OR (follower=? AND followee=?)', user.id, u.id, u.id, user.id);
         await D.run('DELETE FROM friends WHERE (user_id=? AND friend_id=?) OR (user_id=? AND friend_id=?)', user.id, u.id, u.id, user.id);
@@ -1402,12 +1518,12 @@ async function route(req, env, url) {
         await D.run("DELETE FROM notifications WHERE kind='friend_request' AND ((user_id=? AND actor_id=?) OR (user_id=? AND actor_id=?))", user.id, u.id, u.id, user.id);
       }
     }
-    return json({ [kind === 'mute' ? 'muted' : 'blocked']: !(had && had.kind === kind) });
+    return json({ [kind === 'mute' ? 'muted' : 'blocked']: !(had && had.kind === kind && !hrs), hours: hrs || undefined });
   }
   if (seg[0] === 'mutes' && method === 'GET') {
     need();
     return json({
-      users: await D.all('SELECT u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, m.kind FROM mutes m JOIN users u ON u.id=m.target_id WHERE m.user_id=? ORDER BY u.username', user.id),
+      users: await D.all('SELECT u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug, m.kind, m.until FROM mutes m JOIN users u ON u.id=m.target_id WHERE m.user_id=? ORDER BY u.username', user.id),
       topics: (await D.all('SELECT topic FROM topic_mutes WHERE user_id=? ORDER BY topic', user.id)).map((r) => r.topic),
     });
   }
@@ -1468,6 +1584,12 @@ async function route(req, env, url) {
     if (b.friendsPrivacy !== undefined) {
       if (!['everyone', 'friends', 'me'].includes(b.friendsPrivacy)) bad('Pick everyone, only my friends, or only me!');
       await D.run('INSERT INTO settings(user_id,k,v) VALUES(?,?,?) ON CONFLICT(user_id,k) DO UPDATE SET v=excluded.v', user.id, 'friends_privacy', b.friendsPrivacy);
+    }
+    const extra = [['ask', (v) => v === 'on' || v === 'off'], ['accent', (v) => v === '' || /^#[0-9a-f]{6}$/i.test(v)], ['banner', (v) => v === '' || BANNERS.includes(v)]];
+    for (const [k, ok] of extra) {
+      if (b[k] === undefined) continue;
+      if (!ok(String(b[k]))) bad('That choice is not allowed!');
+      await D.run('INSERT INTO settings(user_id,k,v) VALUES(?,?,?) ON CONFLICT(user_id,k) DO UPDATE SET v=excluded.v', user.id, k, String(b[k]).toLowerCase());
     }
     return json({ ok: true });
   }
@@ -1656,7 +1778,7 @@ async function route(req, env, url) {
   if (seg[0] === 'bookmark-folders') {
     need();
     if (method === 'GET' && !seg[1]) {
-      const rows = await D.all('SELECT f.id, f.name, (SELECT COUNT(*) FROM bookmark_folder_items i WHERE i.folder_id=f.id) AS n FROM bookmark_folders f WHERE f.user_id=? ORDER BY f.name', user.id);
+      const rows = await D.all('SELECT f.id, f.name, f.public, (SELECT COUNT(*) FROM bookmark_folder_items i WHERE i.folder_id=f.id) AS n FROM bookmark_folders f WHERE f.user_id=? ORDER BY f.name', user.id);
       return json({ folders: rows });
     }
     if (method === 'POST' && !seg[1]) {
@@ -1667,6 +1789,13 @@ async function route(req, env, url) {
       if (await D.first('SELECT 1 AS x FROM bookmark_folders WHERE user_id=? AND name=? COLLATE NOCASE', user.id, name)) bad('You already have a folder with that name!', 409);
       const r = await D.run('INSERT INTO bookmark_folders(user_id,name) VALUES(?,?)', user.id, name);
       return json({ folder: { id: r.meta.last_row_id, name: name, n: 0 } });
+    }
+    if (method === 'PATCH' && seg[1]) {
+      const b = await readJson(req, 300);
+      const id = intParam(seg[1]);
+      const c = await D.run('UPDATE bookmark_folders SET public=? WHERE id=? AND user_id=?', b.public ? 1 : 0, id, user.id);
+      if (!c.meta.changes) bad('We could not find that folder!', 404);
+      return json({ ok: true, public: !!b.public });
     }
     if (method === 'DELETE' && seg[1]) {
       const id = intParam(seg[1]);
@@ -1693,12 +1822,123 @@ async function route(req, env, url) {
       if (!body && !files.length && !b.poll) bad('Write something first!');
       if (b.parent != null || b.quote != null) bad('Only new posts can be scheduled!');
       if ((await D.first('SELECT COUNT(*) AS n FROM scheduled WHERE user_id=?', user.id)).n >= 20) bad('You can have up to 20 scheduled posts!');
-      const payload = { body, cw: cleanLine(b.cw, 80), files: files.map((f) => ({ id: intParam(f && f.id), alt: cleanLine(f && f.alt, 200) })), poll: b.poll && typeof b.poll === 'object' ? b.poll : undefined, outlet: b.outlet ? String(b.outlet) : undefined, subject: b.subject ? String(b.subject) : undefined, replies: b.replies, vis: b.vis === 'friends' ? 'friends' : undefined };
+      const payload = { body, cw: cleanLine(b.cw, 80), files: files.map((f) => ({ id: intParam(f && f.id), alt: cleanLine(f && f.alt, 200) })), poll: b.poll && typeof b.poll === 'object' ? b.poll : undefined, expires: b.expires, event: b.event && typeof b.event === 'object' ? b.event : undefined, outlet: b.outlet ? String(b.outlet) : undefined, subject: b.subject ? String(b.subject) : undefined, replies: b.replies, vis: b.vis === 'friends' ? 'friends' : undefined };
       const r = await D.run('INSERT INTO scheduled(user_id,payload,at,created) VALUES(?,?,?,?)', user.id, JSON.stringify(payload), at, Date.now());
       return json({ ok: true, id: r.meta.last_row_id, at: at });
     }
     if (method === 'DELETE' && seg[1]) { await D.run('DELETE FROM scheduled WHERE id=? AND user_id=?', intParam(seg[1]), user.id); return json({ ok: true }); }
   }
+  // --- status: a little emoji and a few words on your profile
+  if (seg[0] === 'me' && seg[1] === 'status') {
+    need();
+    if (method === 'PUT') {
+      const b = await readJson(req, 600);
+      const emoji = [...cleanLine(b.emoji, 12)].slice(0, 4).join('');
+      const text = cleanLine(b.text, 60);
+      if (!emoji && !text) bad('Pick an emoji or write a few words!');
+      const hrs = Number(b.hours);
+      const until = [1, 4, 24, 168].includes(hrs) ? Date.now() + hrs * 3600000 : null;
+      await D.run('INSERT INTO statuses(user_id,emoji,text,until) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET emoji=excluded.emoji, text=excluded.text, until=excluded.until', user.id, emoji, text, until);
+      return json({ status: { emoji, text, until } });
+    }
+    if (method === 'DELETE') { await D.run('DELETE FROM statuses WHERE user_id=?', user.id); return json({ ok: true }); }
+  }
+
+  // --- drafts that follow you from device to device
+  if (seg[0] === 'drafts') {
+    need();
+    if (method === 'GET' && !seg[1]) return json({ drafts: await D.all('SELECT id, body, cw, updated FROM drafts WHERE user_id=? ORDER BY updated DESC', user.id) });
+    if (method === 'POST' && !seg[1]) {
+      await rate(D, 'draft:' + user.id, 60, 3600);
+      const b = await readJson(req, 3000);
+      const body = cleanBody(b.body);
+      if (!body) bad('Write something to save!');
+      if ([...body].length > MAX_POST) bad('Posts are up to ' + MAX_POST + ' characters!');
+      if ((await D.first('SELECT COUNT(*) AS n FROM drafts WHERE user_id=?', user.id)).n >= 30) bad('You can keep up to 30 drafts!');
+      const r = await D.run('INSERT INTO drafts(user_id,body,cw,updated) VALUES(?,?,?,?)', user.id, body, cleanLine(b.cw, 80), Date.now());
+      return json({ ok: true, id: r.meta.last_row_id });
+    }
+    if (method === 'DELETE' && seg[1]) { await D.run('DELETE FROM drafts WHERE id=? AND user_id=?', intParam(seg[1]), user.id); return json({ ok: true }); }
+  }
+
+  // --- questions: people ask, you answer in public
+  if (seg[0] === 'users' && seg[1] && seg[2] === 'ask' && method === 'POST') {
+    need();
+    await rate(D, 'ask:' + user.id, 20, 3600);
+    const u = await userBy(D, inst, seg[1], 'id, username');
+    if (!u) bad('We could not find that person!', 404);
+    if (u.id === user.id) bad('Ask someone else!');
+    const st = await D.first("SELECT v FROM settings WHERE user_id=? AND k='ask'", u.id);
+    if (!st || st.v !== 'on') bad('This person is not taking questions!', 403);
+    if (await blockedBetween(D, user.id, u.id)) bad('You cannot ask this person!', 403);
+    const b = await readJson(req, 1000);
+    const body = cleanBody(b.body);
+    if (!body) bad('Write your question!');
+    if ([...body].length > 140) bad('Questions are up to 140 characters!');
+    if ((await D.first('SELECT COUNT(*) AS n FROM questions WHERE to_id=?', u.id)).n >= 200) bad('Their inbox is full right now. Try again later!');
+    const anon = b.anon ? 1 : 0;
+    await D.run('INSERT INTO questions(to_id,from_id,anon,body,created) VALUES(?,?,?,?,?)', u.id, user.id, anon, body, Date.now());
+    if (!anon) await notify(D, u.id, user.id, 'question', null);
+    return json({ ok: true, anon: !!anon });
+  }
+  if (seg[0] === 'me' && seg[1] === 'questions') {
+    need();
+    if (method === 'GET' && !seg[2]) {
+      const rows = await D.all(`SELECT q.id, q.body, q.created, q.anon, CASE WHEN q.anon=1 THEN NULL ELSE u.username END AS username FROM questions q JOIN users u ON u.id=q.from_id WHERE q.to_id=? ORDER BY q.id DESC LIMIT 100`, user.id);
+      return json({ items: rows.map((r) => ({ ...r, anon: !!r.anon })) });
+    }
+    if (method === 'POST' && seg[2] && seg[3] === 'answer') {
+      const q = await D.first('SELECT id, from_id, anon, body FROM questions WHERE id=? AND to_id=?', intParam(seg[2]), user.id);
+      if (!q) bad('We could not find that question!', 404);
+      const b = await readJson(req, 2000);
+      const answer = cleanBody(b.answer);
+      if (!answer) bad('Write your answer!');
+      const text = '> ' + q.body + '\n\n' + answer;
+      if ([...text].length > MAX_POST) bad('The question and your answer must fit in ' + MAX_POST + ' characters together. Yours is ' + ([...text].length - MAX_POST) + ' too long!');
+      const post = await createPost(env, D, user, { body: text });
+      await D.run('DELETE FROM questions WHERE id=?', q.id);
+      if (!q.anon) await notify(D, q.from_id, user.id, 'answer', post.id);
+      return json({ post });
+    }
+    if (method === 'DELETE' && seg[2]) { await D.run('DELETE FROM questions WHERE id=? AND to_id=?', intParam(seg[2]), user.id); return json({ ok: true }); }
+  }
+
+  // --- achievements (worked out from what you have done, nothing to store)
+  if (seg[0] === 'users' && seg[1] && seg[2] === 'achievements' && method === 'GET') {
+    const u = await userBy(D, inst, seg[1], 'id, created');
+    if (!u) bad('We could not find that person!', 404);
+    const n = async (sql, ...a) => (await D.first(sql, ...a)).n;
+    const posts = await n('SELECT COUNT(*) AS n FROM posts WHERE user_id=? AND parent_id IS NULL', u.id);
+    const replies = await n('SELECT COUNT(*) AS n FROM posts WHERE user_id=? AND parent_id IS NOT NULL', u.id);
+    const followers = await n('SELECT COUNT(*) AS n FROM follows WHERE followee=?', u.id);
+    const likesGot = await n('SELECT COUNT(*) AS n FROM likes l JOIN posts p ON p.id=l.post_id WHERE p.user_id=?', u.id);
+    const friends = await n('SELECT COUNT(*) AS n FROM friends WHERE user_id=?', u.id);
+    const polls = await n('SELECT COUNT(*) AS n FROM polls pl JOIN posts p ON p.id=pl.post_id WHERE p.user_id=?', u.id);
+    const events = await n('SELECT COUNT(*) AS n FROM events e JOIN posts p ON p.id=e.post_id WHERE p.user_id=?', u.id);
+    const pics = await n('SELECT COUNT(*) AS n FROM attachments WHERE user_id=? AND post_id IS NOT NULL AND mime LIKE ?', u.id, 'image/%');
+    const best = await n('SELECT COALESCE(MAX(c),0) AS n FROM (SELECT COUNT(*) AS c FROM posts WHERE parent_id IS NOT NULL AND parent_id IN (SELECT id FROM posts WHERE user_id=?) GROUP BY parent_id)', u.id);
+    const days = Math.floor((Date.now() - u.created) / 864e5);
+    const A = (id, name, desc, have, need2, emoji) => ({ id, name, desc, have: Math.min(have, need2), need: need2, done: have >= need2, emoji });
+    return json({ items: [
+      A('first', 'First words', 'Write your first post', posts, 1, '✍️'), A('p10', 'Regular', 'Write 10 posts', posts, 10, '📝'), A('p100', 'Prolific', 'Write 100 posts', posts, 100, '📚'),
+      A('rep10', 'Chatty', 'Write 10 replies', replies, 10, '💬'), A('f10', 'Getting known', 'Get 10 followers', followers, 10, '🌱'), A('f100', 'Community pillar', 'Get 100 followers', followers, 100, '🌳'),
+      A('l50', 'Well liked', 'Get 50 likes on your posts', likesGot, 50, '❤️'), A('l500', 'Crowd favorite', 'Get 500 likes on your posts', likesGot, 500, '🏆'),
+      A('fr5', 'Good company', 'Have 5 friends', friends, 5, '🤝'), A('poll', 'Pollster', 'Make a poll', polls, 1, '📊'), A('event', 'Host', 'Plan an event', events, 1, '🎉'),
+      A('pics', 'Photographer', 'Share 5 pictures', pics, 5, '📷'), A('conv', 'Conversation starter', 'Get 10 replies on one post', best, 10, '🔥'),
+      A('d30', 'Settled in', 'Be here for 30 days', days, 30, '🗓️'), A('d365', 'Old friend', 'Be here for a year', days, 365, '🎂'),
+    ] });
+  }
+
+  // --- collections: a bookmark folder that its owner shared
+  if (seg[0] === 'collections' && seg[1] && method === 'GET') {
+    const id = intParam(seg[1]);
+    const f = id && (await D.first('SELECT f.id, f.name, f.user_id, u.username, (SELECT slug FROM instances WHERE id=u.inst) AS inst_slug FROM bookmark_folders f JOIN users u ON u.id=f.user_id WHERE f.id=? AND f.public=1', id));
+    if (!f) bad('We could not find that collection!', 404);
+    const rows = await D.all('SELECT post_id FROM bookmark_folder_items WHERE folder_id=? ORDER BY post_id DESC LIMIT 100', id);
+    const got = rows.length ? await listPosts(env, D, user, `p.id IN (${ph(rows.length)})`, rows.map((r) => r.post_id), { limit: 100 }) : { posts: [] };
+    return json({ collection: { id: f.id, name: f.name, owner: f.username, inst_slug: f.inst_slug }, posts: got.posts });
+  }
+
   if (seg[0] === 'trending' && method === 'GET') {
     const since = Date.now() - 864e5;
     const loc = url.searchParams.get('local') === '1';

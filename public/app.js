@@ -201,6 +201,7 @@
           h('a', { href: '/bookmarks', 'data-link': true }, 'Saved posts'),
           h('a', { href: '/instances', 'data-link': true }, 'Instances'),
           instInfo && instInfo.canManage ? h('a', { href: '/instance/settings', 'data-link': true }, 'Instance settings') : null,
+          h('a', { href: '/questions', 'data-link': true }, 'Questions', me.questions ? h('span', { class: 'badge inline' }, me.questions) : null),
           h('a', { href: '/scheduled', 'data-link': true }, 'Scheduled posts'),
           h('a', { href: '/stats', 'data-link': true }, 'Your stats'),
           h('a', { href: '/lists', 'data-link': true }, 'Lists'),
@@ -363,6 +364,41 @@
       others.map((f) => h('a', { class: 'filechip', href: '/api/files/' + f.id, download: f.name }, icon('file'), h('span', { class: 'fn' }, f.name), h('span', { class: 'muted small' }, bytes(f.size)))));
   }
 
+  const BANNER_IDS = ['sunrise', 'ocean', 'forest', 'grape', 'candy', 'ember', 'mint', 'night', 'peach', 'slate', 'aurora', 'dots'];
+  // an event inside a post: date, place, RSVP buttons, who is going, and a calendar file
+  function eventView(x, redraw) {
+    const e = x.event;
+    const when = new Date(e.at);
+    const past = e.at < Date.now();
+    const rsvp = (status) => safe(async () => {
+      if (!me) return go('/login');
+      const r = await api('/posts/' + x.id + '/rsvp', { method: 'POST', body: { status: e.mine === status ? 'none' : status } });
+      Object.assign(x, r.post);
+      redraw();
+    });
+    const rb = (st, label) => h('button', { type: 'button', class: 'btn small' + (e.mine === st ? '' : ' ghost'), 'aria-pressed': String(e.mine === st), onclick: rsvp(st) }, label);
+    const who = (st, n, label) => (n ? h('button', { type: 'button', class: 'linkbtn', onclick: safe(async () => { const r = await api('/posts/' + x.id + '/rsvps?status=' + st); peopleDialog(label, r.users); }) }, n + ' ' + label.toLowerCase()) : null);
+    return h('div', { class: 'eventcard' + (past ? ' past' : '') },
+      h('div', { class: 'evdate', 'aria-hidden': 'true' }, h('b', null, when.toLocaleDateString(undefined, { month: 'short' }).toUpperCase()), h('span', null, String(when.getDate()))),
+      h('div', { class: 'evbody' },
+        h('div', { class: 'evtitle' }, e.title),
+        h('div', { class: 'muted small' }, when.toLocaleString(undefined, { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' }), past ? ' · Already happened' : ' · ' + until(e.at).replace(' left', ' to go')),
+        e.place ? h('div', { class: 'small' }, '📍 ' + e.place) : null,
+        !past ? h('div', { class: 'row2 evbtns' }, rb('going', 'Going'), rb('maybe', 'Maybe'), rb('no', 'Can’t go')) : null,
+        h('div', { class: 'small muted evcounts' }, who('going', e.going, 'Going'), who('maybe', e.maybe, 'Maybe'), !e.going && !e.maybe ? 'Nobody has answered yet' : null, ' ', h('a', { href: '/api/posts/' + x.id + '/ics', download: 'event.ics' }, 'Add to calendar'))));
+  }
+  // drafts saved on your account: pick one to carry on writing it
+  async function draftsDialog(use) {
+    const r = await api('/drafts');
+    const list = h('div');
+    const box = modal('Your drafts', list);
+    const draw = (items) => put(list, items.length ? items.map((d) => h('div', { class: 'draftrow' },
+      h('div', { class: 'draftbody' }, d.body.length > 140 ? d.body.slice(0, 140) + '…' : d.body, h('div', { class: 'muted small' }, ago(d.updated) + ' ago')),
+      h('div', { class: 'row2' },
+        h('button', { class: 'btn small', type: 'button', onclick: safe(async () => { await api('/drafts/' + d.id, { method: 'DELETE' }); box.remove(); use(d); toast('Draft loaded!'); }) }, 'Use'),
+        h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/drafts/' + d.id, { method: 'DELETE' }); items = items.filter((z) => z !== d); draw(items); }) }, 'Delete')))) : h('p', { class: 'muted' }, 'No drafts yet. Press Save draft while you write, and it waits here on every device!'));
+    draw(r.drafts);
+  }
   function pollView(x, redraw) {
     const poll = x.poll;
     const canVote = me && !poll.ended && poll.myVote === null;
@@ -455,6 +491,8 @@
     if (me && x.bookmarked) items.push(h('button', { type: 'button', onclick: act(async () => { await folderPicker(x, redraw); }) }, 'Move to a folder'));
     if (x.likes) items.unshift(h('button', { type: 'button', onclick: act(async () => { const r = await api('/posts/' + x.id + '/likes'); peopleDialog('Liked by', r.users); }) }, 'See who liked'));
     if (me && !mineP) items.push(h('button', { type: 'button', onclick: act(async () => { listPicker(x.username); }) }, 'Add @' + x.username + ' to a list'));
+    if (me) items.push(h('button', { type: 'button', onclick: act(async () => { const w = prompt('Remind you about this post in how long? Type 1 (an hour), 4 (hours), 24 (a day), 72 (3 days) or 168 (a week):', '24'); if (!w) return; await api('/posts/' + x.id + '/remind', { method: 'POST', body: { hours: parseInt(w, 10) } }); toast('Okay! You will get a reminder in your notifications.'); }) }, 'Remind me later'));
+    if (me && !mineP) [['for 1 day', 24], ['for 1 week', 168]].forEach(([l, hrs]) => items.push(h('button', { type: 'button', onclick: act(async () => { await api('/users/' + enc(x.username) + '/mute', { method: 'POST', body: { hours: hrs } }); toast('Muted ' + l + '! You will not see their posts until then.'); }) }, 'Mute @' + x.username + ' ' + l)));
     // Outlet moderators
     const modSlug = ol && ol.canMod ? ol.slug : opts.modOutlet;
     if (modSlug) {
@@ -479,10 +517,12 @@
         h('div', { class: 'ph' }, h('a', { class: 'who', href: '/u/' + enc(x.username), 'data-link': true }, nameOf(x)), badgeEl(x), h('span', { class: 'muted small' }, '@' + x.username), x.inst_slug && x.inst_slug !== inst.slug && !x.username.includes("@") ? h('span', { class: 'itag', title: 'From the ' + x.inst_slug + ' instance' }, x.inst_slug) : null, h('a', { class: 'when', href: '/post/' + x.id, 'data-link': true }, ago(x.created)), x.edited ? h('span', { class: 'muted small', title: 'Edited ' + new Date(x.edited).toLocaleString() }, '· edited') : null, x.vis === 'friends' ? h('span', { class: 'pinned friendsonly', title: 'Only friends can see this post' }, icon('users'), 'Friends only') : null, opts.pinned || (ol && ol.pinned) ? h('span', { class: 'pinned' }, icon('pin', 'solid'), 'Pinned') : null, ol && ol.locked ? h('span', { class: 'pinned' }, icon('lock'), 'Locked') : null),
         outletChip,
         x.replyPolicy ? h('div', { class: 'ptag muted small' }, icon('lock'), x.replyPolicy === 'following' ? ' Only people the author follows can reply' : ' Only mentioned people can reply') : null,
+        x.expires ? h('div', { class: 'ptag muted small' }, '\u23F3 Disappears in ' + until(x.expires).replace(' left', '')) : null,
         warn,
         hidden ? null : bodyHolder,
         hidden ? null : (x.files.length ? filesView(x) : null),
         hidden ? null : (x.poll ? pollView(x, redraw) : null),
+        hidden ? null : (x.event ? eventView(x, redraw) : null),
         hidden ? null : quoteEl,
         hidden ? null : rxBar,
         h('div', { class: 'acts' },
@@ -491,7 +531,7 @@
     return [rp ? h('div', { class: 'reposthead' }, icon('repost'), link('/u/' + enc(rp.username), nameOf(rp)), ' reposted') : null, article];
   }
   function postCard(p, opts = {}) {
-    const wrap = h('div', { class: 'postwrap' });
+    const wrap = h('div', { class: 'postwrap' + (p.kind === 'repost' ? ' k-repost' : '') + ((p.kind === 'repost' ? p.target : p).files && (p.kind === 'repost' ? p.target : p).files.length ? ' k-media' : '') });
     const redraw = () => wrap.replaceChildren(...build(p, opts, redraw, wrap).filter(Boolean));
     redraw();
     return wrap;
@@ -550,6 +590,29 @@
     const repSel = canPolicy ? h('select', { class: 'subsel', 'aria-label': 'Who can reply' }, [['everyone', 'Anyone can reply'], ['following', 'People I follow can reply'], ['mentioned', 'Only people I mention can reply']].map(([v, l]) => h('option', { value: v }, l))) : null;
     // who can see it: everyone, or only your friends
     const visSel = !opts.parent && !opts.outlet && me ? h('select', { class: 'subsel', 'aria-label': 'Who can see this post' }, [['', 'Everyone can see it'], ['friends', 'Friends only']].map(([v, l]) => h('option', { value: v }, l))) : null;
+    // posts that disappear, events, and drafts that follow you around
+    const expSel = me ? h('select', { class: 'subsel', 'aria-label': 'How long the post stays up' }, [['', 'Stays up'], ['1', 'Disappears after 1 hour'], ['24', 'Disappears after 1 day'], ['168', 'Disappears after 7 days'], ['720', 'Disappears after 30 days']].map(([v, l]) => h('option', { value: v }, l))) : null;
+    let evOn = false;
+    const evTitle = h('input', { placeholder: 'Event name', maxlength: 60, 'aria-label': 'Event name' });
+    const evWhen = h('input', { type: 'datetime-local', 'aria-label': 'Event date and time' });
+    const evPlace = h('input', { placeholder: 'Where? (optional)', maxlength: 80, 'aria-label': 'Event place' });
+    const evBox = h('div', { class: 'eventbuilder', hidden: true }, evTitle, evWhen, evPlace);
+    const evBtn = opts.parent || opts.quote || opts.outlet || !me ? null : h('button', { class: 'act txt', type: 'button', 'aria-pressed': 'false', title: 'Plan an event with RSVPs', onclick: () => {
+      evOn = !evOn; evBox.hidden = !evOn; evBtn.setAttribute('aria-pressed', String(evOn));
+      if (evOn && !evWhen.value) { const d = new Date(Date.now() + 7 * 864e5); d.setHours(18, 0, 0, 0); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); evWhen.value = d.toISOString().slice(0, 16); }
+      update();
+    } }, 'Event');
+    evTitle.addEventListener('input', () => update());
+    const draftBtn = me ? h('button', { class: 'act txt', type: 'button', title: 'Save this as a draft you can finish on any device', onclick: safe(async () => {
+      if (!area.value.trim()) return toast('Write something first!');
+      await api('/drafts', { method: 'POST', body: { body: area.value, cw: cwOn ? cwIn.value : '' } });
+      toast('Draft saved! Open Drafts to find it again.');
+    }) }, 'Save draft') : null;
+    const draftsBtn = me ? h('button', { class: 'act txt', type: 'button', title: 'Your saved drafts', onclick: safe(() => draftsDialog((d) => {
+      area.value = d.body; store.set(dkey, area.value);
+      if (d.cw) { if (!cwOn) cwBtn.click(); cwIn.value = d.cw; }
+      update(); paintPreview(); area.focus();
+    })) }, 'Drafts') : null;
     // @name suggestions
     const ac = h('div', { class: 'ac card', hidden: true, role: 'listbox' });
     let acT = 0;
@@ -631,7 +694,7 @@
       const left = 300 - [...area.value].length;
       count.textContent = String(left);
       count.className = 'count' + (left < 0 ? ' over' : '');
-      const hasThing = area.value.trim() || files.length || (pollOn && pollInputs.filter((i) => i.value.trim()).length >= 2);
+      const hasThing = area.value.trim() || files.length || (evOn && evTitle.value.trim()) || (pollOn && pollInputs.filter((i) => i.value.trim()).length >= 2);
       const over = extras.some((t) => [...t.value].length > 300);
       btn.disabled = left < 0 || over || !hasThing || busy > 0 || (opts.quote && !area.value.trim());
     };
@@ -708,6 +771,8 @@
         if (pollOn) body.poll = { options: pollInputs.map((i) => i.value).filter((v) => v.trim()), hours: parseInt(dur.value, 10) };
         if (repSel && repSel.value !== 'everyone') body.replies = repSel.value;
         if (visSel && visSel.value) body.vis = visSel.value;
+        if (expSel && expSel.value) body.expires = parseInt(expSel.value, 10);
+        if (evOn && evTitle.value.trim()) body.event = { title: evTitle.value, at: new Date(evWhen.value).getTime(), place: evPlace.value };
         const sched = !when.hidden && when.value && !opts.parent && !opts.quote;
         if (sched) body.at = new Date(when.value).getTime();
         const r = sched ? await api('/scheduled', { method: 'POST', body }) : await api('/posts', { method: 'POST', body });
@@ -723,15 +788,19 @@
         drawTray();
         if (pollOn) { pollInputs.forEach((i) => (i.value = '')); togglePoll(); }
         preview.hidden = true;
+        if (expSel) expSel.value = '';
+        if (evOn && evBtn) { evBtn.click(); evTitle.value = ''; evPlace.value = ''; }
         if (!sched && opts.onPosted) opts.onPosted(r.post);
       } finally { update(); }
     }) },
       subSel ? h('label', { class: 'small muted subrow' }, icon('forum'), ' Post in ', subSel) : null,
       area, ac, cwIn, tray, pollBox, extraBox, preview,
       schedBtn ? h('div', { class: 'schedrow' }, when) : null,
+      evBox,
+      expSel ? h('div', { class: 'small muted subrow' }, h('span', { class: 'subitem' }, '\u23F3 ', expSel)) : null,
       repSel || visSel ? h('div', { class: 'small muted subrow subpair' }, repSel ? h('span', { class: 'subitem' }, icon('lock'), ' ', repSel) : null, visSel ? h('span', { class: 'subitem' }, icon('users'), ' ', visSel) : null) : null,
       opts.quote ? h('div', { class: 'quote small' }, h('b', null, nameOf(opts.quote)), ' ', '@' + opts.quote.username, h('div', { class: 'qbody' }, opts.quote.body.slice(0, 200))) : null,
-      h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, fmtMenu, opts.parent || opts.noPoll ? null : pollBtn, cwBtn, emojiMenu, opts.parent || opts.quote ? null : threadBtn, schedBtn, count), btn),
+      h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, fmtMenu, opts.parent || opts.noPoll ? null : pollBtn, cwBtn, emojiMenu, opts.parent || opts.quote ? null : threadBtn, schedBtn, evBtn, draftBtn, draftsBtn, count), btn),
       h('div', { class: 'muted small' }, 'Keydown works here: **bold**, *italic*, `code`, #G#chips#'), err);
     return form;
   }
@@ -929,7 +998,10 @@
       !me ? instanceHero() : null,
       me ? composer({ onPosted: (p) => { f.add(p); toast('Posted!'); drawSide(); } }) : null,
       h('div', { class: 'tabs' }, onTab('local', 'Local', 'Everyone on ' + inst.name), me ? onTab('home', 'Following', 'People and Topics you follow') : null, me ? onTab('friends', 'Friends', 'You and your friends') : null, onTab('all', 'Federated', 'Every instance together')),
+      h('div', { class: 'feedfilters small muted' }, h('label', null, h('input', { type: 'checkbox', checked: store.get('beta_f_nore') === '1', onchange: (e) => { store.set('beta_f_nore', e.target.checked ? '1' : ''); applyFeedFilters(); } }), ' Hide reposts'), h('label', null, h('input', { type: 'checkbox', checked: store.get('beta_f_media') === '1', onchange: (e) => { store.set('beta_f_media', e.target.checked ? '1' : ''); applyFeedFilters(); } }), ' Only posts with pictures or files')),
       banner, f);
+    const applyFeedFilters = () => { const l = f.firstChild; l.toggleAttribute('data-nore', store.get('beta_f_nore') === '1'); l.toggleAttribute('data-media', store.get('beta_f_media') === '1'); };
+    applyFeedFilters();
     await f.ready;
     timers.push(setInterval(async () => {
       try {
@@ -1121,6 +1193,59 @@
     await f.ready;
   }
 
+  // the profile's achievements, worked out by the server when you open the list
+  function achievementsBox(user) {
+    const box = h('details', { class: 'card achv' }, h('summary', null, 'Achievements'));
+    let done = false;
+    box.addEventListener('toggle', safe(async () => {
+      if (!box.open || done) return;
+      done = true;
+      const r = await api('/users/' + enc(user.username) + '/achievements');
+      const got = r.items.filter((a) => a.done).length;
+      box.querySelector('summary').textContent = 'Achievements (' + got + ' of ' + r.items.length + ')';
+      box.append(h('div', { class: 'achgrid' }, r.items.map((a) => h('div', { class: 'ach' + (a.done ? ' done' : '') },
+        h('span', { class: 'aemoji', 'aria-hidden': 'true' }, a.emoji), h('div', null, h('b', null, a.name), h('div', { class: 'muted small' }, a.desc), a.done ? h('div', { class: 'small' }, 'Earned!') : h('div', { class: 'achbar', 'aria-label': a.have + ' of ' + a.need }, h('i', { style: 'width:' + Math.round((a.have * 100) / a.need) + '%' }), h('span', { class: 'small muted' }, a.have + ' / ' + a.need)))))));
+    }));
+    return box;
+  }
+  function askDialog(user) {
+    const ta = h('textarea', { maxlength: 140, placeholder: 'Ask @' + user.username + ' anything (up to 140 characters)', 'aria-label': 'Your question' });
+    const anon = h('input', { type: 'checkbox', id: 'qanon' });
+    const err = errBox();
+    const box = modal('Ask @' + user.username, ta, h('label', { class: 'small', for: 'qanon' }, anon, ' Ask without showing my name'),
+      h('p', null, h('button', { class: 'btn', type: 'button', onclick: guard(err, async () => { await api('/users/' + enc(user.username) + '/ask', { method: 'POST', body: { body: ta.value, anon: anon.checked } }); box.remove(); toast('Sent! They can answer it in public.'); }) }, 'Send question')), err);
+    ta.focus();
+  }
+  async function questionsPage() {
+    if (!me) return go('/login', true);
+    setTitle('Questions');
+    drawSide();
+    const list = h('div', { class: 'card feed' });
+    const draw = async () => {
+      const r = await api('/me/questions');
+      put(list, r.items.length ? r.items.map((q) => {
+        const ans = h('textarea', { maxlength: 280, placeholder: 'Your answer', 'aria-label': 'Your answer' });
+        const err = errBox();
+        return h('div', { class: 'qrow' },
+          h('div', { class: 'muted small' }, q.anon ? 'Anonymous' : ['@' + q.username], ' · ' + ago(q.created)),
+          h('div', { class: 'qtext' }, q.body), ans,
+          h('div', { class: 'row2' },
+            h('button', { class: 'btn small', type: 'button', onclick: guard(err, async () => { await api('/me/questions/' + q.id + '/answer', { method: 'POST', body: { answer: ans.value } }); toast('Answered! It is a post on your profile now.'); draw(); }) }, 'Answer in public'),
+            h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/me/questions/' + q.id, { method: 'DELETE' }); draw(); }) }, 'Delete')), err);
+      }) : h('div', { class: 'empty' }, me.ask === 'on' ? 'No questions waiting! Share your profile so people can ask you things.' : 'Questions are off. Turn them on in Settings, and people can ask you things!'));
+    };
+    show(h('h1', null, 'Questions'), h('p', { class: 'muted' }, 'People ask, you answer in public. Your answer becomes a post that quotes the question.'), list);
+    await draw();
+  }
+  async function collectionPage(id) {
+    const r = await api('/collections/' + enc(id));
+    setTitle(r.collection.name);
+    drawSide();
+    const list = h('div', { class: 'card feed' });
+    r.posts.forEach((p) => list.append(postCard(p, {})));
+    if (!r.posts.length) list.append(h('div', { class: 'empty' }, 'Nothing in this collection yet!'));
+    show(h('h1', null, r.collection.name), h('p', { class: 'muted' }, 'A collection by ', link('/u/' + enc(r.collection.owner), '@' + r.collection.owner), ' · ' + r.posts.length + (r.posts.length === 1 ? ' post' : ' posts')), list);
+  }
   async function userPage(name, sub) {
     const { user } = await api('/users/' + enc(name));
     setTitle(nameOf(user));
@@ -1158,13 +1283,17 @@
     }
     const path = '/u/' + enc(user.username);
     const f = feed('/feed', { user: user.username, tab }, { empty: { posts: 'No posts yet!', replies: 'No replies yet!', media: 'No pictures or files yet!', likes: 'No likes yet!' }[tab], pinnedId: user.pinned ? user.pinned.id : null });
-    show(h('div', { class: 'card profile' },
+    show(h('div', { class: 'card profile' + (user.banner ? ' hasbanner' : '') + (user.accent ? ' hasaccent' : ''), style: user.accent ? '--pacc:' + user.accent : null },
+      user.banner ? h('div', { class: 'pbanner b-' + user.banner }) : null,
       h('div', { class: 'top2' }, avatar(user, true), h('div', { class: 'who2' }, h('h1', null, nameOf(user), badgeEl(user)), h('div', { class: 'muted' }, '@' + user.username, user.inst_slug && user.inst_slug !== inst.slug && !user.username.includes("@") ? h('span', { class: 'itag', title: 'From the ' + user.inst_slug + ' instance' }, user.inst_slug) : null, user.followsYou ? h('span', { class: 'chip small' }, 'Follows you') : null, user.muted ? h('span', { class: 'chip small' }, 'Muted') : null, user.blocked ? h('span', { class: 'chip small' }, 'Blocked') : null)),
-        h('div', { class: 'pbtns' }, mineU ? h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Edit profile') : [fbtn, frbtn], mineU ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => changePicture(() => render()) }, 'Change picture') : null, me && !mineU ? h('a', { class: 'btn ghost small', href: '/messages/' + enc(user.username), 'data-link': true, title: 'Send a message' }, icon('mail')) : null, me && !mineU ? h('button', { class: 'btn ghost small', type: 'button', title: 'Add to a list', onclick: safe(() => listPicker(user.username)) }, icon('list')) : null, h('a', { class: 'btn ghost small', href: '/rss/user/' + enc(user.username), title: 'RSS feed' }, icon('rss')))),
+        h('div', { class: 'pbtns' }, mineU ? [h('a', { class: 'btn ghost small', href: '/settings', 'data-link': true }, 'Edit profile'), me.ask === 'on' ? h('a', { class: 'btn ghost small', href: '/questions', 'data-link': true }, 'Questions') : null] : [fbtn, frbtn, user.askOpen ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => (me ? askDialog(user) : go('/login')) }, 'Ask') : null], mineU ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => changePicture(() => render()) }, 'Change picture') : null, me && !mineU ? h('a', { class: 'btn ghost small', href: '/messages/' + enc(user.username), 'data-link': true, title: 'Send a message' }, icon('mail')) : null, me && !mineU ? h('button', { class: 'btn ghost small', type: 'button', title: 'Add to a list', onclick: safe(() => listPicker(user.username)) }, icon('list')) : null, h('a', { class: 'btn ghost small', href: '/rss/user/' + enc(user.username), title: 'RSS feed' }, icon('rss')))),
+      user.status ? h('div', { class: 'pstatus' }, (user.status.emoji ? user.status.emoji + ' ' : '') + user.status.text) : null,
       user.bio ? h('p', null, rich(user.bio)) : null,
       user.fields && user.fields.length ? h('dl', { class: 'pfields' }, user.fields.map((f) => [h('dt', null, f.label), h('dd', null, /^https?:\/\/[^\s<>"']{3,100}$/i.test(f.value) ? h('a', { href: f.value, rel: 'noopener noreferrer nofollow ugc', target: '_blank' }, f.value.replace(/^https?:\/\//, '')) : f.value)])) : null,
       h('p', { class: 'muted small' }, user.website ? [h('a', { href: user.website, rel: 'noopener noreferrer nofollow ugc', target: '_blank' }, user.website.replace(/^https?:\/\//, '')), ' · '] : null, 'Joined ' + new Date(user.created).toLocaleDateString()),
-      stats, relBtns.length ? h('div', { class: 'row2' }, relBtns) : null),
+      stats, relBtns.length ? h('div', { class: 'row2' }, relBtns) : null,
+      user.collections && user.collections.length ? h('p', { class: 'small' }, 'Collections: ', user.collections.map((c) => h('a', { class: 'chip', href: '/collection/' + c.id, 'data-link': true }, c.name + ' (' + c.n + ')'))) : null),
+      achievementsBox(user),
       h('div', { class: 'tabs' }, [['posts', 'Posts'], ['replies', 'Replies'], ['media', 'Media'], ['likes', 'Likes']].map(([k, l]) => h('a', { href: path + (k === 'posts' ? '' : '?tab=' + k), 'data-link': true, class: tab === k ? 'on' : '' }, l))),
       tab === 'posts' && user.pinned ? h('div', { class: 'card feed' }, postCard(user.pinned, { pinned: true, onDelete: () => render() })) : null,
       f);
@@ -1219,7 +1348,7 @@
     const list = h('div', { class: 'card feed' });
     const more = h('div', { class: 'more' });
     let cursor = null;
-    const text = { like: 'liked your post', reply: 'replied to your post', repost: 'reposted your post', quote: 'quoted your post', mention: 'mentioned you', follow: 'followed you', friend_request: 'wants to be your friend', friend_accept: 'accepted your friend request' };
+    const text = { remind: 'Reminder: you wanted to see this post again', rsvp: 'is going to your event', question: 'asked you a question', answer: 'answered your question', like: 'liked your post', reply: 'replied to your post', repost: 'reposted your post', quote: 'quoted your post', mention: 'mentioned you', follow: 'followed you', friend_request: 'wants to be your friend', friend_accept: 'accepted your friend request' };
     const load = async () => {
       more.replaceChildren();
       const r = await api('/notifications' + (cursor ? '?before=' + cursor : ''));
@@ -1234,8 +1363,8 @@
           list.append(row);
           return;
         }
-        const href = n.kind === 'follow' || n.kind === 'friend_accept' ? '/u/' + enc(n.username) : '/post/' + n.post_id;
-        list.append(h('a', { class: 'note' + (n.read ? '' : ' unread'), href, 'data-link': true }, avatar(n), h('div', { class: 'nt' }, h('div', null, h('b', null, nameOf(n)), ' ' + (text[n.kind] || 'did something'), h('span', { class: 'muted small' }, ' · ' + ago(n.created))), n.snippet ? h('div', { class: 'muted snip' }, n.snippet) : null)));
+        const href = n.kind === 'follow' || n.kind === 'friend_accept' ? '/u/' + enc(n.username) : n.kind === 'question' ? '/questions' : '/post/' + n.post_id;
+        list.append(h('a', { class: 'note' + (n.read ? '' : ' unread'), href, 'data-link': true }, avatar(n), h('div', { class: 'nt' }, h('div', null, (n.kind === 'remind' ? [h('b', null, '\u23F0 Reminder'), ' about a post you wanted to see again'] : [h('b', null, nameOf(n)), ' ' + (text[n.kind] || 'did something')]), h('span', { class: 'muted small' }, ' · ' + ago(n.created))), n.snippet ? h('div', { class: 'muted snip' }, n.snippet) : null)));
       });
       cursor = r.cursor;
       if (!list.children.length) list.append(h('div', { class: 'empty' }, 'Nothing yet. Likes, replies, reposts, mentions, new followers and friend requests show up here!'));
@@ -1253,17 +1382,21 @@
     let cur = params().get('folder') || '';
     const bar = h('div', { class: 'folderbar' });
     const holder = h('div');
+    const shareRow = h('div', { class: 'sharerow small' });
     const draw = async () => {
       const fl = (await api('/bookmark-folders')).folders;
       const chip = (id, label, n, del) => h('span', { class: 'fchip' + (cur === id ? ' on' : '') }, h('button', { type: 'button', onclick: () => { cur = id; history.replaceState(null, '', '/bookmarks' + (id ? '?folder=' + id : '')); draw(); } }, label + (n != null ? ' (' + n + ')' : '')),
         del ? h('button', { type: 'button', class: 'fdel', 'aria-label': 'Delete folder ' + label, onclick: safe(async () => { if (!confirm('Delete the folder “' + label + '”? Your posts stay saved.')) return; await api('/bookmark-folders/' + id, { method: 'DELETE' }); if (cur === id) cur = ''; draw(); }) }, '×') : null);
       put(bar, chip('', 'All', null), chip('none', 'Unfiled', null), fl.map((f) => chip(String(f.id), f.name, f.n, true)),
         h('button', { type: 'button', class: 'btn ghost small', onclick: safe(async () => { const name = prompt('Name the new folder:'); if (!name) return; const r = await api('/bookmark-folders', { method: 'POST', body: { name } }); cur = String(r.folder.id); draw(); }) }, '+ Folder'));
+      const fcur = /^\d+$/.test(cur) ? fl.find((z) => String(z.id) === cur) : null;
+      put(shareRow, fcur ? [h('label', null, h('input', { type: 'checkbox', checked: !!fcur.public, onchange: safe(async (e) => { await api('/bookmark-folders/' + fcur.id, { method: 'PATCH', body: { public: e.target.checked } }); toast(e.target.checked ? 'Shared! Anyone with the link can see this collection.' : 'Not shared any more!'); draw(); }) }), ' Share this folder as a public collection'),
+        fcur.public ? h('button', { type: 'button', class: 'btn ghost small', onclick: safe(async () => { await navigator.clipboard.writeText(location.origin + '/collection/' + fcur.id); toast('Link copied!'); }) }, 'Copy link') : null] : null);
       const f = feed('/bookmarks', cur ? { folder: cur } : {}, { empty: cur ? 'Nothing in here yet! Use “Move to a folder” in a saved post’s menu.' : 'Nothing saved yet. Tap the ribbon on a post to keep it here!', onUnsave: true });
       put(holder, f);
       await f.ready;
     };
-    show(h('h1', null, 'Saved posts'), bar, holder);
+    show(h('h1', null, 'Saved posts'), bar, shareRow, holder);
     await draw();
   }
 
@@ -1317,6 +1450,24 @@
     const frSel = h('select', { id: 'frp', onchange: safe(async () => { await api('/me/settings', { method: 'PATCH', body: { friendsPrivacy: frSel.value } }); me.friendsPrivacy = frSel.value; toast('Saved!'); }) }, [['everyone', 'Everyone'], ['friends', 'Only my friends'], ['me', 'Only me']].map(([v, l]) => h('option', { value: v, selected: (me.friendsPrivacy || 'everyone') === v }, l)));
     const themeSel = h('select', { id: 'thm', onchange: () => setTheme(themeSel.value) }, [['auto', 'Match my device'], ['light', 'Light'], ['dark', 'Dark']].map(([v, l]) => h('option', { value: v, selected: (store.get('beta_theme') || 'auto') === v }, l)));
     const densSel = h('select', { id: 'dns', onchange: () => { store.set('beta_density', densSel.value === 'comfortable' ? '' : densSel.value); applyPrefs(); } }, [['comfortable', 'Comfortable'], ['compact', 'Compact']].map(([v, l]) => h('option', { value: v, selected: (store.get('beta_density') || 'comfortable') === v }, l)));
+    const askSel = h('select', { id: 'ask', onchange: safe(async () => { await api('/me/settings', { method: 'PATCH', body: { ask: askSel.value } }); me.ask = askSel.value; toast('Saved!'); }) }, [['off', 'Off'], ['on', 'On: people can ask me questions']].map(([v, l]) => h('option', { value: v, selected: (cur.ask || 'off') === v }, l)));
+    const stEmoji = h('input', { maxlength: 8, placeholder: '🙂', 'aria-label': 'Status emoji', class: 'stemoji' });
+    const stText = h('input', { maxlength: 60, placeholder: 'What are you up to?', 'aria-label': 'Status text' });
+    const stHours = h('select', { 'aria-label': 'Clear the status after' }, [['', 'Keep it until I clear it'], ['1', 'Clear after 1 hour'], ['4', 'Clear after 4 hours'], ['24', 'Clear after a day'], ['168', 'Clear after a week']].map(([v, l]) => h('option', { value: v }, l)));
+    api('/users/' + enc(cur.username)).then((r) => { if (r.user.status) { stEmoji.value = r.user.status.emoji; stText.value = r.user.status.text; } }).catch(() => {});
+    const statusBox = h('div', null, h('div', { class: 'row2' }, stEmoji, stText), stHours,
+      h('p', null, h('button', { class: 'btn small', type: 'button', onclick: safe(async () => { await api('/me/status', { method: 'PUT', body: { emoji: stEmoji.value, text: stText.value, hours: stHours.value ? parseInt(stHours.value, 10) : undefined } }); toast('Status set!'); }) }, 'Set status'), ' ',
+        h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { await api('/me/status', { method: 'DELETE' }); stEmoji.value = ''; stText.value = ''; toast('Status cleared!'); }) }, 'Clear it')));
+    let accent = cur.accent || '', banner = cur.banner || '';
+    const accIn = h('input', { type: 'color', value: accent || '#4d7c0f', 'aria-label': 'Profile accent color', oninput: () => { accent = accIn.value; } });
+    const bannerBox = h('div', { class: 'bannerpick', role: 'radiogroup', 'aria-label': 'Profile banner' });
+    const paintBanner = () => bannerBox.replaceChildren(h('button', { type: 'button', class: 'bn none' + (!banner ? ' sel' : ''), 'aria-pressed': String(!banner), onclick: () => { banner = ''; paintBanner(); } }, 'None'),
+      ...BANNER_IDS.map((id) => h('button', { type: 'button', class: 'bn b-' + id + (banner === id ? ' sel' : ''), 'aria-label': id, 'aria-pressed': String(banner === id), onclick: () => { banner = id; paintBanner(); } })));
+    paintBanner();
+    const lookBox = h('div', null, h('label', null, 'Accent color ', accIn, ' ', h('button', { type: 'button', class: 'btn ghost small', onclick: () => { accent = ''; accIn.value = '#4d7c0f'; toast('Accent cleared! Press Save look.'); } }, 'Clear')),
+      h('label', null, 'Banner'), bannerBox,
+      h('p', null, h('button', { class: 'btn small', type: 'button', onclick: safe(async () => { await api('/me/settings', { method: 'PATCH', body: { accent, banner } }); toast('Profile look saved!'); }) }, 'Save look')));
+    const fsSel = h('select', { id: 'fsz', onchange: () => { store.set('beta_fs', fsSel.value === 'normal' ? '' : fsSel.value); applyPrefs(); } }, [['normal', 'Normal'], ['large', 'Large'], ['xl', 'Extra large']].map(([v, l]) => h('option', { value: v, selected: (store.get('beta_fs') || 'normal') === v }, l)));
     const muted = h('div');
     api('/mutes').then((m) => {
       put(muted,
@@ -1336,12 +1487,17 @@
       h('label', { for: 'web' }, 'Website'), web,
       h('label', null, 'Avatar color'), sw,
       h('p', null, h('button', { class: 'btn', onclick: guard(err1, async () => { await api('/me', { method: 'PATCH', body: { display_name: dn.value, bio: bio.value, website: web.value, color } }); Object.assign(me, { display_name: dn.value.trim(), bio: bio.value.trim(), color }); drawNav(); toast('Saved!'); }) }, 'Save profile')), err1,
+      h('h2', null, 'Questions'),
+      h('label', { for: 'ask' }, 'Let people ask you questions (you answer them in public)'), askSel,
+      h('h2', null, 'Your status'), statusBox,
+      h('h2', null, 'Profile look'), lookBox,
       h('h2', null, 'Messages'),
       h('label', { for: 'dmp' }, 'Who can send you messages?'), dmSel,
       h('label', { for: 'frp' }, 'Who can see your friends list?'), frSel,
       h('h2', null, 'How Beta looks'),
       h('label', { for: 'thm' }, 'Theme'), themeSel,
       h('label', { for: 'dns' }, 'Spacing'), densSel,
+      h('label', { for: 'fsz' }, 'Text size'), fsSel,
       h('h2', null, 'Muted words'), wordsBox(),
       h('h2', null, 'Profile fields'), fieldsBox(cur.username),
       h('h2', null, 'Muted and blocked'), muted,
@@ -1849,6 +2005,8 @@
   function applyPrefs() {
     const t = themeStore.get() || 'auto';
     const d = store.get('beta_density') || 'comfortable';
+    const fs = store.get('beta_fs');
+    if (fs === 'large' || fs === 'xl') document.documentElement.setAttribute('data-fs', fs); else document.documentElement.removeAttribute('data-fs');
     if (t === 'auto') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t);
     window.dispatchEvent(new Event('kd-recolor'));
     if (d === 'compact') document.documentElement.setAttribute('data-density', 'compact'); else document.documentElement.removeAttribute('data-density');
@@ -1902,6 +2060,8 @@
       else if (a === 'instances' && b === 'new') newInstancePage();
       else if (a === 'instance' && b === 'settings') await instanceSettingsPage();
       else if (a === 'scheduled' && !b) await scheduledPage();
+      else if (a === 'questions' && !b) await questionsPage();
+      else if (a === 'collection' && b) await collectionPage(b);
       else if (a === 'stats' && !b) await statsPage();
       else if (a === 'outlets' && !b) await outletsPage();
       else if (a === 'outlets' && b === 'new') newOutletPage();

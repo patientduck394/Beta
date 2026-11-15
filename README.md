@@ -90,3 +90,17 @@ Beta is made of **instances**: communities that each have their own people, hous
 Until the wildcard DNS record and certificate exist, the main instance keeps working as before, and new instances are created fine but their addresses will not open yet.
 
 Testing on your computer: `wrangler dev` always rewrites the host, so put `ALLOW_INSTANCE_HEADER=1` in a file called `.dev.vars` (it is not committed) and send a header `x-beta-instance: name` to act as an instance. Never set it in production.
+
+## Version 14 and 15 additions
+
+- **Status**: an emoji and a few words on your profile, cleared after an hour, four hours, a day, a week, or when you clear it
+- **Disappearing posts**: choose Stays up, or disappears after 1 hour, 1 day, 7 days or 30 days. They are hidden the moment time is up and removed for good soon after
+- **Events**: plan an event (name, date and time, place) inside a post. People answer Going, Maybe or Can't go, see who is coming, and add it to their calendar (a .ics file)
+- **Drafts**: save a post as a draft on your account and carry on from any device
+- **Questions**: turn on "Ask me" in Settings. People ask (anonymously if they like), you answer in public, and the answer becomes a post that quotes the question
+- **Achievements**: 15 of them on every profile, worked out from what a person has done, with progress bars
+- **Collections**: share a Saved posts folder with a public link (`/collection/ID`), listed on your profile
+- **Profile look**: your own accent color and one of 12 banners
+- **Timed mutes**: mute someone for a day or a week, from a post's menu
+- **Reminders**: "Remind me later" on any post brings it back as a notification
+- **Feed filters**: hide reposts, or show only posts with pictures or files; **Text size** (normal, large, extra large) in Settings
