@@ -1076,6 +1076,19 @@
     show(h('div', { class: 'row' }, h('h1', null, 'Instances'), h('a', { class: 'btn small', href: '/instances/new', 'data-link': true }, 'Make an instance')),
       h('p', { class: 'muted' }, 'Every instance is its own community, and they are all part of one Beta. Your account lives on the instance where you joined!'), h('div', { class: 'row2' }, find), grid);
   }
+  const CC0_URL = 'https://creativecommons.org/publicdomain/zero/1.0/';
+  // "I give this to everyone" checkbox. It is optional; ticking it dedicates that one thing to the public domain under CC0
+  function cc0Box(id, checked, what, onchange) {
+    return h('label', { class: 'checkrow cc0row', for: id }, h('input', { type: 'checkbox', id, checked: !!checked, onchange: (e) => onchange(e.target.checked) }),
+      h('span', null, 'Dedicate ', what, ' to the public domain (', h('a', { href: CC0_URL, target: '_blank', rel: 'noopener noreferrer' }, 'CC0'), ')', h('div', { class: 'muted small' }, 'Anyone may copy, change and reuse it for any purpose, with no need to ask or give credit. Optional!')));
+  }
+  // a little note under an instance's text when its owner dedicated things to CC0
+  function cc0Note(i) {
+    const c = i && i.cc0; if (!c) return null;
+    const bits = [c.icon ? 'icon' : '', c.description ? 'description' : '', c.rules ? 'rules' : ''].filter(Boolean);
+    if (!bits.length) return null;
+    return h('p', { class: 'muted small cc0note' }, 'The ' + bits.join(', ').replace(/, ([^,]*)$/, ' and $1') + ' of this instance ' + (bits.length > 1 ? 'are' : 'is') + ' ', h('a', { href: CC0_URL, target: '_blank', rel: 'noopener noreferrer' }, 'CC0'), ' (public domain).');
+  }
   function newInstancePage() {
     setTitle('Make an instance');
     side.replaceChildren();
@@ -1085,6 +1098,7 @@
     const desc = h('input', { id: 'id', maxlength: 300, placeholder: 'What is it about?' });
     const rules = h('textarea', { id: 'ir', rows: 4, maxlength: 1500, placeholder: 'Be kind. No spam. Keep it on topic.' });
     const reg = h('select', { id: 'ig' }, [['open', 'Open: anyone can join'], ['invite', 'Invite only: people need a code'], ['closed', 'Closed: nobody new for now']].map(([v, l]) => h('option', { value: v }, l)));
+    const cc0 = { description: false, rules: false };
     const user = h('input', { id: 'iu', maxlength: 20, autocomplete: 'username', required: true });
     const pw = h('input', { id: 'ip', type: 'password', autocomplete: 'new-password', required: true });
     let touched = false;
@@ -1093,7 +1107,7 @@
     const host = location.hostname.replace(/^[^.]+\.(?=.*beta\.)/, '');
     const done = h('div');
     const form = h('form', { class: 'card formcard wide', onsubmit: guard(err, async () => {
-      const r = await api('/instances', { method: 'POST', body: { name: name.value, slug: slug.value, description: desc.value, rules: rules.value, reg: reg.value, username: user.value, password: pw.value } });
+      const r = await api('/instances', { method: 'POST', body: { name: name.value, slug: slug.value, description: desc.value, rules: rules.value, cc0, reg: reg.value, username: user.value, password: pw.value } });
       form.hidden = true;
       put(done, h('div', { class: 'card formcard wide' }, h('h1', null, 'Your instance is live!'), h('p', null, h('b', null, r.url.replace(/^https?:\/\//, ''))),
         h('p', { class: 'muted' }, 'You are its admin as @' + r.username + '. Log in there with the password you just chose!'), h('p', null, h('a', { class: 'btn', href: r.url + '/login' }, 'Go to your instance'))));
@@ -1102,8 +1116,8 @@
       h('p', { class: 'muted' }, 'An instance is your own community inside Beta. You pick the name, the rules and who may join, and you are its admin!'),
       h('label', { for: 'in' }, 'Name'), name,
       h('label', { for: 'is' }, 'Address'), h('div', { class: 'slugrow' }, slug, h('span', { class: 'muted' }, '.' + host.replace(/^beta\./, 'beta.'))),
-      h('label', { for: 'id' }, 'Description'), desc,
-      h('label', { for: 'ir' }, 'House rules'), rules,
+      h('label', { for: 'id' }, 'Description'), desc, cc0Box('icd', false, 'the description', (v) => (cc0.description = v)),
+      h('label', { for: 'ir' }, 'House rules'), rules, cc0Box('icr', false, 'the rules', (v) => (cc0.rules = v)),
       h('label', { for: 'ig' }, 'Sign-up'), reg,
       h('h2', null, 'Your admin account'), h('p', { class: 'muted small' }, 'Accounts live on one instance, so this one is made on your new instance. Usernames are unique on each instance!'),
       h('label', { for: 'iu' }, 'Username'), user, h('label', { for: 'ip' }, 'Password (8 or more characters)'), pw,
@@ -1125,6 +1139,7 @@
     const reg = h('select', { id: 'sg', disabled: i.isMain }, [['open', 'Open: anyone can join'], ['invite', 'Invite only: people need a code'], ['closed', 'Closed: nobody new for now']].map(([v, l]) => h('option', { value: v, selected: i.reg === v }, l)));
     const listed = h('input', { type: 'checkbox', id: 'sl', checked: i.listed, disabled: i.isMain });
     const code = h('div', { class: 'codebox' });
+    const cc0 = { icon: !!(i.cc0 && i.cc0.icon), description: !!(i.cc0 && i.cc0.description), rules: !!(i.cc0 && i.cc0.rules) };
     const BT = window.BetaTheme;
     let th = { id: 'default', accent: '#0ea5e9', title: '', icon: '', ...(i.theme || {}) };
     const picker = h('div', { class: 'themepick', role: 'radiogroup', 'aria-label': 'Theme' });
@@ -1140,20 +1155,20 @@
       const title = h('input', { id: 'tti', maxlength: 24, placeholder: 'Beta', value: th.title || '', oninput: () => { th.title = title.value; preview(); } });
       const emoji = h('input', { id: 'tem', maxlength: 8, placeholder: 'An emoji, like 🌻', value: /^\/api\//.test(th.icon || '') ? '' : th.icon || '', oninput: () => { th.icon = emoji.value.trim(); preview(); } });
       const up = h('button', { class: 'btn ghost small', type: 'button', onclick: () => { const inp = h('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp', hidden: true, onchange: safe(async () => { const f = inp.files[0]; inp.remove(); if (!f) return; const blob = await iconBlob(f); const x = await api('/instance/icon', { method: 'POST', raw: true, body: blob, headers: { 'content-type': 'application/octet-stream' } }); th.icon = x.icon; drawThemes(); preview(); toast('Icon ready, press Save!'); }) }); document.body.append(inp); inp.click(); } }, 'Upload a picture');
-      put(custom, th.id === 'custom' ? [h('label', { for: 'tac' }, 'Accent color'), accent, h('label', { for: 'tti' }, 'Title (top-left and the tab, up to 24 letters)'), title, h('label', { for: 'tem' }, 'Icon (favicon and top-left)'), h('div', { class: 'row2' }, emoji, up, th.icon ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => { th.icon = ''; drawThemes(); preview(); } }, 'Use the Beta icon') : null)] : null);
+      put(custom, th.id === 'custom' ? [h('label', { for: 'tac' }, 'Accent color'), accent, h('label', { for: 'tti' }, 'Title (top-left and the tab, up to 24 letters)'), title, h('label', { for: 'tem' }, 'Icon (favicon and top-left)'), h('div', { class: 'row2' }, emoji, up, th.icon ? h('button', { class: 'btn ghost small', type: 'button', onclick: () => { th.icon = ''; drawThemes(); preview(); } }, 'Use the Beta icon') : null), cc0Box('sci', cc0.icon, 'the icon picture', (v) => (cc0.icon = v))] : null);
     };
     drawThemes();
     const drawCode = (c) => put(code, c ? h('p', null, 'Invite code: ', h('code', null, c), ' ', h('button', { class: 'btn ghost small', type: 'button', onclick: async () => { try { await navigator.clipboard.writeText(i.url + '/register?invite=' + c); toast('Invite link copied!'); } catch (e) { prompt('Copy this invite link:', i.url + '/register?invite=' + c); } } }, 'Copy invite link'), ' ',
       h('button', { class: 'btn ghost small', type: 'button', onclick: safe(async () => { const x = await api('/instance', { method: 'PATCH', body: { regen_invite: true } }); drawCode(x.inviteCode); toast('New code!'); }) }, 'Make a new code')) : null);
     drawCode(i.reg === 'invite' ? i.inviteCode : '');
     show(h('form', { class: 'card formcard wide', onsubmit: guard(err, async () => {
-      const x = await api('/instance', { method: 'PATCH', body: { name: name.value, description: desc.value, rules: rules.value, ...(i.isMain ? {} : { reg: reg.value, listed: listed.checked }), theme: { ...(th.id === 'custom' ? { id: 'custom', accent: th.accent, title: th.title, icon: th.icon } : { id: th.id }), ...(th.nobadge ? { nobadge: true } : {}) } } });
+      const x = await api('/instance', { method: 'PATCH', body: { name: name.value, description: desc.value, rules: rules.value, cc0: { icon: cc0.icon && /^\/api\//.test(th.icon || ''), description: cc0.description, rules: cc0.rules }, ...(i.isMain ? {} : { reg: reg.value, listed: listed.checked }), theme: { ...(th.id === 'custom' ? { id: 'custom', accent: th.accent, title: th.title, icon: th.icon } : { id: th.id }), ...(th.nobadge ? { nobadge: true } : {}) } } });
       drawCode(!i.isMain && reg.value === 'invite' ? x.inviteCode : '');
       inst = { ...inst, name: name.value, description: desc.value, rules: rules.value, reg: i.isMain ? inst.reg : reg.value, theme: { ...(th.id === 'custom' ? { id: 'custom', accent: th.accent, title: th.title, icon: th.icon } : { id: th.id }), ...(th.nobadge ? { nobadge: true } : {}) } };
       applyInstTheme(); toast('Saved!');
     }) },
       h('h1', null, 'Instance settings'), h('p', { class: 'muted' }, h('b', null, i.url.replace(/^https?:\/\//, '')), ' · ' + i.members + ' members · ' + i.posts + ' posts'),
-      h('label', { for: 'sn' }, 'Name'), name, h('label', { for: 'sd' }, 'Description'), desc, h('label', { for: 'sr' }, 'House rules'), rules,
+      h('label', { for: 'sn' }, 'Name'), name, h('label', { for: 'sd' }, 'Description'), desc, cc0Box('scd', cc0.description, 'the description', (v) => (cc0.description = v)), h('label', { for: 'sr' }, 'House rules'), rules, cc0Box('scr', cc0.rules, 'the rules', (v) => (cc0.rules = v)),
       h('label', { for: 'sg' }, 'Sign-up'), reg, i.isMain ? h('p', { class: 'muted small' }, 'The main instance follows the site-wide sign-up switches in Admin.') : null, code,
       i.isMain ? null : h('label', { class: 'checkrow', for: 'sl' }, listed, h('span', null, h('b', null, 'Show in the instance directory'), h('div', { class: 'muted small' }, 'Turn off to keep it unlisted. People with the address can still join.'))),
       h('h2', null, 'Theme'), h('p', { class: 'muted small' }, 'Colors, icon and title for everyone who visits this instance. The default is the plain Beta look!'), picker, custom,
@@ -1164,7 +1179,7 @@
     const i = instInfo ? instInfo.instance : inst;
     return h('div', { class: 'card side icardside' }, h('h2', null, i.isMain ? 'Beta' : i.name), i.description ? h('p', { class: 'muted small' }, i.description) : null,
       i.members !== undefined ? h('p', { class: 'muted small' }, i.members + (i.members === 1 ? ' member' : ' members') + ' · ' + REG_WORDS[i.reg]) : null,
-      i.rules ? h('details', { class: 'irules small' }, h('summary', null, 'House rules'), h('div', { class: 'vbody' }, i.rules)) : null,
+      i.rules ? h('details', { class: 'irules small' }, h('summary', null, 'House rules'), h('div', { class: 'vbody' }, i.rules)) : null, cc0Note(i),
       h('p', { class: 'small' }, link('/instances', 'All instances'), instInfo && instInfo.canManage ? [' · ', link('/instance/settings', 'Manage')] : null));
   }
 

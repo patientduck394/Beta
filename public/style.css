@@ -627,3 +627,5 @@ html[data-fs="xl"] body { font-size: 20px; }
 .badge.inline { position: static; display: inline-block; margin-left: 6px; vertical-align: middle; }
 
 .row2 .stemoji, .formcard .stemoji { flex: none; width: 4.2em !important; text-align: center; }
+.cc0row { margin: 6px 0 10px; font-size: .92em; }
+.cc0note { margin: 0; }

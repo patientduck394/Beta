@@ -96,7 +96,7 @@ async function readJson(req, limit = 4 * 1024 * 1024) {
 
 // ---------- the newer tables: made automatically the first time the Worker runs after a deploy ----------
 // (schema.sql has the same list, for starting a brand new database by hand)
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 const DDL = [
   'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
   "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT 'lime', pinned INTEGER)",
@@ -213,6 +213,9 @@ function ensureSchema(env) {
       // version 10: an instance can have a theme (JSON: id, accent, title, icon)
       try { await env.DB.prepare('SELECT theme FROM instances LIMIT 1').first(); }
       catch (e) { await env.DB.prepare("ALTER TABLE instances ADD COLUMN theme TEXT NOT NULL DEFAULT ''").run(); }
+      // version 16: an instance can dedicate its icon, description and rules to the public domain (CC0). It is a bitmask: 1 icon, 2 description, 4 rules
+      try { await env.DB.prepare('SELECT cc0 FROM instances LIMIT 1').first(); }
+      catch (e) { await env.DB.prepare('ALTER TABLE instances ADD COLUMN cc0 INTEGER NOT NULL DEFAULT 0').run(); }
       // version 14: timed mutes, and public collections (a bookmark folder you share)
       try { await env.DB.prepare('SELECT until FROM mutes LIMIT 1').first(); }
       catch (e) { await env.DB.prepare('ALTER TABLE mutes ADD COLUMN until INTEGER').run(); }
@@ -705,7 +708,9 @@ function cleanTheme(b, old) {
   }
   return { id: 'custom', accent, title, icon, ...nb };
 }
-const instPublic = (r, env, url) => ({ id: r.id, slug: r.slug, name: r.name, description: r.description, rules: r.rules, reg: r.reg, listed: !!r.listed, isMain: r.id === 1, created: r.created, theme: themeOf(r.theme), url: instUrl(env, url, r.slug) });
+const cc0Mask = (c) => (c && c.icon ? 1 : 0) | (c && c.description ? 2 : 0) | (c && c.rules ? 4 : 0);
+const cc0Of = (r) => { const m = r.cc0 | 0, up = /^\/api\/files\/\d+$/.test(themeOf(r.theme).icon || ''); return { icon: !!(m & 1) && up, description: !!(m & 2) && !!r.description, rules: !!(m & 4) && !!r.rules }; };
+const instPublic = (r, env, url) => ({ cc0: cc0Of(r), id: r.id, slug: r.slug, name: r.name, description: r.description, rules: r.rules, reg: r.reg, listed: !!r.listed, isMain: r.id === 1, created: r.created, theme: themeOf(r.theme), url: instUrl(env, url, r.slug) });
 
 // the posts people scheduled go out here (a Cloudflare cron runs this every minute, and signing in checks too)
 let lastSweep = 0;
@@ -1639,7 +1644,8 @@ async function route(req, env, url) {
     const oldTheme = themeOf(inst.theme);
     let theme = oldTheme;
     if (b.theme !== undefined) theme = cleanTheme(b.theme, oldTheme);
-    await D.run('UPDATE instances SET name=?, description=?, rules=?, reg=?, invite_code=?, listed=?, theme=? WHERE id=?', name, description, rules, reg, code, listed, theme.id === 'default' && !theme.nobadge ? '' : JSON.stringify(theme), inst.id);
+    const cc0 = b.cc0 === undefined ? inst.cc0 | 0 : cc0Mask(b.cc0);
+    await D.run('UPDATE instances SET name=?, description=?, rules=?, reg=?, invite_code=?, listed=?, theme=?, cc0=? WHERE id=?', name, description, rules, reg, code, listed, theme.id === 'default' && !theme.nobadge ? '' : JSON.stringify(theme), cc0, inst.id);
     const oldIcon = /^\/api\/files\/(\d+)$/.exec(oldTheme.icon || '');
     if (oldIcon && theme.icon !== oldTheme.icon) await D.batch([D.stmt("DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE id=? AND name='insticon')", +oldIcon[1]), D.stmt("DELETE FROM attachments WHERE id=? AND name='insticon'", +oldIcon[1])]);
     return json({ ok: true, inviteCode: code });
@@ -1686,7 +1692,7 @@ async function route(req, env, url) {
     if (pw.length < 8 || pw.length > 200) bad('Passwords need at least 8 characters!');
     const reg = ['open', 'invite', 'closed'].includes(b.reg) ? b.reg : 'open';
     const now = Date.now();
-    const r = await D.run('INSERT INTO instances(slug,name,description,rules,reg,invite_code,created) VALUES(?,?,?,?,?,?,?)', slug, name, cleanLine(b.description, 300), cleanBody(b.rules).slice(0, 1500), reg, reg === 'invite' ? genCode() : '', now);
+    const r = await D.run('INSERT INTO instances(slug,name,description,rules,reg,invite_code,created,cc0) VALUES(?,?,?,?,?,?,?,?)', slug, name, cleanLine(b.description, 300), cleanBody(b.rules).slice(0, 1500), reg, reg === 'invite' ? genCode() : '', now, cc0Mask(b.cc0) & 6);
     const iid = r.meta.last_row_id;
     const u = await D.run('INSERT INTO users(username,pw,created,inst) VALUES(?,?,?,?)', uname, await hashPw(pw), now, iid);
     await D.run('UPDATE instances SET owner_id=? WHERE id=?', u.meta.last_row_id, iid);
