@@ -629,3 +629,30 @@ html[data-fs="xl"] body { font-size: 20px; }
 .row2 .stemoji, .formcard .stemoji { flex: none; width: 4.2em !important; text-align: center; }
 .cc0row { margin: 6px 0 10px; font-size: .92em; }
 .cc0note { margin: 0; }
+
+/* ---- the Filter button above the feed: a pill with a dropdown of styled switches ---- */
+.tabs { align-items: center; flex-wrap: wrap; }
+.tabs .filtermenu { margin-left: auto; }
+.filterbtn { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; font-size: .92rem; color: var(--muted); background: var(--card); border: 1.5px solid var(--line); border-radius: 99px; padding: 6px 14px; user-select: none; transition: background .15s, border-color .15s, color .15s; }
+.filterbtn:hover { border-color: var(--lime); color: var(--lime-dd); background: var(--lime-ll); }
+.filterbtn .ic { width: 16px; height: 16px; }
+.filterbtn.on, details[open] > .filterbtn { background: var(--lime-l); border-color: var(--lime); color: var(--lime-dd); }
+.filterbtn:focus-visible { outline: 3px solid var(--lime-l); outline-offset: 1px; border-color: var(--lime); }
+.fcount { min-width: 19px; height: 19px; padding: 0 5px; border-radius: 99px; background: var(--lime-d); color: #fff; font-size: .75rem; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; }
+details.menu .pop.filterpop { top: 40px; min-width: 270px; padding: 8px; gap: 2px; }
+.filterpop .ftitle { font-size: .75rem; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 4px 8px 6px; }
+.fopt { display: flex; gap: 11px; align-items: flex-start; padding: 8px 8px; border-radius: 10px; cursor: pointer; position: relative; }
+.fopt:hover { background: var(--lime-ll); }
+.fopt input.fcheck { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+.fbox { flex: none; width: 22px; height: 22px; margin-top: 1px; border-radius: 7px; border: 2px solid var(--lime-d); background: var(--card); display: inline-flex; align-items: center; justify-content: center; color: #fff; transition: background .15s, transform .15s; }
+.fbox .ic { width: 14px; height: 14px; opacity: 0; transform: scale(.5); transition: opacity .12s, transform .15s; stroke-width: 3; }
+.fopt input.fcheck:checked + .fbox { background: var(--lime-d); }
+.fopt input.fcheck:checked + .fbox .ic { opacity: 1; transform: none; }
+.fopt:active .fbox { transform: scale(.92); }
+.fopt input.fcheck:focus-visible + .fbox { outline: 3px solid var(--lime-l); outline-offset: 2px; }
+.fopt .ftext { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.fopt .ftext b { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; color: var(--ink); }
+.fopt .ftext b .ic { width: 15px; height: 15px; color: var(--lime-d); }
+.fopt .ftext small { color: var(--muted); font-size: .8rem; }
+details.menu .pop.filterpop button.fclear { align-self: flex-end; margin-top: 4px; font-size: .85rem; font-weight: 700; color: var(--lime-dd); padding: 5px 12px; border-radius: 99px; }
+.subitem .ic { width: 16px; height: 16px; color: var(--lime-d); }

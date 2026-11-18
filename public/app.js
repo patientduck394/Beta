@@ -797,7 +797,7 @@
       area, ac, cwIn, tray, pollBox, extraBox, preview,
       schedBtn ? h('div', { class: 'schedrow' }, when) : null,
       evBox,
-      expSel ? h('div', { class: 'small muted subrow' }, h('span', { class: 'subitem' }, '\u23F3 ', expSel)) : null,
+      expSel ? h('div', { class: 'small muted subrow' }, h('span', { class: 'subitem' }, icon('hourglass'), ' ', expSel)) : null,
       repSel || visSel ? h('div', { class: 'small muted subrow subpair' }, repSel ? h('span', { class: 'subitem' }, icon('lock'), ' ', repSel) : null, visSel ? h('span', { class: 'subitem' }, icon('users'), ' ', visSel) : null) : null,
       opts.quote ? h('div', { class: 'quote small' }, h('b', null, nameOf(opts.quote)), ' ', '@' + opts.quote.username, h('div', { class: 'qbody' }, opts.quote.body.slice(0, 200))) : null,
       h('div', { class: 'row' }, h('div', { class: 'tools' }, imgBtn, fileBtn, fmtMenu, opts.parent || opts.noPoll ? null : pollBtn, cwBtn, emojiMenu, opts.parent || opts.quote ? null : threadBtn, schedBtn, evBtn, draftBtn, draftsBtn, count), btn),
@@ -992,13 +992,28 @@
     const tab = ['home', 'friends', 'local', 'all'].includes(tabParam) && (tabParam !== 'friends' || me) ? tabParam : 'local';
     const query = tab === 'home' && me ? { scope: 'home' } : tab === 'friends' ? { scope: 'friends' } : tab === 'local' ? { scope: 'local' } : {};
     const f = feed('/feed', query, { empty: tab === 'home' ? 'Your home feed is empty. Follow people and Topics, or look at the Local and Federated timelines!' : tab === 'friends' ? 'Nothing from friends yet! Add a few friends from their profiles, and post something Friends only!' : 'No posts yet. Be the first!' });
+    // the feed filters live in a Filter button: a dropdown of styled switches, with a count of the ones that are on
+    const FILTERS = [['beta_f_nore', 'repost', 'Hide reposts', 'Only show posts people wrote themselves'], ['beta_f_media', 'image', 'Only posts with pictures or files', 'Hide posts that are just text']];
+    const filterCount = () => FILTERS.filter(([k]) => store.get(k) === '1').length;
+    function filterMenu() {
+      const badge = h('span', { class: 'fcount', hidden: true });
+      const sum = h('summary', { class: 'filterbtn', 'aria-label': 'Filter posts', title: 'Filter posts' }, icon('filter'), h('span', null, 'Filter'), badge);
+      const paint = () => { const n = filterCount(); badge.hidden = !n; badge.textContent = String(n); sum.classList.toggle('on', n > 0); };
+      const pop = h('div', { class: 'pop right filterpop' }, h('div', { class: 'ftitle' }, 'Show in this feed'),
+        FILTERS.map(([key, ic, label, hint]) => {
+          const cb = h('input', { type: 'checkbox', class: 'fcheck', checked: store.get(key) === '1', onchange: (e) => { store.set(key, e.target.checked ? '1' : ''); applyFeedFilters(); paint(); } });
+          return h('label', { class: 'fopt' }, cb, h('span', { class: 'fbox' }, icon('check')), h('span', { class: 'ftext' }, h('b', null, icon(ic), ' ', label), h('small', null, hint)));
+        }),
+        h('button', { type: 'button', class: 'fclear', onclick: (e) => { FILTERS.forEach(([k]) => store.set(k, '')); pop.querySelectorAll('.fcheck').forEach((c) => { c.checked = false; }); applyFeedFilters(); paint(); } }, 'Clear filters'));
+      paint();
+      return h('details', { class: 'menu filtermenu' }, sum, pop);
+    }
     const banner = h('button', { class: 'btn newposts', type: 'button', hidden: true, onclick: () => render() }, 'New posts, show them!');
     const onTab = (k, label, title) => h('a', { href: k === 'local' ? '/' : '/?tab=' + k, 'data-link': true, class: tab === k ? 'on' : '', title }, label);
     show(
       !me ? instanceHero() : null,
       me ? composer({ onPosted: (p) => { f.add(p); toast('Posted!'); drawSide(); } }) : null,
-      h('div', { class: 'tabs' }, onTab('local', 'Local', 'Everyone on ' + inst.name), me ? onTab('home', 'Following', 'People and Topics you follow') : null, me ? onTab('friends', 'Friends', 'You and your friends') : null, onTab('all', 'Federated', 'Every instance together')),
-      h('div', { class: 'feedfilters small muted' }, h('label', null, h('input', { type: 'checkbox', checked: store.get('beta_f_nore') === '1', onchange: (e) => { store.set('beta_f_nore', e.target.checked ? '1' : ''); applyFeedFilters(); } }), ' Hide reposts'), h('label', null, h('input', { type: 'checkbox', checked: store.get('beta_f_media') === '1', onchange: (e) => { store.set('beta_f_media', e.target.checked ? '1' : ''); applyFeedFilters(); } }), ' Only posts with pictures or files')),
+      h('div', { class: 'tabs' }, onTab('local', 'Local', 'Everyone on ' + inst.name), me ? onTab('home', 'Following', 'People and Topics you follow') : null, me ? onTab('friends', 'Friends', 'You and your friends') : null, onTab('all', 'Federated', 'Every instance together'), filterMenu()),
       banner, f);
     const applyFeedFilters = () => { const l = f.firstChild; l.toggleAttribute('data-nore', store.get('beta_f_nore') === '1'); l.toggleAttribute('data-media', store.get('beta_f_media') === '1'); };
     applyFeedFilters();
