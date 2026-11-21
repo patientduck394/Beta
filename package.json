@@ -7,5 +7,8 @@
     "db:remote": "wrangler d1 execute beta-db --remote --file=schema.sql",
     "deploy": "wrangler deploy"
   },
-  "devDependencies": { "wrangler": "^4" }
+  "devDependencies": {
+    "wrangler": "^4"
+  },
+  "license": "Unlicense OR CC0-1.0"
 }

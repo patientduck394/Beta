@@ -9,7 +9,7 @@
     loading = new Promise((ok, no) => {
       window.__KeydownNoAuto = true; // we draw things ourselves; do not let it scan the whole page
       const s = document.createElement('script');
-      s.src = '/Keydown.js?v=30';
+      s.src = 'https://radii-office.com/Keydown.js'; // one shared copy: it updates for every Radii Office app at once
       s.onload = () => (window.Keydown ? ok(window.Keydown) : no(new Error('Keydown did not start!')));
       s.onerror = () => {
         loading = null;
